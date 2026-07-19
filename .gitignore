@@ -1,0 +1,91 @@
+# ── Secrets ──────────────────────────────────────────────
+.env
+.env.*
+*.env
+!*.env.example
+
+# ── Python (backend) ────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Real device/model uploads land here at runtime — never committed
+LokiAI-backend/uploaded_models/*
+!LokiAI-backend/uploaded_models/.gitkeep
+
+# ── Node / web (dashboard) ──────────────────────────────
+node_modules/
+dist/
+dist-ssr/
+.output/
+.vinxi/
+.tanstack/
+.nitro/
+.wrangler/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── Flutter / Dart (mobile) ─────────────────────────────
+**/build/
+**/.cxx/
+**/.gradle/
+**/intermediates/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+*.iml
+android/local.properties
+ios/Pods/
+ios/.symlinks/
+
+# ── Model binaries — never stored in the repo. Phones pull
+#    these straight from the HuggingFace CDN at deploy time.
+*.gguf
+*.tflite
+*.onnx
+# Exception: the mobile app's bundled default camera model ships inside
+# the APK itself (referenced directly in pubspec.yaml) — required to build.
+!LokiAImobile UI/assets/best.tflite
+
+# ── Local toolchains vendored into this folder by mistake
+#    (Flutter SDK, Go SDK, ADB platform-tools, old v1 Go
+#    discovery agent) — not part of the product, never tracked.
+/flutter/
+/go/
+/platform-tools/
+/agent/
+/.pub-cache/
+
+# ── Misc dev scratch / legacy v1-v2 artifacts at repo root
+/REPORT.md
+/*.png
+/*.gguf
+accept_licenses.py
+download_extract_go.py
+extract_adb.py
+extract_go.py
+verify_phase*.py
+*_config.json
+dummy_model.tflite
+pairing_qr.png
+
+# Internal working logs — may contain tokens/test data, not for public repo
+Docs/files/REPORT.md
+
+# Lovable platform metadata — internal tooling artifact, not part of the product
+LokiAI-Desktop/stellar-dashboard-builder-main/.lovable/
+
+# ── Editor / OS ──────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.log
