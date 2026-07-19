@@ -337,6 +337,14 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USER)
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "LokiAI")
 
+# Render's free tier blocks outbound SMTP entirely (confirmed by testing,
+# not just a routing quirk — forcing IPv4 didn't help either). When set,
+# route email through the Vercel-hosted relay function instead of
+# connecting to SMTP_HOST directly — Vercel's serverless functions have no
+# such block. See LokiAI-Desktop/stellar-dashboard-builder-main/api/send-email.ts.
+EMAIL_RELAY_URL = os.getenv("EMAIL_RELAY_URL")
+EMAIL_RELAY_SECRET = os.getenv("EMAIL_RELAY_SECRET")
+
 OTP_TTL_MINUTES = 10
 OTP_MAX_ATTEMPTS = 5
 OTP_RESEND_COOLDOWN_SECONDS = 60
@@ -372,8 +380,22 @@ def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: str
         server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
 
 
+async def _send_email_via_relay(to_email: str, subject: str, text_body: str, html_body: str) -> None:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            EMAIL_RELAY_URL,
+            json={"to": to_email, "subject": subject, "text": text_body, "html": html_body},
+            headers={"X-Relay-Secret": EMAIL_RELAY_SECRET},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Email relay returned {resp.status_code}: {resp.text}")
+
+
 async def send_email(to_email: str, subject: str, text_body: str, html_body: str) -> None:
-    """smtplib is synchronous — run it off the event loop."""
+    if EMAIL_RELAY_URL and EMAIL_RELAY_SECRET:
+        await _send_email_via_relay(to_email, subject, text_body, html_body)
+        return
+    # Local dev fallback: direct SMTP (smtplib is synchronous — run off the event loop).
     await asyncio.to_thread(_send_email_sync, to_email, subject, text_body, html_body)
 
 
