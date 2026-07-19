@@ -342,6 +342,21 @@ OTP_MAX_ATTEMPTS = 5
 OTP_RESEND_COOLDOWN_SECONDS = 60
 
 
+class _IPv4SMTP(smtplib.SMTP):
+    """Some free-tier hosts (Render included) hand containers IPv6 egress
+    that has no real route to certain destinations, surfacing as
+    'Network is unreachable' even though a working IPv4 path exists.
+    Force the actual socket connection to an IPv4 address while leaving
+    self._host as the real hostname, so starttls()'s SNI/certificate
+    check (which uses self._host, not the connected IP) is unaffected."""
+    def connect(self, host="", port=0, source_address=None):
+        try:
+            ip = socket.getaddrinfo(host, port, socket.AF_INET)[0][4][0]
+        except socket.gaierror:
+            ip = host
+        return super().connect(ip, port, source_address)
+
+
 def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: str) -> None:
     if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
         raise RuntimeError("SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASSWORD missing in .env)")
@@ -351,7 +366,7 @@ def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: str
     msg["To"] = to_email
     msg.attach(MIMEText(text_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+    with _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
