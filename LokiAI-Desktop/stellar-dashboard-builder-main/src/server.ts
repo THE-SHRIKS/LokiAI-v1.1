@@ -45,7 +45,12 @@ async function normalizeCatastrophicSsrResponse(response: Response): Promise<Res
 // is never the surface this hardening is protecting.
 function withSecurityHeaders(response: Response): Response {
   response.headers.set("X-Content-Type-Options", "nosniff");
-  response.headers.set("X-Frame-Options", "DENY");
+  // SAMEORIGIN (not DENY): the workspace's own Preview panel iframes pages
+  // from this same app (e.g. /android-app) as a legitimate in-product
+  // feature. DENY blocked that too, not just third-party embedding — the
+  // real threat this header defends against is an attacker's site framing
+  // ours for clickjacking, which SAMEORIGIN still fully blocks.
+  response.headers.set("X-Frame-Options", "SAMEORIGIN");
   response.headers.set("X-XSS-Protection", "1; mode=block");
   response.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   if (import.meta.env.PROD) {
@@ -73,7 +78,8 @@ const CSP_HEADER_VALUE =
   "img-src 'self' data: https:; " +
   "font-src 'self' data:; " +
   "connect-src 'self' http://localhost:8000 https:; " +
-  "frame-ancestors 'none'";
+  "frame-src 'self' https:; " +
+  "frame-ancestors 'self'";
 
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {

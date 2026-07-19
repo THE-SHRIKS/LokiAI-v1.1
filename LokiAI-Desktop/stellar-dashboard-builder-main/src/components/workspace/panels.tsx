@@ -377,13 +377,13 @@ export function ChangesPanel({ onClose }: { onClose?: () => void }) {
 /* ---------------- Preview ---------------- */
 
 export function PreviewPanel({ onClose }: { onClose?: () => void }) {
-  // Real page in a real iframe — defaults to the backend's install page,
-  // the same one phones open from the Add Device QR.
+  // Real page in a real iframe — defaults to this dashboard's own install
+  // page, the same one phones open from the Add Device QR.
   const [url, setUrl] = useState(() => {
     try {
-      return `${localStorage.getItem("lokiai_backend_url") ?? "http://localhost:8000"}/install`;
+      return `${window.location.origin}/android-app`;
     } catch {
-      return "http://localhost:8000/install";
+      return "/android-app";
     }
   });
   const [loading, setLoading] = useState(false);

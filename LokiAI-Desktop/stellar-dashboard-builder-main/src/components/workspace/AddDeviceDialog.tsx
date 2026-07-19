@@ -12,8 +12,10 @@ interface AddDeviceDialogProps {
 type Step = "install" | "pair";
 
 /// "Add Device" flow: real one-time pairing token from POST /pairing/generate.
-/// Step 1 QR: the backend's /install page (phone's default camera opens it).
-/// Step 2 QR: the pairing payload (scanned from inside the LokiAI app).
+/// Step 1 QR: this dashboard's own /android-app page (phone's default camera
+/// opens it) — not the backend directly, since the backend's filesystem
+/// can't hold the ~139MB APK. Step 2 QR: the pairing payload (scanned from
+/// inside the LokiAI app).
 export function AddDeviceDialog({ open, onClose }: AddDeviceDialogProps) {
   const [step, setStep] = useState<Step>("install");
   const [qrData, setQrData] = useState<string | null>(null);
@@ -29,8 +31,7 @@ export function AddDeviceDialog({ open, onClose }: AddDeviceDialogProps) {
     try {
       const res = await generatePairingToken();
       setQrData(res.qr_data);
-      const parsed = JSON.parse(res.qr_data) as { backend_url?: string };
-      setInstallUrl(parsed.backend_url ? `${parsed.backend_url}/install` : null);
+      setInstallUrl(`${window.location.origin}/android-app`);
       setExpiresAt(new Date(res.expires_at));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
