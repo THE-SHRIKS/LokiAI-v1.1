@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request, Response, Depends, UploadFile, File, Form
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
 from typing import Optional, List
@@ -85,9 +85,26 @@ async def _run_migrations(pool: asyncpg.Pool):
         """)
 
 
+async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> asyncpg.Pool:
+    """Neon's serverless compute auto-suspends after inactivity and takes a
+    few seconds to wake on the next connection; Render's free tier does the
+    same to the whole container after 15 idle minutes. The two can wake up
+    at once on the first request, so the initial pool connection gets a
+    short retry budget instead of failing the whole boot on one slow wake."""
+    last_error: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            return await asyncpg.create_pool(DATABASE_URL)
+        except (asyncpg.PostgresError, OSError, TimeoutError) as e:
+            last_error = e
+            if attempt < retries - 1:
+                await asyncio.sleep(base_delay * (attempt + 1))
+    raise last_error
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.pool = await asyncpg.create_pool(DATABASE_URL)
+    app.state.pool = await _create_pool_with_retry()
     await _run_migrations(app.state.pool)
     yield
     await app.state.pool.close()
@@ -423,9 +440,18 @@ APK_PATH = os.path.normpath(os.path.join(
     "..", "LokiAImobile UI", "build", "app", "outputs", "flutter-apk", "app-debug.apk"
 ))
 
+# Production hosts the APK as a GitHub Release asset (Render's filesystem is
+# ephemeral and the repo never carries the ~140MB build artifact — see
+# LokiAI-backend/README.md). When set, /apk redirects there instead of
+# serving APK_PATH from local disk (the local-dev flutter-build path).
+APK_DOWNLOAD_URL = os.getenv("APK_DOWNLOAD_URL")
+APK_SIZE_MB = os.getenv("APK_SIZE_MB")
+
 
 @app.api_route("/apk", methods=["GET", "HEAD"])
 async def download_apk():
+    if APK_DOWNLOAD_URL:
+        return RedirectResponse(APK_DOWNLOAD_URL, status_code=302)
     if not os.path.isfile(APK_PATH):
         raise HTTPException(status_code=404, detail="APK not built yet. Run flutter build first.")
     return FileResponse(
@@ -437,7 +463,11 @@ async def download_apk():
 
 @app.get("/install", response_class=HTMLResponse)
 async def install_page():
-    size_mb = round(os.path.getsize(APK_PATH) / (1024 * 1024), 1) if os.path.isfile(APK_PATH) else 0
+    if APK_DOWNLOAD_URL:
+        size_mb = float(APK_SIZE_MB) if APK_SIZE_MB else None
+    else:
+        size_mb = round(os.path.getsize(APK_PATH) / (1024 * 1024), 1) if os.path.isfile(APK_PATH) else None
+    size_text = f" ({size_mb} MB)" if size_mb else ""
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -460,7 +490,7 @@ async def install_page():
 </head>
 <body>
   <h1>LokiAI</h1>
-  <p>On-device AI for your phone. Tap below to download the app ({size_mb} MB), then open the file and allow the install when prompted.</p>
+  <p>On-device AI for your phone. Tap below to download the app{size_text}, then open the file and allow the install when prompted.</p>
   <a class="btn" href="/apk">Download LokiAI</a>
 </body>
 </html>"""
