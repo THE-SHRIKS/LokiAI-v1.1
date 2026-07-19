@@ -3,9 +3,11 @@ import { useEffect, useRef, useState } from "react";
 import { Sidebar } from "@/components/workspace/Sidebar";
 import { ChatPanel, type ChatMessage, type DeployState } from "@/components/workspace/ChatPanel";
 import { Workspace } from "@/components/workspace/Workspace";
+import { NimKeyModal } from "@/components/workspace/NimKeyModal";
 import {
   getToken,
   getDevices,
+  getMe,
   assistantChat,
   createDeployment,
   getDeployment,
@@ -88,6 +90,15 @@ function Index() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [device, setDevice] = useState<Device | null>(null);
   const [deployStates, setDeployStates] = useState<Record<string, DeployState>>({});
+
+  // Compulsory NIM key gate: every account brings its own NVIDIA NIM API
+  // key (no shared key, no fallback — see LokiAI-backend's assistant_chat).
+  // null = still checking, so nothing renders instead of a false flash.
+  const [hasNimKey, setHasNimKey] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!getToken()) return;
+    getMe().then((me) => setHasNimKey(me.has_nim_key)).catch(() => setHasNimKey(null));
+  }, []);
 
   useEffect(() => {
     saveSessions(sessions);
@@ -328,6 +339,7 @@ function Index() {
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
+      {hasNimKey === false && <NimKeyModal onSaved={() => setHasNimKey(true)} />}
       <div className="flex min-h-0 flex-1">
         <Sidebar
           collapsed={collapsed}

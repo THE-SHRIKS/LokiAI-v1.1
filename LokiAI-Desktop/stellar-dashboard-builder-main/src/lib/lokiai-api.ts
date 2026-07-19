@@ -204,10 +204,22 @@ export interface Me {
   name: string;
   email_verified: boolean;
   created_at: string | null;
+  has_nim_key: boolean;
 }
 
 export async function getMe() {
   return request<Me>("/auth/me");
+}
+
+export async function saveNimKey(apiKey: string) {
+  return request<{ saved: boolean }>("/auth/nim-key", {
+    method: "PUT",
+    body: JSON.stringify({ api_key: apiKey }),
+  });
+}
+
+export async function deleteNimKey() {
+  return request<{ deleted: boolean }>("/auth/nim-key", { method: "DELETE" });
 }
 
 // ── Devices & pairing ────────────────────────────────────────────────────────

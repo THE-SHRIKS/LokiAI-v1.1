@@ -28,6 +28,24 @@ ALGORITHM = "HS256"
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# Per-user secrets at rest (the NVIDIA NIM API key each account brings).
+# Fernet needs a 32-byte urlsafe-base64 key; derived from JWT_SECRET_KEY via
+# SHA-256 instead of requiring yet another env var — same trust boundary
+# (whoever has JWT_SECRET_KEY can already mint valid sessions for anyone).
+from cryptography.fernet import Fernet
+import base64
+import hashlib as _hashlib
+
+_fernet = Fernet(base64.urlsafe_b64encode(_hashlib.sha256(JWT_SECRET_KEY.encode()).digest()))
+
+
+def _encrypt_secret(plaintext: str) -> str:
+    return _fernet.encrypt(plaintext.encode()).decode()
+
+
+def _decrypt_secret(ciphertext: str) -> str:
+    return _fernet.decrypt(ciphertext.encode()).decode()
+
 async def _run_migrations(pool: asyncpg.Pool):
     """Idempotent startup schema migration — safe to run on every boot.
     Adds email verification support: real name on the account, a verified
@@ -83,6 +101,10 @@ async def _run_migrations(pool: asyncpg.Pool):
                 created_at  TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        # Each account brings its own NVIDIA NIM API key — the AI assistant
+        # is unusable (and the shared free-tier quota unshared) until the
+        # user provides one. Encrypted at rest; never returned to the client.
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS nvidia_api_key_encrypted TEXT")
 
 
 async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> asyncpg.Pool:
@@ -782,7 +804,8 @@ async def get_me(request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name, email_verified, created_at FROM users WHERE id = $1::uuid",
+            "SELECT id, email, name, email_verified, created_at, nvidia_api_key_encrypted "
+            "FROM users WHERE id = $1::uuid",
             user_id,
         )
         if not row:
@@ -793,7 +816,39 @@ async def get_me(request: Request, user_id: str = Depends(get_current_user)):
         "name": row["name"] or row["email"].split("@")[0],
         "email_verified": row["email_verified"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "has_nim_key": row["nvidia_api_key_encrypted"] is not None,
     }
+
+
+class NimKeyRequest(BaseModel):
+    api_key: str
+
+
+@app.put("/auth/nim-key")
+@limiter.limit("10/minute")
+async def save_nim_key(req: NimKeyRequest, request: Request, user_id: str = Depends(get_current_user)):
+    """Each account brings its own NVIDIA NIM API key — required before the
+    AI assistant will run for that user. Encrypted at rest, never returned."""
+    key = req.api_key.strip()
+    if not key:
+        raise HTTPException(status_code=422, detail="API key cannot be empty")
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET nvidia_api_key_encrypted = $1 WHERE id = $2::uuid",
+            _encrypt_secret(key), user_id,
+        )
+    return {"saved": True}
+
+
+@app.delete("/auth/nim-key")
+async def delete_nim_key(request: Request, user_id: str = Depends(get_current_user)):
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET nvidia_api_key_encrypted = NULL WHERE id = $1::uuid", user_id,
+        )
+    return {"deleted": True}
 
 
 # ------------------------------------------------------------------
@@ -1476,7 +1531,8 @@ async def upload_model(
 from openai import AsyncOpenAI
 import json
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+# No shared NVIDIA_API_KEY — every account brings its own NIM key, checked
+# and used per-request inside assistant_chat(). See _encrypt_secret/_decrypt_secret.
 # NIM_ROUTER_MODEL: conversational replies + intent-classification fallback.
 # NIM_SELECTOR_MODEL: constrained JSON ranking from real candidates.
 # NIM_INTENT_MODEL: fast primary intent classifier.
@@ -1599,6 +1655,20 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
     6. Every returned model id is re-validated against the filtered list
        server-side; hallucinated ids are dropped."""
     pool = request.app.state.pool
+
+    # Each account brings its own NVIDIA NIM key — no shared-quota fallback.
+    async with pool.acquire() as conn:
+        key_row = await conn.fetchrow(
+            "SELECT nvidia_api_key_encrypted FROM users WHERE id = $1::uuid", user_id
+        )
+    if not key_row or not key_row["nvidia_api_key_encrypted"]:
+        raise HTTPException(
+            status_code=428,
+            detail="Add your NVIDIA NIM API key before using the AI assistant. "
+                   "Get one free at https://build.nvidia.com, then save it in LokiAI settings."
+        )
+    user_nvidia_key = _decrypt_secret(key_row["nvidia_api_key_encrypted"])
+
     async with pool.acquire() as conn:
         device_row = await conn.fetchrow(
             "SELECT phone_model, cpu_arch, ram_mb, storage_free_gb, android_version, status FROM devices "
@@ -1617,7 +1687,7 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
 
     openai_client = AsyncOpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
-        api_key=NVIDIA_API_KEY,
+        api_key=user_nvidia_key,
         timeout=45.0,
     )
 

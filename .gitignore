@@ -25,6 +25,7 @@ dist-ssr/
 .tanstack/
 .nitro/
 .wrangler/
+.vercel/
 *.local
 npm-debug.log*
 yarn-debug.log*
