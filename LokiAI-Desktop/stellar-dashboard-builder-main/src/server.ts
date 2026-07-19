@@ -54,12 +54,21 @@ function withSecurityHeaders(response: Response): Response {
   return response;
 }
 
-// script-src/style-src omit 'unsafe-inline' on purpose (Job 3: "CSP blocks
-// inline scripts"). connect-src allows the backend API — without it every
-// fetch() to LokiAI-backend would be silently blocked by CSP, not CORS.
+// script-src needs 'unsafe-inline': TanStack Start's own SSR hydration
+// bootstrap ("$tsr-stream-barrier") is an inline <script> that embeds a
+// live per-request timestamp, so it's a different script body on every
+// single load — a static sha256 hash allowlist can't cover it, and this
+// Vinxi/TanStack Start version has no wired-up per-request CSP nonce. This
+// script is framework-trusted (not attacker-controlled), and the app never
+// uses dangerouslySetInnerHTML, so React's own escaping still covers any
+// real user content. Job 3 originally shipped this without 'unsafe-inline'
+// but never tested an actual production build (npm run dev never applies
+// CSP), so the break went unnoticed until the first real Vercel deploy.
+// connect-src allows the backend API — without it every fetch() to
+// LokiAI-backend would be silently blocked by CSP, not CORS.
 const CSP_HEADER_VALUE =
   "default-src 'self'; " +
-  "script-src 'self'; " +
+  "script-src 'self' 'unsafe-inline'; " +
   "style-src 'self' 'unsafe-inline'; " +
   "img-src 'self' data: https:; " +
   "font-src 'self' data:; " +
