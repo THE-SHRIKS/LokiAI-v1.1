@@ -12,8 +12,10 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as ResetPasswordRouteImport } from './routes/reset-password'
 import { Route as MonitorRouteImport } from './routes/monitor'
 import { Route as ModelsRouteImport } from './routes/models'
+import { Route as MobileUiRouteImport } from './routes/mobile-ui'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as ForgotPasswordRouteImport } from './routes/forgot-password'
+import { Route as FeedbackRouteImport } from './routes/feedback'
 import { Route as DevicesRouteImport } from './routes/devices'
 import { Route as AndroidAppRouteImport } from './routes/android-app'
 import { Route as IndexRouteImport } from './routes/index'
@@ -33,6 +35,11 @@ const ModelsRoute = ModelsRouteImport.update({
   path: '/models',
   getParentRoute: () => rootRouteImport,
 } as any)
+const MobileUiRoute = MobileUiRouteImport.update({
+  id: '/mobile-ui',
+  path: '/mobile-ui',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
@@ -41,6 +48,11 @@ const LoginRoute = LoginRouteImport.update({
 const ForgotPasswordRoute = ForgotPasswordRouteImport.update({
   id: '/forgot-password',
   path: '/forgot-password',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const FeedbackRoute = FeedbackRouteImport.update({
+  id: '/feedback',
+  path: '/feedback',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DevicesRoute = DevicesRouteImport.update({
@@ -63,8 +75,10 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/android-app': typeof AndroidAppRoute
   '/devices': typeof DevicesRoute
+  '/feedback': typeof FeedbackRoute
   '/forgot-password': typeof ForgotPasswordRoute
   '/login': typeof LoginRoute
+  '/mobile-ui': typeof MobileUiRoute
   '/models': typeof ModelsRoute
   '/monitor': typeof MonitorRoute
   '/reset-password': typeof ResetPasswordRoute
@@ -73,8 +87,10 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/android-app': typeof AndroidAppRoute
   '/devices': typeof DevicesRoute
+  '/feedback': typeof FeedbackRoute
   '/forgot-password': typeof ForgotPasswordRoute
   '/login': typeof LoginRoute
+  '/mobile-ui': typeof MobileUiRoute
   '/models': typeof ModelsRoute
   '/monitor': typeof MonitorRoute
   '/reset-password': typeof ResetPasswordRoute
@@ -84,8 +100,10 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/android-app': typeof AndroidAppRoute
   '/devices': typeof DevicesRoute
+  '/feedback': typeof FeedbackRoute
   '/forgot-password': typeof ForgotPasswordRoute
   '/login': typeof LoginRoute
+  '/mobile-ui': typeof MobileUiRoute
   '/models': typeof ModelsRoute
   '/monitor': typeof MonitorRoute
   '/reset-password': typeof ResetPasswordRoute
@@ -96,8 +114,10 @@ export interface FileRouteTypes {
     | '/'
     | '/android-app'
     | '/devices'
+    | '/feedback'
     | '/forgot-password'
     | '/login'
+    | '/mobile-ui'
     | '/models'
     | '/monitor'
     | '/reset-password'
@@ -106,8 +126,10 @@ export interface FileRouteTypes {
     | '/'
     | '/android-app'
     | '/devices'
+    | '/feedback'
     | '/forgot-password'
     | '/login'
+    | '/mobile-ui'
     | '/models'
     | '/monitor'
     | '/reset-password'
@@ -116,8 +138,10 @@ export interface FileRouteTypes {
     | '/'
     | '/android-app'
     | '/devices'
+    | '/feedback'
     | '/forgot-password'
     | '/login'
+    | '/mobile-ui'
     | '/models'
     | '/monitor'
     | '/reset-password'
@@ -127,8 +151,10 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AndroidAppRoute: typeof AndroidAppRoute
   DevicesRoute: typeof DevicesRoute
+  FeedbackRoute: typeof FeedbackRoute
   ForgotPasswordRoute: typeof ForgotPasswordRoute
   LoginRoute: typeof LoginRoute
+  MobileUiRoute: typeof MobileUiRoute
   ModelsRoute: typeof ModelsRoute
   MonitorRoute: typeof MonitorRoute
   ResetPasswordRoute: typeof ResetPasswordRoute
@@ -157,6 +183,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ModelsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/mobile-ui': {
+      id: '/mobile-ui'
+      path: '/mobile-ui'
+      fullPath: '/mobile-ui'
+      preLoaderRoute: typeof MobileUiRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/login': {
       id: '/login'
       path: '/login'
@@ -169,6 +202,13 @@ declare module '@tanstack/react-router' {
       path: '/forgot-password'
       fullPath: '/forgot-password'
       preLoaderRoute: typeof ForgotPasswordRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/feedback': {
+      id: '/feedback'
+      path: '/feedback'
+      fullPath: '/feedback'
+      preLoaderRoute: typeof FeedbackRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/devices': {
@@ -199,8 +239,10 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AndroidAppRoute: AndroidAppRoute,
   DevicesRoute: DevicesRoute,
+  FeedbackRoute: FeedbackRoute,
   ForgotPasswordRoute: ForgotPasswordRoute,
   LoginRoute: LoginRoute,
+  MobileUiRoute: MobileUiRoute,
   ModelsRoute: ModelsRoute,
   MonitorRoute: MonitorRoute,
   ResetPasswordRoute: ResetPasswordRoute,

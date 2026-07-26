@@ -1,7 +1,9 @@
 // LokiAI backend client — every call hits the real FastAPI backend.
 // No mock data anywhere: if the backend is unreachable the UI must say so.
 
-const DEFAULT_BACKEND = import.meta.env.PROD ? "https://lokiai.onrender.com" : "http://localhost:8000";
+const DEFAULT_BACKEND = import.meta.env.PROD 
+  ? "https://lokiai.onrender.com" 
+  : `${window.location.protocol}//${window.location.hostname}:8000`;
 
 export function backendUrl(): string {
   return localStorage.getItem("lokiai_backend_url") ?? DEFAULT_BACKEND;

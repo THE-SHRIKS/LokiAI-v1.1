@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { Download, RefreshCw, ScanLine, X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { generatePairingToken } from "@/lib/lokiai-api";
+import { generatePairingToken, backendUrl, getToken } from "@/lib/lokiai-api";
 
 interface AddDeviceDialogProps {
   open: boolean;
@@ -12,10 +12,9 @@ interface AddDeviceDialogProps {
 type Step = "install" | "pair";
 
 /// "Add Device" flow: real one-time pairing token from POST /pairing/generate.
-/// Step 1 QR: this dashboard's own /android-app page (phone's default camera
-/// opens it) — not the backend directly, since the backend's filesystem
-/// can't hold the ~139MB APK. Step 2 QR: the pairing payload (scanned from
-/// inside the LokiAI app).
+/// Step 1 QR: this dashboard's own /mobile-ui page — URL built from the real
+/// LAN IP returned by GET /system/info so phones on the same network can reach it.
+/// Step 2 QR: the pairing payload (scanned from inside the LokiAI app).
 export function AddDeviceDialog({ open, onClose }: AddDeviceDialogProps) {
   const [step, setStep] = useState<Step>("install");
   const [qrData, setQrData] = useState<string | null>(null);
@@ -29,9 +28,23 @@ export function AddDeviceDialog({ open, onClose }: AddDeviceDialogProps) {
     setBusy(true);
     setError(null);
     try {
+      // Fetch LAN-reachable dashboard URL from backend so QR works on phone
+      let dashboardBase = window.location.origin;
+      try {
+        const infoRes = await fetch(`${backendUrl()}/system/info`, {
+          headers: { Authorization: `Bearer ${getToken()!}` },
+        });
+        if (infoRes.ok) {
+          const info = await infoRes.json() as { dashboard_url: string };
+          if (info.dashboard_url) dashboardBase = info.dashboard_url;
+        }
+      } catch {
+        // silently fall back to window.location.origin
+      }
+
       const res = await generatePairingToken();
       setQrData(res.qr_data);
-      setInstallUrl(`${window.location.origin}/android-app`);
+      setInstallUrl(`${dashboardBase}/mobile-ui`);
       setExpiresAt(new Date(res.expires_at));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

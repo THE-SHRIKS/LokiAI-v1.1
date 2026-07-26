@@ -121,8 +121,7 @@ function LoginPage() {
     <div className="flex h-screen flex-col items-center justify-center bg-background text-foreground">
       <div className="w-full max-w-sm rounded-md border border-border bg-panel">
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-          <Asterisk className="h-4 w-4 text-olive-bright" />
-          <span className="text-sm font-medium">LokiAI</span>
+          <img src="/lokiai-logo.png" alt="LokiAI" style={{ height: 22, width: "auto", opacity: 0.9 }} />
           <span className="ml-auto text-[11px] text-muted-foreground">
             on-device AI, no cloud
           </span>

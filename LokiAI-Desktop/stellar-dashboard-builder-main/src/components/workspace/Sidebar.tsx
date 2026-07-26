@@ -15,6 +15,7 @@ import {
   Dot,
   Activity,
   LogOut,
+  MessageSquarePlus,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getMe, logout, type Me } from "@/lib/lokiai-api";
@@ -76,7 +77,8 @@ export function Sidebar({ collapsed, onToggle, recents, activeRecentId, onSelect
 
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-panel">
-      <div className="flex items-center gap-1 px-2 py-2">
+      <div className="flex items-center justify-between pl-3 pr-2 py-2.5">
+        <img src="/lokiai-logo.png" alt="LokiAI" style={{ height: 26, width: "auto", opacity: 1 }} />
         <button onClick={onToggle} className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground" title="Collapse sidebar (Ctrl+B)">
           <PanelLeft className="h-4 w-4" />
         </button>
@@ -89,6 +91,7 @@ export function Sidebar({ collapsed, onToggle, recents, activeRecentId, onSelect
         <SideItem icon={Repeat} label="Models" onClick={() => navigate({ to: "/models" })} />
         <SideItem icon={Send} label="Devices" onClick={() => navigate({ to: "/devices" })} />
         <SideItem icon={Activity} label="Monitor" onClick={() => navigate({ to: "/monitor" })} />
+        <SideItem icon={MessageSquarePlus} label="Feedback" onClick={() => navigate({ to: "/feedback" })} />
       </nav>
 
       <div className="mt-4 px-3 pb-1 text-[11px] uppercase tracking-wider text-muted-foreground/70 flex items-center justify-between">

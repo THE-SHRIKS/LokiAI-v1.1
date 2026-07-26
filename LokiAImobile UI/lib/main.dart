@@ -53,7 +53,7 @@ class LokiApp extends StatelessWidget {
           bodyMedium: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: LokiColors.textSecondary),
         ),
       ),
-      home: const LokiHomeScreen(), // Bypassed PairingGate to directly open the app without QR scanning
+      home: const PairingGate(), // Checks pairing and shows QR scanner if disconnected
     );
   }
 }

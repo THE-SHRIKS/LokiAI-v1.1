@@ -305,6 +305,76 @@ async def monitor_status(request: Request):
 async def monitor_get_log(limit: int = 50):
     return monitor_log[-limit:]
 
+# ── Feedback ──────────────────────────────────────────────────────────────────
+feedback_store: list[dict] = []
+
+class FeedbackPayload(BaseModel):
+    category: str
+    message: str
+
+@app.post("/feedback")
+async def submit_feedback(payload: FeedbackPayload, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    token_data = verify_token(credentials.credentials)
+    if not token_data:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not payload.message.strip():
+        raise HTTPException(status_code=422, detail="Message cannot be empty")
+    if len(payload.message) > 2000:
+        raise HTTPException(status_code=422, detail="Message too long (max 2000 chars)")
+
+    user_email = token_data.get("sub", "unknown")
+    ts = datetime.now(timezone.utc).isoformat()
+    entry_id = _uuid.uuid4().hex[:8]
+
+    entry = {
+        "id": entry_id,
+        "ts": ts,
+        "user": user_email,
+        "category": payload.category,
+        "message": payload.message.strip(),
+    }
+    feedback_store.append(entry)
+
+    # Fire-and-forget email to team inbox
+    text_body = (
+        f"New LokiAI feedback\n"
+        f"──────────────────\n"
+        f"ID:       {entry_id}\n"
+        f"From:     {user_email}\n"
+        f"Category: {payload.category}\n"
+        f"Time:     {ts}\n\n"
+        f"{payload.message.strip()}\n"
+    )
+    html_body = f"""<div style="font-family:sans-serif;background:#0A0A0A;color:#F5F5F5;padding:24px;border-radius:12px;max-width:520px;">
+<h2 style="margin-top:0;color:#8BC34A;">New Feedback</h2>
+<table style="border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px;">
+  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">From</td><td style="color:#F5F5F5;">{user_email}</td></tr>
+  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">Category</td><td style="color:#F5F5F5;">{payload.category}</td></tr>
+  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">ID</td><td style="color:#555;font-family:monospace;">{entry_id}</td></tr>
+  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">Time</td><td style="color:#555;font-family:monospace;">{ts}</td></tr>
+</table>
+<div style="background:#141414;border-radius:8px;padding:16px;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#E8EDE0;">{payload.message.strip()}</div>
+</div>"""
+
+    asyncio.create_task(
+        send_email(
+            to_email=SMTP_FROM_EMAIL,
+            subject=f"[LokiAI Feedback] {payload.category} — {user_email}",
+            text_body=text_body,
+            html_body=html_body,
+        )
+    )
+
+    return {"ok": True, "id": entry_id}
+
+@app.get("/feedback")
+async def get_feedback(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    token_data = verify_token(credentials.credentials)
+    if not token_data:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return list(reversed(feedback_store))
+
+
 class AuthUser(BaseModel):
     email: EmailStr
     password: str
@@ -1007,6 +1077,54 @@ def _public_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+# ── APK distribution ──────────────────────────────────────────────────────────
+_APK_PATH = os.path.join(os.path.dirname(__file__), "apk", "lokiai.apk")
+
+@app.get("/apk/download")
+async def download_apk():
+    """Serves the LokiAI Android APK directly — no GitHub login required."""
+    if not os.path.exists(_APK_PATH):
+        raise HTTPException(status_code=404, detail="APK not found on server")
+    return FileResponse(
+        path=_APK_PATH,
+        media_type="application/vnd.android.package-archive",
+        filename="lokiai.apk",
+        headers={"Content-Disposition": "attachment; filename=lokiai.apk"},
+    )
+
+@app.get("/apk/info")
+async def apk_info():
+    """Returns APK metadata (size, availability) so the frontend can show accurate info."""
+    if not os.path.exists(_APK_PATH):
+        return {"available": False}
+    size_mb = round(os.path.getsize(_APK_PATH) / (1024 * 1024), 1)
+    return {"available": True, "size_mb": size_mb, "filename": "lokiai.apk"}
+
+
+@app.get("/system/info")
+async def system_info(request: Request):
+    """Returns the LAN-reachable base URLs for both backend and dashboard.
+    Used by the frontend to build QR codes that work from a phone on the
+    same network — window.location.origin gives localhost which the phone
+    can't reach."""
+    backend_base = _public_base_url(request)
+    # Dashboard runs on the same machine, same IP, but port 8080 by default.
+    # DASHBOARD_PUBLIC_URL overrides this for production deployments.
+    lan_ip = _detect_lan_ip()
+    dashboard_port = 8080
+    if DASHBOARD_URL and not DASHBOARD_URL.startswith("http://localhost"):
+        dashboard_base = DASHBOARD_URL.rstrip("/")
+    elif lan_ip:
+        dashboard_base = f"http://{lan_ip}:{dashboard_port}"
+    else:
+        dashboard_base = DASHBOARD_URL.rstrip("/")
+    return {
+        "backend_url": backend_base,
+        "dashboard_url": dashboard_base,
+        "lan_ip": lan_ip,
+    }
+
+
 @app.post("/pairing/generate")
 async def generate_pairing_token(request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
@@ -1167,9 +1285,9 @@ async def get_devices(request: Request, user_id: str = Depends(get_current_user)
             d = dict(r)
             d["id"] = str(d["id"])
             d["user_id"] = str(d["user_id"])
-            if d["last_seen"]:
+            if d.get("last_seen"):
                 d["last_seen"] = d["last_seen"].isoformat()
-            if d["created_at"]:
+            if d.get("created_at"):
                 d["created_at"] = d["created_at"].isoformat()
             d.pop("adb_serial", None)
             res.append(d)
