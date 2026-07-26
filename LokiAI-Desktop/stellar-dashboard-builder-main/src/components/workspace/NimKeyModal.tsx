@@ -18,8 +18,8 @@ export function NimKeyModal({ onSaved }: NimKeyModalProps) {
 
   const submit = async () => {
     const key = apiKey.trim();
-    if (!key) {
-      setError("Enter your NVIDIA NIM API key.");
+    if (!key.startsWith("nvapi-")) {
+      setError("NVIDIA NIM API keys must start with 'nvapi-'.");
       return;
     }
     setBusy(true);

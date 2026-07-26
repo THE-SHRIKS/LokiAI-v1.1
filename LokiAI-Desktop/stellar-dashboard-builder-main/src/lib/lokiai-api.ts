@@ -3,7 +3,9 @@
 
 const DEFAULT_BACKEND = import.meta.env.PROD 
   ? "https://lokiai.onrender.com" 
-  : `${window.location.protocol}//${window.location.hostname}:8000`;
+  : typeof window !== "undefined" 
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
+    : "http://localhost:8000";
 
 export function backendUrl(): string {
   return localStorage.getItem("lokiai_backend_url") ?? DEFAULT_BACKEND;

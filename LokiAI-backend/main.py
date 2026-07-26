@@ -2521,3 +2521,62 @@ async def get_deployment_status(deployment_id: str, request: Request, user_id: s
             "error_message": row["error_message"],
             "progress_percent": 100 if row["status"] == "complete" else (row["progress"] or 0)
         }
+
+@app.get("/admin/stats")
+async def get_admin_stats(request: Request):
+    # This is a local admin dashboard endpoint. 
+    # In a real production app, we would secure this with an admin role.
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        # Get overall counts
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        total_devices = await conn.fetchval("SELECT COUNT(*) FROM devices")
+        active_devices = await conn.fetchval("SELECT COUNT(*) FROM devices WHERE status = 'online'")
+        total_deployments = await conn.fetchval("SELECT COUNT(*) FROM deployments WHERE status = 'complete'")
+
+        # Get detailed user list with their devices and deployments
+        users_raw = await conn.fetch("""
+            SELECT u.id, u.name, u.email, u.created_at, u.email_verified,
+                   (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id) as device_count,
+                   (SELECT MAX(last_seen) FROM devices d WHERE d.user_id = u.id) as last_active
+            FROM users u
+            ORDER BY u.created_at DESC
+        """)
+
+        users = []
+        for u in users_raw:
+            # Fetch latest deployment for this user
+            latest_deployment = await conn.fetchrow("""
+                SELECT m.name as model_name, m.hf_model_id, d.status, d.completed_at
+                FROM deployments d
+                JOIN models m ON d.model_id = m.id
+                WHERE d.user_id = $1
+                ORDER BY d.deployed_at DESC
+                LIMIT 1
+            """, u['id'])
+
+            users.append({
+                "id": str(u['id']),
+                "name": u['name'],
+                "email": u['email'],
+                "created_at": u['created_at'].isoformat() if u['created_at'] else None,
+                "last_active": u['last_active'].isoformat() if u['last_active'] else None,
+                "email_verified": u['email_verified'],
+                "device_count": u['device_count'],
+                "latest_deployment": {
+                    "model_name": latest_deployment['model_name'] if latest_deployment else None,
+                    "hf_model_id": latest_deployment['hf_model_id'] if latest_deployment else None,
+                    "status": latest_deployment['status'] if latest_deployment else None,
+                    "completed_at": latest_deployment['completed_at'].isoformat() if latest_deployment and latest_deployment['completed_at'] else None
+                } if latest_deployment else None
+            })
+
+        return {
+            "overview": {
+                "total_users": total_users,
+                "total_devices": total_devices,
+                "active_devices": active_devices,
+                "total_deployments": total_deployments
+            },
+            "users": users
+        }
