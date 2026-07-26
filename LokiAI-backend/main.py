@@ -176,6 +176,7 @@ ALLOWED_ORIGINS = list(dict.fromkeys(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://lokiai.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
@@ -900,8 +901,8 @@ async def save_nim_key(req: NimKeyRequest, request: Request, user_id: str = Depe
     """Each account brings its own NVIDIA NIM API key — required before the
     AI assistant will run for that user. Encrypted at rest, never returned."""
     key = req.api_key.strip()
-    if not key:
-        raise HTTPException(status_code=422, detail="API key cannot be empty")
+    if not key or not key.startswith("nvapi-"):
+        raise HTTPException(status_code=422, detail="Invalid API key. NVIDIA NIM keys must start with 'nvapi-'")
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute(
