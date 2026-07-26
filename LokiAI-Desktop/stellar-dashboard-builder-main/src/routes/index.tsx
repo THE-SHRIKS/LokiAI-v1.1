@@ -4,6 +4,7 @@ import { Sidebar } from "@/components/workspace/Sidebar";
 import { ChatPanel, type ChatMessage, type DeployState } from "@/components/workspace/ChatPanel";
 import { Workspace } from "@/components/workspace/Workspace";
 import { NimKeyModal } from "@/components/workspace/NimKeyModal";
+import { LandingPage } from "@/components/landing/LandingPage";
 import {
   getToken,
   getDevices,
@@ -80,10 +81,15 @@ function saveSessions(sessions: ChatSession[]) {
 function Index() {
   const navigate = useNavigate();
   const deploySearch = Route.useSearch();
-  // Auth gate: the workspace is only for signed-in users.
+  // Determine authentication state
+  const [isAuthenticated, setIsAuthenticated] = useState(() => !!getToken());
+  
   useEffect(() => {
-    if (!getToken()) navigate({ to: "/login" });
-  }, [navigate]);
+    // Keep it synced if token changes in another tab or after login
+    const handleStorage = () => setIsAuthenticated(!!getToken());
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, []);
 
   const [collapsed, setCollapsed] = useState(false);
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
@@ -336,6 +342,10 @@ function Index() {
   const recents = [...sessions]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .map((s) => ({ id: s.id, title: s.title }));
+
+  if (!isAuthenticated) {
+    return <LandingPage />;
+  }
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
