@@ -259,3 +259,119 @@ None against production. `test_infra/schema_baseline.sql` was applied only to th
 #### Outcome
 
 Batch 0 complete. Disposable test environment works and is reproducible. Two of Entry 1's P0 findings (P0-1 `/admin/stats`, P0-6 `/auth/me` crash) were independently reproduced live, with exact matching evidence, strengthening confidence in the rest of the defect register. Two genuinely dangerous non-test scripts (`delete_device.py`, `update_device.py`) were identified and correctly never run. One real incident occurred (§6) — a real email send via real credentials to a fictitious address, caused by an environment-isolation mistake — disclosed immediately, root-caused, and fixed for all subsequent runs. Frontend typecheck baseline is currently **failing** on the committed repo (stale generated file, not a real type error) — recorded honestly, not fixed (no code changes permitted in Batch 0). Flutter baseline is blocked by missing tooling on this machine. No Batch 1 (or any production) work was started.
+
+**Batch 0 commit:** `c3f6093ac23d880419bd7a8c4d73ed8c875cfc3a`
+
+---
+
+### Entry 3 — Batches 1–8 implementation + full regression
+
+**Date:** 2026-07-27
+**Branch:** `chore/batch0-test-baseline` (never merged to `main`, never deployed)
+**Range:** `c3f6093` → `f7efca6`
+**Authorization:** user granted use of real accounts/email/DB/NIM/devices; the disposable database was used anyway for the test *flow* because it is hermetic, needs no manual OTP retrieval, and has zero real-world side effects. Real HuggingFace API calls were made (read-only, public, unauthenticated). Production Neon was never written to.
+
+#### Execution order
+
+As instructed: Batch 0 → 1 → 2 → 6 → 5 → 4 → 3 → 7 → 8 → full regression → reports. Batches 3 and 7 were committed together because both rewrite the same WebSocket handler and could not be split without one leaving the other's tests failing.
+
+#### Commits
+
+```
+c3f6093ac23d880419bd7a8c4d73ed8c875cfc3a  Batch 0  test baseline, no app changes
+e584bcaeaf74a82403b5fc1ddc216d0821f8a495  Batch 1  P0-6 + P0-9 undefined-name 500s, NIM key exposure
+d87881b9a735ba442e6e8c3575654b4d7835c95a  Batch 2  P0-1, P0-1b, P0-2, P0-2b, P0-3 cross-tenant exposure
+da14ee72b4c93135f3ee0def0df3dada5e8a1af1  Batch 6  P0-7 CORS wildcard
+01e6df024cf4196c8c24b0891bf12a14ff2d3e0d  Batch 5  P0-8 upload cap, P1-2 rate limits
+1680e385fc658641fb95c1ff67d64ce0ba3e6425  Batch 4  P0-5 device takeover
+06116699d0ceae23152335cdfd22fcc08a38c2a2  Batch 3+7 P0-4 WS auth, P1-3/4/7 presence
+f7efca6807a2d715b9a3337fedf4c3b7d7f9b975  Batch 8  P1-6 reconnect/lifecycle, P1-8 path traversal
+```
+
+#### Commands run (representative; every batch followed the same loop)
+
+```
+git checkout -b chore/batch0-test-baseline           # from 168f79b
+# per batch:
+#   edit -> restart backend against disposable DB -> run reproducer -> commit
+bash test_infra/run_test_backend.sh                   # env-isolated boot
+./venv/Scripts/python.exe test_infra/regression.py
+PRESENCE_TTL_SECONDS=5 ./venv/Scripts/python.exe test_infra/presence_test.py
+npx tsc --noEmit          # frontend typecheck
+npm run lint              # eslint
+npm run build             # vite + nitro
+./venv/Scripts/python.exe -c "import ast; ast.parse(open('main.py').read())"
+grep -icE "nvapi-|postgresql://|JWT_SECRET|password_hash" test_infra/backend.log
+```
+
+#### Sanitized raw output — regression progression
+
+```
+Batch 0 baseline (pre-fix):   14 checks,  8 passed,  6 failed
+after Batch 1:                14 checks,  9 passed,  5 failed
+after Batch 2:                14 checks, 13 passed,  1 failed
+after Batch 6:                16 checks, 15 passed,  1 failed
+after Batch 5:                18 checks, 17 passed,  1 failed
+after Batch 4:                18 checks, 18 passed,  0 failed   <- all P0 closed
+after Batch 3+7:              22 checks, 22 passed,  0 failed
+final (Batch 8):              22 checks, 22 passed,  0 failed
+presence liveness:             3 checks,  3 passed,  0 failed
+```
+
+Final run and the presence-test output are reproduced verbatim in `LOKIAI_FINAL_TEST_REPORT.md`.
+
+#### Failures encountered and how they were resolved
+
+1. **`POST /auth/register` 502 in the test harness** — registration sends a real OTP email and SMTP is deliberately unreachable in the test environment, so the transaction rolled back. Resolved by seeding verified users directly in the disposable DB; the login path is still exercised for real. Not a product defect.
+
+2. **New defect found, not in the audit register (P0-9)** — the first regression run surfaced `POST /feedback` returning 500. Root cause: `verify_token` called at `main.py:318` and `:373` but never defined anywhere. Both feedback endpoints were 100% broken in production. Fixed in Batch 1 alongside the `_decrypt_key` crash (same class of bug). Recorded here because it was discovered by testing, not by the original audit.
+
+3. **`get_current_user` NameError at import** — moving `/feedback` onto the shared auth dependency failed at import time, since FastAPI resolves `Depends()` when the decorator runs and the helper was defined ~500 lines below its new first use. Resolved by moving the definition above the first route that needs it. Caught before commit.
+
+4. **`FLOW-1` false failure after Batch 5** — the new rate-limit check exhausted the shared account's `/models/search` budget, starving the end-to-end flow check that ran after it. This was a test-isolation defect, not a product regression: fixed by giving the rate-limit check its own dedicated account. Recorded rather than silently reordered.
+
+5. **`websockets` rejected close code 1006** — the presence test tried to send 1006 deliberately; that code only ever *describes* an abnormal close and cannot be sent. Replaced with a transport-level abort, which is a truer simulation of a killed process anyway.
+
+#### Database changes
+
+- **Production Neon: none.** Never connected to for writes at any point in Batches 1–8.
+- **Disposable local DB:** synthetic rows created and deleted per run under a unique `batch0test-<8hex>` prefix. Cleanup returned `rc=0` on every run. One operator-allowlist test account was created and deleted inline while verifying `ADMIN_EMAILS`.
+- **No migration was written or applied.** No batch required a schema change.
+
+#### Provider results
+
+- **HuggingFace (real, unauthenticated, read-only):** `/models/search` returned real results throughout, e.g. `litert-community/MobileNet-v2` 13.43 MB, `MobileNet-v3-small` 9.71 MB, `yolox-m-litert` 48.68 MB, `resnet18` 44.59 MB, `MobileNet-v3-large` 20.91 MB — real repo ids, real CDN-measured sizes, real download counts.
+- **NVIDIA NIM:** not called. `/assistant/chat` was verified only to its `428` "key required" gate; no real NIM quota was consumed.
+- **Email:** no send attempted after the Entry 2 §6 incident. SMTP was pointed at an unresolvable host for every run in this entry; the one register attempt failed fast with `getaddrinfo failed` and rolled back cleanly, as designed.
+
+#### Real-device results
+
+**None.** No Flutter/Dart SDK exists on this machine (`flutter`/`dart` absent from PATH and from the usual install locations). The mobile code in Batches 3 and 8 is committed but has **never been compiled, analyzed, or run**, and the reconnect fix has never been exercised on a physical phone. The new `test/model_downloader_test.dart` (14 cases) is written but unexecuted; its logic was verified by running an exact Python port against the same 14 cases (14/14 match). This is the largest outstanding gap and is recorded as R-1/R-2 in the risk register.
+
+#### Secret handling
+
+`grep -icE "nvapi-|postgresql://|JWT_SECRET|password_hash"` over the full server log: **0**. `SEC-1` additionally asserts no secrets or tracebacks reach client-visible error bodies. No secret value was printed, logged, or committed at any point; only presence/absence was ever checked.
+
+#### Files changed
+
+25 files, +3542 / −135. Full list in `LOKIAI_FULL_IMPLEMENTATION_REPORT.md`. Application code: `LokiAI-backend/main.py`, `.env.example`, 5 dashboard `src/` files, 4 Flutter `lib/` files. Everything else is new test infrastructure under `test_infra/` and documentation under `Docs/test/`.
+
+#### Rollback
+
+No migration to undo. Each batch reverts independently:
+
+```
+git revert f7efca6   # Batch 8
+git revert 0611669   # Batch 3+7 — reopens P0-4
+git revert 1680e38   # Batch 4  — reopens P0-5 device takeover
+git revert 01e6df0   # Batch 5
+git revert da14ee7   # Batch 6  — reopens P0-7 session takeover
+git revert d87881b   # Batch 2  — reopens P0-1/2/3 to the internet
+git revert e584bca   # Batch 1  — restores the /auth/me and /feedback 500s
+```
+
+Reverting Batches 2, 4, or 6 reintroduces a P0; prefer fixing forward. Fastest production rollback is Render's previous-deploy button.
+
+#### Outcome
+
+All 8 audit P0s closed, plus 2 P0-class defects found during implementation (P0-2b, P0-9). Four P1s closed. 22/22 regression and 3/3 presence liveness passing; frontend typecheck, lint and build all exit 0. The user's originally-reported reconnect symptom is **proven fixed server-side** (a device abandoned without a clean close now expires to offline and returns to connected on reconnect) and **implemented but unproven client-side**. Not merged, not deployed, per instruction. Six reports produced under `Docs/test/`. Honest verdict recorded in `LOKIAI_RELEASE_READINESS_REPORT.md`: conditionally ready for backend + dashboard once two configuration prerequisites are met; mobile not ready until it can be built and verified on a real device.
