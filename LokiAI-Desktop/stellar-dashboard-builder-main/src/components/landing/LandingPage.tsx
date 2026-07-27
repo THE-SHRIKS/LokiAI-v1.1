@@ -77,34 +77,49 @@ export function LandingPage() {
             </div>
 
             <div className="grid gap-8 md:grid-cols-3">
-              <div className="rounded-lg border border-border bg-panel p-8 transition-colors hover:border-olive/50">
-                <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
-                  <Cpu className="h-5 w-5" />
+              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-colors hover:border-olive/50">
+                <div className="h-48 w-full overflow-hidden border-b border-border/50">
+                  <img src="/feature_local_inference.jpg" alt="Local Inference Visualization" className="h-full w-full object-cover transition-transform duration-700 group-hover:scale-105" />
                 </div>
-                <h3 className="mb-2 text-lg font-semibold text-foreground">Local Inference</h3>
-                <p className="text-sm leading-relaxed text-muted-foreground">
-                  Models run natively on your phone's hardware. Once downloaded, inference works completely offline with zero latency.
-                </p>
+                <div className="p-8">
+                  <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
+                    <Cpu className="h-5 w-5" />
+                  </div>
+                  <h3 className="mb-2 text-lg font-semibold text-foreground">Local Inference</h3>
+                  <p className="text-sm leading-relaxed text-muted-foreground">
+                    Models run natively on your phone's hardware. Once downloaded, inference works completely offline with zero latency.
+                  </p>
+                </div>
               </div>
 
-              <div className="rounded-lg border border-border bg-panel p-8 transition-colors hover:border-olive/50">
-                <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
-                  <ShieldCheck className="h-5 w-5" />
+              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-colors hover:border-olive/50">
+                <div className="h-48 w-full overflow-hidden border-b border-border/50">
+                  <img src="/feature_privacy.jpg" alt="Absolute Privacy Visualization" className="h-full w-full object-cover transition-transform duration-700 group-hover:scale-105" />
                 </div>
-                <h3 className="mb-2 text-lg font-semibold text-foreground">Absolute Privacy</h3>
-                <p className="text-sm leading-relaxed text-muted-foreground">
-                  Your data never leaves your device. No cloud processing, no server logs, and no API subscriptions required.
-                </p>
+                <div className="p-8">
+                  <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
+                    <ShieldCheck className="h-5 w-5" />
+                  </div>
+                  <h3 className="mb-2 text-lg font-semibold text-foreground">Absolute Privacy</h3>
+                  <p className="text-sm leading-relaxed text-muted-foreground">
+                    Your data never leaves your device. No cloud processing, no server logs, and no API subscriptions required.
+                  </p>
+                </div>
               </div>
 
-              <div className="rounded-lg border border-border bg-panel p-8 transition-colors hover:border-olive/50">
-                <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
-                  <Zap className="h-5 w-5" />
+              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-colors hover:border-olive/50">
+                <div className="h-48 w-full overflow-hidden border-b border-border/50">
+                  <img src="/feature_wireless.jpg" alt="Wireless Deployment Visualization" className="h-full w-full object-cover transition-transform duration-700 group-hover:scale-105" />
                 </div>
-                <h3 className="mb-2 text-lg font-semibold text-foreground">Wireless Deployment</h3>
-                <p className="text-sm leading-relaxed text-muted-foreground">
-                  Just scan a QR code. Our proprietary WebSocket bridge pushes gigabyte-scale models over local Wi-Fi instantly.
-                </p>
+                <div className="p-8">
+                  <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
+                    <Zap className="h-5 w-5" />
+                  </div>
+                  <h3 className="mb-2 text-lg font-semibold text-foreground">Wireless Deployment</h3>
+                  <p className="text-sm leading-relaxed text-muted-foreground">
+                    Just scan a QR code. Our proprietary WebSocket bridge pushes gigabyte-scale models over local Wi-Fi instantly.
+                  </p>
+                </div>
               </div>
             </div>
           </div>
