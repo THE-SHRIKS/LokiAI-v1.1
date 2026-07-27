@@ -50,15 +50,42 @@ export function LandingPage() {
               </Link>
             </div>
 
-            {/* Hero Visual */}
+            {/* Interactive Hero Visual */}
             <div className="mt-20 flex justify-center">
-              <div className="relative w-full max-w-4xl overflow-hidden rounded-xl border border-border bg-panel shadow-2xl">
-                <div className="absolute inset-0 bg-gradient-to-t from-background/40 to-transparent z-10" />
-                <img 
-                  src="/hero-visual.jpg" 
-                  alt="LokiAI Neural Visual" 
-                  className="w-full object-cover transition-transform duration-700 hover:scale-105"
-                />
+              <div className="group relative w-full max-w-4xl overflow-hidden rounded-xl border border-border bg-panel shadow-2xl">
+                <div className="absolute inset-0 bg-gradient-to-t from-background/90 via-background/20 to-transparent z-10" />
+                
+                <div className="relative h-64 md:h-96 w-full overflow-hidden bg-[#030303]">
+                  {/* Grid background */}
+                  <div className="absolute inset-0 bg-[linear-gradient(to_right,#6b8c421a_1px,transparent_1px),linear-gradient(to_bottom,#6b8c421a_1px,transparent_1px)] bg-[size:2rem_2rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)]" />
+                  
+                  {/* Floating elements */}
+                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center gap-8 md:gap-16 z-0">
+                    {/* Server Node */}
+                    <div className="relative flex h-24 w-24 flex-col items-center justify-center rounded-2xl border border-olive/30 bg-background/50 backdrop-blur-md shadow-[0_0_30px_-5px_var(--olive-glow)] transition-transform duration-700 group-hover:-translate-y-2">
+                      <div className="absolute -top-3 -right-3 flex h-6 w-6 items-center justify-center rounded-full bg-olive-bright text-[10px] font-bold text-background shadow-lg">AI</div>
+                      <Cpu className="h-10 w-10 text-olive-bright" />
+                      <div className="mt-2 text-[10px] font-medium tracking-widest text-muted-foreground">LOKI CORE</div>
+                    </div>
+
+                    {/* Animated Connection */}
+                    <div className="relative w-24 md:w-40 h-px bg-border">
+                      <div className="absolute top-1/2 left-0 h-1 w-full -translate-y-1/2 overflow-hidden">
+                        <div className="h-full w-1/3 animate-[slide_2s_ease-in-out_infinite] bg-gradient-to-r from-transparent via-olive-bright to-transparent" />
+                      </div>
+                    </div>
+
+                    {/* Phone Node */}
+                    <div className="relative flex h-28 w-20 flex-col items-center justify-center rounded-[1.5rem] border-2 border-olive/30 bg-background/50 backdrop-blur-md shadow-[0_0_30px_-5px_var(--olive-glow)] transition-transform duration-700 delay-100 group-hover:-translate-y-2">
+                      <div className="absolute top-2 h-1 w-6 rounded-full bg-border" />
+                      <div className="h-full w-full rounded-[1.3rem] border border-border/50 bg-panel/30 p-2 flex flex-col justify-center items-center">
+                        <div className="h-8 w-8 rounded-full border border-olive-bright/50 flex items-center justify-center animate-pulse">
+                          <Zap className="h-4 w-4 text-olive-bright" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -77,12 +104,26 @@ export function LandingPage() {
             </div>
 
             <div className="grid gap-8 md:grid-cols-3">
-              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-colors hover:border-olive/50">
-                <div className="h-48 w-full overflow-hidden border-b border-border/50">
-                  <img src="/feature_local_inference.jpg" alt="Local Inference Visualization" className="h-full w-full object-cover transition-transform duration-700 group-hover:scale-105" />
+              {/* Feature 1: Local Inference */}
+              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-all hover:border-olive/50 hover:shadow-[0_0_30px_-15px_var(--olive-glow)]">
+                <div className="relative h-48 w-full overflow-hidden border-b border-border/50 bg-[#020202]">
+                  {/* Interactive Visual */}
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="relative h-24 w-24">
+                      {/* Outer spinning ring */}
+                      <div className="absolute inset-0 rounded-full border border-dashed border-olive/30 animate-[spin_10s_linear_infinite]" />
+                      <div className="absolute inset-2 rounded-full border border-olive/20 animate-[spin_15s_linear_infinite_reverse]" />
+                      {/* Center chip */}
+                      <div className="absolute inset-0 flex items-center justify-center transition-transform duration-500 group-hover:scale-110">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-olive-bright bg-olive/10 shadow-[0_0_15px_0_var(--olive-glow)]">
+                          <Cpu className="h-6 w-6 text-olive-bright" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
                 <div className="p-8">
-                  <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
+                  <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
                     <Cpu className="h-5 w-5" />
                   </div>
                   <h3 className="mb-2 text-lg font-semibold text-foreground">Local Inference</h3>
@@ -92,12 +133,23 @@ export function LandingPage() {
                 </div>
               </div>
 
-              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-colors hover:border-olive/50">
-                <div className="h-48 w-full overflow-hidden border-b border-border/50">
-                  <img src="/feature_privacy.jpg" alt="Absolute Privacy Visualization" className="h-full w-full object-cover transition-transform duration-700 group-hover:scale-105" />
+              {/* Feature 2: Absolute Privacy */}
+              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-all hover:border-olive/50 hover:shadow-[0_0_30px_-15px_var(--olive-glow)]">
+                <div className="relative h-48 w-full overflow-hidden border-b border-border/50 bg-[#020202]">
+                  {/* Interactive Visual */}
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    {/* Concentric waves */}
+                    <div className="absolute h-32 w-32 rounded-full border border-olive/20 opacity-0 animate-[ping_3s_cubic-bezier(0,0,0.2,1)_infinite]" />
+                    <div className="absolute h-24 w-24 rounded-full border border-olive/40 opacity-0 animate-[ping_3s_cubic-bezier(0,0,0.2,1)_infinite_1s]" />
+                    {/* Shield */}
+                    <div className="relative flex h-16 w-16 items-center justify-center transition-transform duration-500 group-hover:scale-110">
+                      <div className="absolute inset-0 bg-olive-bright/20 blur-xl" />
+                      <ShieldCheck className="relative h-10 w-10 text-olive-bright drop-shadow-[0_0_10px_var(--olive-glow)]" />
+                    </div>
+                  </div>
                 </div>
                 <div className="p-8">
-                  <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
+                  <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
                     <ShieldCheck className="h-5 w-5" />
                   </div>
                   <h3 className="mb-2 text-lg font-semibold text-foreground">Absolute Privacy</h3>
@@ -107,12 +159,30 @@ export function LandingPage() {
                 </div>
               </div>
 
-              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-colors hover:border-olive/50">
-                <div className="h-48 w-full overflow-hidden border-b border-border/50">
-                  <img src="/feature_wireless.jpg" alt="Wireless Deployment Visualization" className="h-full w-full object-cover transition-transform duration-700 group-hover:scale-105" />
+              {/* Feature 3: Wireless Deployment */}
+              <div className="group overflow-hidden rounded-lg border border-border bg-panel transition-all hover:border-olive/50 hover:shadow-[0_0_30px_-15px_var(--olive-glow)]">
+                <div className="relative h-48 w-full overflow-hidden border-b border-border/50 bg-[#020202]">
+                  {/* Interactive Visual */}
+                  <div className="absolute inset-0 flex items-center justify-center gap-8">
+                    {/* Laptop Icon */}
+                    <div className="h-10 w-14 rounded-sm border-2 border-muted-foreground flex flex-col justify-between p-1 transition-transform group-hover:-translate-x-2">
+                      <div className="h-4 w-full bg-muted/20 rounded-sm" />
+                      <div className="h-1 w-full bg-muted-foreground rounded-full" />
+                    </div>
+                    {/* Wireless Waves */}
+                    <div className="flex gap-1 items-center">
+                      <div className="h-2 w-2 rounded-full bg-olive animate-[bounce_1s_infinite_0ms]" />
+                      <div className="h-2 w-2 rounded-full bg-olive animate-[bounce_1s_infinite_200ms]" />
+                      <div className="h-2 w-2 rounded-full bg-olive animate-[bounce_1s_infinite_400ms]" />
+                    </div>
+                    {/* Phone Icon */}
+                    <div className="h-12 w-8 rounded-md border-2 border-olive-bright bg-olive/10 p-1 flex items-center justify-center shadow-[0_0_15px_0_var(--olive-glow)] transition-transform group-hover:translate-x-2">
+                      <div className="h-4 w-4 bg-olive-bright/80 rounded-sm animate-pulse" />
+                    </div>
+                  </div>
                 </div>
                 <div className="p-8">
-                  <div className="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
+                  <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md bg-olive/10 text-olive-bright">
                     <Zap className="h-5 w-5" />
                   </div>
                   <h3 className="mb-2 text-lg font-semibold text-foreground">Wireless Deployment</h3>
