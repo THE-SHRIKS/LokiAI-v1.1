@@ -59,10 +59,24 @@ interface ChatSession {
 const SESSIONS_KEY = "lokiai_chat_sessions_v1";
 const MAX_SESSIONS = 50;
 
-function loadSessions(): ChatSession[] {
+function loadSessions(userId: string): ChatSession[] {
   try {
-    const raw = localStorage.getItem(SESSIONS_KEY);
-    if (!raw) return [];
+    const scopedKey = `${SESSIONS_KEY}_${userId}`;
+    let raw = localStorage.getItem(scopedKey);
+    
+    // Migration: if no scoped data exists, check for old unsiloed data.
+    // Assign it to the first user who logs in, then delete the global key.
+    if (!raw) {
+      const oldRaw = localStorage.getItem(SESSIONS_KEY);
+      if (oldRaw) {
+        localStorage.setItem(scopedKey, oldRaw);
+        localStorage.removeItem(SESSIONS_KEY);
+        raw = oldRaw;
+      } else {
+        return [];
+      }
+    }
+    
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -70,9 +84,9 @@ function loadSessions(): ChatSession[] {
   }
 }
 
-function saveSessions(sessions: ChatSession[]) {
+function saveSessions(userId: string, sessions: ChatSession[]) {
   try {
-    localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions.slice(0, MAX_SESSIONS)));
+    localStorage.setItem(`${SESSIONS_KEY}_${userId}`, JSON.stringify(sessions.slice(0, MAX_SESSIONS)));
   } catch {
     /* storage unavailable */
   }
@@ -92,23 +106,38 @@ function Index() {
   }, []);
 
   const [collapsed, setCollapsed] = useState(false);
-  const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [device, setDevice] = useState<Device | null>(null);
   const [deployStates, setDeployStates] = useState<Record<string, DeployState>>({});
+  const [me, setMe] = useState<{ id: string; has_nim_key: boolean } | null>(null);
 
   // Compulsory NIM key gate: every account brings its own NVIDIA NIM API
   // key (no shared key, no fallback — see LokiAI-backend's assistant_chat).
   // null = still checking, so nothing renders instead of a false flash.
   const [hasNimKey, setHasNimKey] = useState<boolean | null>(null);
+  
   useEffect(() => {
     if (!getToken()) return;
-    getMe().then((me) => setHasNimKey(me.has_nim_key)).catch(() => setHasNimKey(null));
+    getMe()
+      .then((m) => {
+        setHasNimKey(m.has_nim_key);
+        setMe(m as any);
+        setSessions(loadSessions(m.id));
+        setSessionsLoaded(true);
+      })
+      .catch(() => {
+        setHasNimKey(null);
+        setSessionsLoaded(true);
+      });
   }, []);
 
   useEffect(() => {
-    saveSessions(sessions);
-  }, [sessions]);
+    if (me?.id && sessionsLoaded) {
+      saveSessions(me.id, sessions);
+    }
+  }, [sessions, me, sessionsLoaded]);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
   const messages = activeSession?.messages ?? [];
