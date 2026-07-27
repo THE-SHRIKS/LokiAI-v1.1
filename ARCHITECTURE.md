@@ -70,7 +70,37 @@ The mobile tier is built with Flutter and is strictly designed for **offline inf
     *   Integrates `tflite_flutter` to execute `.tflite` vision and audio models natively on the device's CPU/NPU.
     *   *Hard Constraint:* It never reaches out to cloud APIs for inference processing.
 
-## Architecture Data Flow Example (Deployment)
+---
+
+## 4. AI Agent Architecture & Model Resolution Pipeline
+
+The intelligence layer of LokiAI (`/assistant/chat`) is not a simple passthrough to an LLM. It operates as a multi-stage, autonomous agent pipeline that verifies hardware constraints and repository integrity in real-time.
+
+### Stage 1: Intent Extraction & Regex Fast-Paths
+When a user submits a query (e.g., "Deploy fire detection" or pasting a direct HuggingFace URL), the backend executes a primary analysis step using the user's provided NVIDIA NIM API key. 
+*   **Regex Interception:** If the query contains a HuggingFace slug (e.g., `prithivMLmods/Fire-Detection-Siglip2`), a regex (`r"([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)"`) extracts it immediately, bypassing generic keyword generation and forcing an `explicit_model` resolution path.
+*   **Keyword Generation:** For natural language requests, the LLM is prompted to extract optimized `search_keywords` and categorize the `task_type` (e.g., `object-detection`, `text-generation`).
+
+### Stage 2: HuggingFace API Proxy & Deep Search
+The backend orchestrates asynchronous network requests to the HuggingFace API based on the extracted intent:
+*   **Direct Lookup:** If `explicit_model` is present, it directly fetches the repository metadata via `https://huggingface.co/api/models/{slug}?full=True`.
+*   **Fuzzy Search:** If keywords are generated, it queries the Hub with sorting heuristics (`sort=downloads`, `direction=-1`) to retrieve the top candidate models.
+
+### Stage 3: Deep File Inspection & Hardware Validation
+This is the most critical constraint layer. An edge device cannot run a raw PyTorch `.bin` or `.safetensors` file. LokiAI performs a "deep file inspection" on the HuggingFace tree structure:
+1.  **Format Verification:** It scans the repository files specifically for `.tflite` (for Vision/Audio) and `.gguf` (for LLMs).
+2.  **RAM Profiling:** It calculates the total file size of the target weights. It then queries the PostgreSQL `devices` table to retrieve the exact `ram_mb` of the target phone. 
+3.  **Constraint Enforcement:** If the model size exceeds the available RAM (with a safety buffer), or if the required edge formats are completely missing, the model is flagged. *Crucially, these models are not silently dropped.* They are passed to the next stage tagged with specific `error_msg` data.
+
+### Stage 4: Synthesis & UI Generation
+The backend executes a final prompt to the NVIDIA NIM LLM, providing it with the validated model data and hardware errors. 
+*   The AI synthesizes a highly contextual response (e.g., "I found `prithivMLmods/Fire-Detection-Siglip2`, but it cannot be deployed because it lacks a TFLite file format.").
+*   If a model is perfectly compatible, the AI outputs a specialized markup string: `[DEPLOY_BUTTON: repository/slug]`.
+*   **Frontend Interception:** In `ChatPanel.tsx`, the frontend intercepts this exact markup using regex and replaces it in the DOM with a fully interactive, native React Component allowing 1-click wireless deployment.
+
+---
+
+## 5. Architecture Data Flow Example (Deployment)
 
 1. **User Intent:** The user types "I need a fire detection model" in `index.tsx`.
 2. **AI Resolution:** The frontend sends this to `/assistant/chat`. The backend queries NVIDIA NIM, fetches the HuggingFace Hub API, cross-references `.tflite` files against the phone's 6GB RAM spec, and returns a verified model.
