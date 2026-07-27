@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { getMe, saveNimKey, type Me } from "@/lib/lokiai-api";
-import { User, KeyRound, Smartphone, ArrowLeft, ExternalLink } from "lucide-react";
+import { User, KeyRound, Smartphone, ArrowLeft, ExternalLink, Eye, EyeOff } from "lucide-react";
 
 export const Route = createFileRoute("/account")({
   head: () => ({
@@ -16,11 +16,15 @@ function AccountSettings() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "error" | "success" } | null>(null);
 
+  const [showKey, setShowKey] = useState(false);
+
   useEffect(() => {
     getMe().then((m) => {
       setMe(m);
-      if (m.has_nim_key) {
-        setApiKey("••••••••••••••••••••••••"); // Masked for security
+      if (m.nim_key) {
+        setApiKey(m.nim_key);
+      } else if (m.has_nim_key) {
+        setApiKey("••••••••••••••••••••••••"); // Masked for security fallback
       }
     });
   }, []);
@@ -36,8 +40,7 @@ function AccountSettings() {
     try {
       await saveNimKey(key);
       setMessage({ text: "API key updated successfully.", type: "success" });
-      setMe((prev) => (prev ? { ...prev, has_nim_key: true } : null));
-      setApiKey("••••••••••••••••••••••••");
+      setMe((prev) => (prev ? { ...prev, has_nim_key: true, nim_key: key } : null));
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : String(e), type: "error" });
     } finally {
@@ -96,13 +99,22 @@ function AccountSettings() {
             </a>
 
             <div className="mt-4 flex gap-3">
-              <input
-                type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="nvapi-..."
-                className="flex-1 rounded border border-border bg-background px-3 py-2 text-sm text-foreground focus:border-olive focus:outline-none"
-              />
+              <div className="relative flex-1">
+                <input
+                  type={showKey ? "text" : "password"}
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="nvapi-..."
+                  className="w-full rounded border border-border bg-background pl-3 pr-10 py-2 text-sm text-foreground focus:border-olive focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowKey(!showKey)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
               <button
                 onClick={handleUpdateKey}
                 disabled={busy || !apiKey || apiKey.startsWith("•••")}

@@ -209,6 +209,7 @@ export interface Me {
   email_verified: boolean;
   created_at: string | null;
   has_nim_key: boolean;
+  nim_key?: string | null;
 }
 
 export async function getMe() {

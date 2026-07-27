@@ -888,6 +888,7 @@ async def get_me(request: Request, user_id: str = Depends(get_current_user)):
         "email_verified": row["email_verified"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
         "has_nim_key": row["nvidia_api_key_encrypted"] is not None,
+        "nim_key": _decrypt_key(row["nvidia_api_key_encrypted"]) if row["nvidia_api_key_encrypted"] else None,
     }
 
 
