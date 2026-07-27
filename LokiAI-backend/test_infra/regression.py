@@ -88,6 +88,8 @@ class Ctx:
     b_user_id = None
     a_device_id = None
     c_device_id = None
+    a_device_token = None
+    c_device_token = None
 
 
 def _psql(sql):
@@ -147,6 +149,7 @@ def setup():
         "storage_free_gb": 32.0, "android_version": "13",
     })
     Ctx.a_device_id = dev.get("device_id") if isinstance(dev, dict) else None
+    Ctx.a_device_token = dev.get("device_token") if isinstance(dev, dict) else None
 
     # Account C + its own device, isolated for the rate-limit check.
     Ctx.c_token = _register_and_login(Ctx.c_email, "Regress C")
@@ -157,6 +160,7 @@ def setup():
         "storage_free_gb": 32.0, "android_version": "13",
     })
     Ctx.c_device_id = dev_c.get("device_id") if isinstance(dev_c, dict) else None
+    Ctx.c_device_token = dev_c.get("device_token") if isinstance(dev_c, dict) else None
 
 
 # ── checks ────────────────────────────────────────────────────────────────────
@@ -457,6 +461,70 @@ def c_p1_2_search_rate_limited():
     return False, f"no 429 in {len(codes)} rapid calls; codes={sorted(set(codes))}"
 
 
+def _ws_connect(device_id, token=None, timeout=10):
+    """Open a device WebSocket. Returns (connected: bool, detail: str)."""
+    import asyncio
+    import websockets
+
+    url = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
+    url = f"{url}/ws/device/{device_id}"
+    if token:
+        url = f"{url}?token={token}"
+
+    async def go():
+        try:
+            async with websockets.connect(url, open_timeout=timeout) as ws:
+                msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                return True, f"connected, first message: {str(msg)[:120]}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {str(e)[:160]}"
+
+    return asyncio.run(go())
+
+
+def c_p0_4_ws_requires_auth():
+    """P0-4 / Batch 3: the device socket must reject a bare device_id.
+
+    Previously any device_id connected with no credential at all — enough to
+    receive another user's deployment pushes and forge their device presence.
+    """
+    if not Ctx.a_device_id:
+        return False, "no device paired to A during setup"
+    ok, detail = _ws_connect(Ctx.a_device_id, token=None)
+    if ok:
+        return False, f"unauthenticated socket ACCEPTED: {detail}"
+    return True, f"unauthenticated socket rejected ({detail})"
+
+
+def c_p0_4b_ws_rejects_foreign_token():
+    """P0-4 / Batch 3: a token minted for one device must not open another."""
+    if not (Ctx.a_device_id and Ctx.c_device_id):
+        return False, "need two paired devices for this check"
+    if not Ctx.c_device_token:
+        return False, "no device token issued at pairing for C"
+    ok, detail = _ws_connect(Ctx.a_device_id, token=Ctx.c_device_token)
+    if ok:
+        return False, f"C's token opened A's socket: {detail}"
+    return True, f"cross-device token rejected ({detail})"
+
+
+def c_ws_valid_token_connects():
+    """Regression guard: a correctly paired device must still connect."""
+    if not Ctx.a_device_id or not Ctx.a_device_token:
+        return False, "no device token issued at pairing for A"
+    ok, detail = _ws_connect(Ctx.a_device_id, token=Ctx.a_device_token)
+    if ok:
+        return True, detail
+    return False, f"legitimate device could not connect: {detail}"
+
+
+def c_pair_returns_device_token():
+    """Batch 3 contract: /devices/pair must issue a device credential."""
+    if Ctx.a_device_token and isinstance(Ctx.a_device_token, str):
+        return True, f"device_token issued (len={len(Ctx.a_device_token)})"
+    return False, "POST /devices/pair did not return a device_token"
+
+
 def c_no_secret_in_error_bodies():
     """Error responses must never carry secrets or stack traces."""
     status, body = _req("GET", "/devices/not-a-uuid", token=Ctx.a_token)
@@ -478,6 +546,10 @@ CHECKS = [
     ("P0-7", "CORS rejects arbitrary *.vercel.app origins", c_p0_7_cors_no_vercel_wildcard),
     ("P0-8", "/models/upload rejects oversized bodies", c_p0_8_upload_size_capped),
     ("P1-2", "/models/search is rate limited", c_p1_2_search_rate_limited),
+    ("P0-4", "device WebSocket rejects unauthenticated connects", c_p0_4_ws_requires_auth),
+    ("P0-4b", "device WebSocket rejects a token for a different device", c_p0_4b_ws_rejects_foreign_token),
+    ("WS-1", "correctly paired device can still connect", c_ws_valid_token_connects),
+    ("WS-2", "/devices/pair issues a device credential", c_pair_returns_device_token),
     ("CORS-1", "configured dashboard origin still allowed with credentials", c_cors_real_dashboard_still_allowed),
     ("ISO-1", "cross-tenant device read blocked", c_cross_tenant_device_read),
     ("ISO-2", "cross-tenant device delete blocked", c_cross_tenant_device_delete),

@@ -67,7 +67,7 @@ class PairingGate extends StatefulWidget {
   State<PairingGate> createState() => _PairingGateState();
 }
 
-class _PairingGateState extends State<PairingGate> {
+class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
   // null = still checking, false = needs pairing, true = paired
   bool? _paired;
   // Set right after a successful in-session pairing to show confirmation.
@@ -76,7 +76,28 @@ class _PairingGateState extends State<PairingGate> {
   @override
   void initState() {
     super.initState();
+    // The app had no lifecycle handling at all, so returning to the foreground
+    // never triggered a reconnect — with the old fixed-delay/30-attempt
+    // backoff already exhausted, the phone stayed offline in the dashboard
+    // until the app was force-restarted.
+    WidgetsBinding.instance.addObserver(this);
     _checkPairing();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed && _paired == true) {
+      // ignore: avoid_print
+      print('VERIFICATION: lifecycle -> resumed, verifying backend link');
+      BackendConnection.instance.resume();
+    }
   }
 
   Future<void> _checkPairing() async {

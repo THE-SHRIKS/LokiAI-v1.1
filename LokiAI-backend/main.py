@@ -124,12 +124,70 @@ async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> 
     raise last_error
 
 
+# Presence liveness. The phone heartbeats every 20s; a device whose last_seen
+# is older than this is treated as gone regardless of what the status column
+# says. Without this, a device that vanished without a clean socket close
+# (process killed, network black-holed, backend restarted) stayed 'connected'
+# in the database forever, because only an orderly WebSocketDisconnect ever
+# wrote 'offline'.
+PRESENCE_TTL_SECONDS = int(os.getenv("PRESENCE_TTL_SECONDS", "70"))
+PRESENCE_SWEEP_SECONDS = 30
+
+
+async def _presence_sweep(pool):
+    """Mark devices offline once their heartbeat goes stale."""
+    while True:
+        try:
+            await asyncio.sleep(PRESENCE_SWEEP_SECONDS)
+            async with pool.acquire() as conn:
+                stale = await conn.fetch(
+                    """UPDATE devices SET status = 'offline'
+                       WHERE status = 'connected'
+                         AND (last_seen IS NULL
+                              OR last_seen < NOW() - ($1 || ' seconds')::interval)
+                       RETURNING id""",
+                    str(PRESENCE_TTL_SECONDS),
+                )
+            for row in stale:
+                device_id = str(row["id"])
+                # Drop any socket we still think is live for a device that has
+                # stopped heartbeating.
+                socket = ws_manager.active.pop(device_id, None)
+                if socket is not None:
+                    try:
+                        await socket.close(code=WS_CLOSE_SUPERSEDED, reason="heartbeat expired")
+                    except Exception:
+                        pass
+                print(f"[presence] device {device_id} -> offline (heartbeat stale)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # A sweep failure must never kill the loop.
+            print(f"[presence] sweep error: {type(e).__name__}: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await _create_pool_with_retry()
     await _run_migrations(app.state.pool)
-    yield
-    await app.state.pool.close()
+
+    # A restart wipes the in-memory socket registry while the database still
+    # says 'connected'. Reconcile immediately so presence reflects reality
+    # until each device reconnects and heartbeats again.
+    async with app.state.pool.acquire() as conn:
+        reset = await conn.execute("UPDATE devices SET status = 'offline' WHERE status = 'connected'")
+    print(f"[presence] startup reconciliation: {reset}")
+
+    sweep_task = asyncio.create_task(_presence_sweep(app.state.pool))
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
+        await app.state.pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -1229,10 +1287,52 @@ class DevicePairRequest(BaseModel):
     android_version: str
 
 
-def _websocket_url(request: Request, device_id: str) -> str:
+def _websocket_url(request: Request, device_id: str, device_token: Optional[str] = None) -> str:
     base = _public_base_url(request)
     ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
-    return f"{ws_base}/ws/device/{device_id}"
+    url = f"{ws_base}/ws/device/{device_id}"
+    if device_token:
+        # Carried as a query parameter because the WebSocket browser/Dart APIs
+        # cannot set arbitrary headers on the upgrade request.
+        url = f"{url}?token={device_token}"
+    return url
+
+
+# Device credentials are long-lived: the phone must be able to reconnect on its
+# own after being offline for days without the user re-pairing. Revocation is
+# by deleting the device (DELETE /devices/{id}), which the WS handler checks on
+# every connect.
+DEVICE_TOKEN_TTL_DAYS = 365
+
+
+def _make_device_token(device_id: str, user_id) -> str:
+    """Bearer credential proving 'I am this specific paired device'.
+
+    Signed with the same key as user sessions but carries type='device', so it
+    can never be used as a user access token (get_current_user requires
+    type='access') and vice versa.
+    """
+    payload = {
+        "sub": str(device_id),
+        "uid": str(user_id),
+        "jti": str(_uuid.uuid4()),
+        "type": "device",
+        "exp": datetime.now(timezone.utc) + timedelta(days=DEVICE_TOKEN_TTL_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _verify_device_token(token: str, device_id: str) -> Optional[str]:
+    """Returns the owning user_id when the token is valid FOR THIS device_id."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+    if payload.get("type") != "device":
+        return None
+    if payload.get("sub") != str(device_id):
+        return None
+    return payload.get("uid")
 
 
 @app.post("/devices/pair")
@@ -1279,7 +1379,15 @@ async def pair_device(req: DevicePairRequest, request: Request):
                 token_row["id"]
             )
 
-    return {"device_id": device_id, "websocket_url": _websocket_url(request, device_id)}
+    # Device-scoped credential for the WebSocket. The socket used to accept any
+    # device_id with no proof at all; the phone stores this and presents it on
+    # every connect.
+    device_token = _make_device_token(device_id, user_id)
+    return {
+        "device_id": device_id,
+        "device_token": device_token,
+        "websocket_url": _websocket_url(request, device_id, device_token),
+    }
 
 
 @app.get("/devices/{device_id}")
@@ -2084,10 +2192,28 @@ class DeviceConnectionManager:
         self.active: dict = {}
 
     async def connect(self, device_id: str, websocket: WebSocket):
-        await websocket.accept()
+        """Register an already-accepted socket, superseding any previous one.
+
+        A reconnecting phone (backgrounded, network flapped, process restarted)
+        can leave the old socket half-open on the server. Replacing the map
+        entry without closing the old socket leaked connections and left a
+        stale peer that could still receive deployment pushes, so the
+        superseded socket is closed explicitly.
+        """
+        previous = self.active.get(device_id)
+        if previous is not None and previous is not websocket:
+            try:
+                await previous.close(code=4000, reason="superseded by a newer connection")
+            except Exception:
+                pass
         self.active[device_id] = websocket
 
-    def disconnect(self, device_id: str):
+    def disconnect(self, device_id: str, websocket: Optional[WebSocket] = None):
+        """Remove the socket. When `websocket` is given, only removes it if it
+        is still the live one — so a late teardown from a superseded connection
+        cannot evict the connection that replaced it."""
+        if websocket is not None and self.active.get(device_id) is not websocket:
+            return
         self.active.pop(device_id, None)
 
     def is_connected(self, device_id: str) -> bool:
@@ -2128,6 +2254,22 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
     error_message = data.get("error_message")
     if not deployment_id or status not in ("downloading", "complete", "failed"):
         return
+
+    # The deployment must belong to the device reporting on it. Without this a
+    # connected device could rewrite the status, progress and error text of ANY
+    # deployment in the system just by naming its id.
+    try:
+        async with pool.acquire() as conn:
+            owns = await conn.fetchval(
+                "SELECT 1 FROM deployments WHERE id = $1::uuid AND device_id = $2::uuid",
+                deployment_id, device_id,
+            )
+    except (asyncpg.PostgresError, ValueError):
+        return
+    if not owns:
+        print(f"[WS] device {device_id} tried to update foreign deployment {deployment_id} — ignored")
+        return
+
     deployment_status[deployment_id] = {
         "status": status,
         "progress_percent": progress,
@@ -2154,11 +2296,125 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
         pass
 
 
+async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebSocket):
+    """Phone → server reconciliation of ACTUAL on-device state.
+
+    Sent by the app on connect/resume. The phone previously never told the
+    backend what it actually had installed, so after any missed message (offline
+    window, backend restart, dropped socket) the two sides could disagree
+    permanently with no way to converge. Reported state is advisory: it can only
+    resolve a deployment the server already believes is in flight FOR THIS
+    device, never create one or alter another device's.
+    """
+    reported_id = data.get("deployment_id")
+    reported_status = data.get("status")
+
+    try:
+        async with pool.acquire() as conn:
+            if reported_id and reported_status in ("complete", "failed"):
+                row = await conn.fetchrow(
+                    """SELECT id, status FROM deployments
+                       WHERE id = $1::uuid AND device_id = $2::uuid""",
+                    reported_id, device_id,
+                )
+                if row and row["status"] in ("queued", "downloading"):
+                    # Server thought it was still running; the device says it
+                    # finished while we weren't listening.
+                    if reported_status == "complete":
+                        await conn.execute(
+                            "UPDATE deployments SET status='complete', progress=100, "
+                            "completed_at=COALESCE(completed_at, NOW()) WHERE id=$1::uuid",
+                            reported_id,
+                        )
+                    else:
+                        await conn.execute(
+                            "UPDATE deployments SET status='failed', error_message=$2 WHERE id=$1::uuid",
+                            reported_id,
+                            str(data.get("error_message") or "Device reported failure after reconnect")[:500],
+                        )
+                    deployment_status[str(reported_id)] = {
+                        "status": reported_status,
+                        "progress_percent": 100 if reported_status == "complete" else 0,
+                        "error_message": data.get("error_message"),
+                    }
+                    print(f"[WS] reconciled deployment {reported_id} -> {reported_status} from device report")
+
+            # Anything the server still believes is in flight for this device
+            # that the phone did NOT mention is unresolvable from the device's
+            # side; leave it for the stale-deployment timeout rather than
+            # guessing.
+            pending = await conn.fetch(
+                """SELECT id, status FROM deployments
+                   WHERE device_id = $1::uuid AND status IN ('queued', 'downloading')
+                   ORDER BY deployed_at DESC LIMIT 5""",
+                device_id,
+            )
+    except (asyncpg.PostgresError, ValueError) as e:
+        print(f"[WS] state_report handling failed for {device_id}: {type(e).__name__}")
+        return
+
+    # Tell the device what the server still considers outstanding, so it can
+    # resume or re-report rather than both sides waiting on each other.
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "state_ack",
+            "pending_deployments": [
+                {"deployment_id": str(p["id"]), "status": p["status"]} for p in pending
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }))
+    except Exception:
+        pass
+
+
+# Largest accepted inbound WebSocket frame. Real messages are heartbeats and
+# small progress updates; anything near this is abuse.
+WS_MAX_MESSAGE_BYTES = 64 * 1024
+
+# WebSocket close codes (4000-4999 is the application-defined range).
+WS_CLOSE_SUPERSEDED = 4000
+WS_CLOSE_UNAUTHORIZED = 4401
+WS_CLOSE_MESSAGE_TOO_LARGE = 4413
+
+
 @app.websocket("/ws/device/{device_id}")
-async def device_websocket(websocket: WebSocket, device_id: str):
+async def device_websocket(websocket: WebSocket, device_id: str, token: str = ""):
+    """Authenticated device socket.
+
+    This endpoint previously accepted ANY device_id with no credential at all,
+    so anyone who learned a device id could impersonate that phone: receive its
+    deployment instructions, forge heartbeats to fake presence while the real
+    device was offline, and corrupt deployment status. A device-scoped token
+    (issued by POST /devices/pair) is now required and must match both the
+    device_id in the path and a device row that still exists and is still owned
+    by the user the token was minted for.
+    """
     pool = websocket.app.state.pool
+
+    owner_user_id = _verify_device_token(token, device_id) if token else None
+    if not owner_user_id:
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Device authentication required")
+        print(f"[WS] rejected unauthenticated connect for device {device_id}")
+        return
+
+    # The token alone is not enough: the device must still exist and still
+    # belong to that user, so unpairing/deleting a device revokes its socket.
+    try:
+        async with pool.acquire() as conn:
+            still_owned = await conn.fetchval(
+                "SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid",
+                device_id, owner_user_id,
+            )
+    except (asyncpg.PostgresError, ValueError):
+        still_owned = None
+    if not still_owned:
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Device is no longer paired")
+        print(f"[WS] rejected connect for unpaired/unknown device {device_id}")
+        return
+
+    await websocket.accept()
     await ws_manager.connect(device_id, websocket)
-    print(f"[WS] device {device_id} connected")
+    print(f"[WS] device {device_id} connected (authenticated)")
     await _set_device_status(pool, device_id, "connected")
     await ws_manager.send_json(device_id, {
         "type": "connected",
@@ -2168,25 +2424,40 @@ async def device_websocket(websocket: WebSocket, device_id: str):
     try:
         while True:
             raw = await websocket.receive_text()
+            if len(raw) > WS_MAX_MESSAGE_BYTES:
+                await websocket.close(code=WS_CLOSE_MESSAGE_TOO_LARGE, reason="Message too large")
+                break
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
                 await websocket.send_text(json.dumps(
                     {"type": "error", "detail": "Message was not valid JSON"}))
                 continue
-            print(f"[WS] from {device_id}: {data}")
+            if not isinstance(data, dict):
+                await websocket.send_text(json.dumps(
+                    {"type": "error", "detail": "Message must be a JSON object"}))
+                continue
+            print(f"[WS] from {device_id}: {str(data)[:200]}")
             if data.get("type") == "heartbeat":
                 await _set_device_status(pool, device_id, "connected")
                 await websocket.send_text(json.dumps({
                     "type": "heartbeat_ack",
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }))
+            elif data.get("type") == "state_report":
+                await _handle_state_report(pool, device_id, data, websocket)
             elif "deployment_id" in data:
                 await _handle_deployment_update(pool, device_id, data)
     except WebSocketDisconnect:
-        ws_manager.disconnect(device_id)
+        pass
+    finally:
+        ws_manager.disconnect(device_id, websocket)
         print(f"[WS] device {device_id} disconnected")
-        await _set_device_status(pool, device_id, "offline")
+        # Only flip to offline if this socket is genuinely the current one —
+        # otherwise a superseded connection's teardown would mark a device
+        # offline that has already reconnected.
+        if ws_manager.active.get(device_id) is None:
+            await _set_device_status(pool, device_id, "offline")
 
 
 # ============================================================

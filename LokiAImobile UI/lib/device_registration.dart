@@ -47,6 +47,11 @@ class DeviceRegistration {
   static const String prefsBackendUrl = 'backend_url';
   static const String prefsWebsocketUrl = 'websocket_url';
 
+  /// Device-scoped credential issued by POST /devices/pair. Required on every
+  /// WebSocket connect — the socket used to accept a bare device_id, so anyone
+  /// who learned that id could impersonate this phone.
+  static const String prefsDeviceToken = 'device_token';
+
   /// Reads the phone's own hardware specs via Flutter platform APIs.
   static Future<DeviceSpecs> readOwnSpecs() async {
     final info = await DeviceInfoPlugin().androidInfo;
@@ -98,11 +103,15 @@ class DeviceRegistration {
           return const RegistrationResult(
               error: 'Backend returned no device_id. Try again.');
         }
+        final deviceToken = json['device_token'] as String?;
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString(prefsDeviceId, deviceId);
         await prefs.setString(prefsBackendUrl, qr.backendUrl);
         if (websocketUrl != null && websocketUrl.isNotEmpty) {
           await prefs.setString(prefsWebsocketUrl, websocketUrl);
+        }
+        if (deviceToken != null && deviceToken.isNotEmpty) {
+          await prefs.setString(prefsDeviceToken, deviceToken);
         }
         return RegistrationResult(
             deviceId: deviceId, websocketUrl: websocketUrl);
