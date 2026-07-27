@@ -210,19 +210,26 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# 10MB cap on request bodies to blunt abuse — except /models/upload, whose
-# entire job is accepting real GGUF/TFLite model files that routinely run
-# into the hundreds of MB (see uploaded_models/ and the deploy history in
-# REPORT.md). Capping that route at 10MB would break a working feature.
+# 10MB cap on request bodies to blunt abuse. /models/upload gets a much larger
+# but still finite cap — its job is accepting real GGUF/TFLite model files that
+# routinely run to hundreds of MB (see uploaded_models/ and the deploy history
+# in REPORT.md), so 10MB would break a working feature. It was previously
+# exempt entirely, which let any authenticated account fill the server's disk.
 MAX_BODY_SIZE = 10 * 1024 * 1024
-_BODY_SIZE_EXEMPT_PATHS = ("/models/upload",)
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_MB", "600")) * 1024 * 1024
+_LARGE_BODY_PATHS = {"/models/upload": MAX_UPLOAD_SIZE}
 
 
 class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path not in _BODY_SIZE_EXEMPT_PATHS:
-            content_length = request.headers.get("content-length")
-            if content_length and int(content_length) > MAX_BODY_SIZE:
+        limit = _LARGE_BODY_PATHS.get(request.url.path, MAX_BODY_SIZE)
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                declared = int(content_length)
+            except ValueError:
+                return JSONResponse(status_code=400, content={"error": "Invalid Content-Length"})
+            if declared > limit:
                 return JSONResponse(status_code=413, content={"error": "Request body too large"})
         return await call_next(request)
 
@@ -784,6 +791,7 @@ async def register(user: RegisterUser, request: Request):
 
 
 @app.post("/auth/verify-otp")
+@limiter.limit("10/minute")
 async def verify_otp(req: VerifyOtpRequest, request: Request, response: Response):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -832,6 +840,7 @@ async def verify_otp(req: VerifyOtpRequest, request: Request, response: Response
 
 
 @app.post("/auth/resend-otp")
+@limiter.limit("5/minute")
 async def resend_otp(req: ResendOtpRequest, request: Request):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -1189,6 +1198,7 @@ async def system_info(request: Request):
 
 
 @app.post("/pairing/generate")
+@limiter.limit("20/minute", key_func=_user_or_ip_key)
 async def generate_pairing_token(request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
     token = secrets.token_urlsafe(32)
@@ -1577,6 +1587,7 @@ class ModelSearchRequest(BaseModel):
     user_message: str
 
 @app.post("/models/search")
+@limiter.limit("20/minute", key_func=_user_or_ip_key)
 async def search_models(req: ModelSearchRequest, request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -1653,6 +1664,7 @@ async def list_models(request: Request, user_id: str = Depends(get_current_user)
 
 
 @app.post("/models/upload")
+@limiter.limit("5/hour", key_func=_user_or_ip_key)
 async def upload_model(
     request: Request,
     file: UploadFile = File(...),
@@ -1681,11 +1693,27 @@ async def upload_model(
 
     sha256 = hashlib.sha256()
     size_bytes = 0
-    with open(dest_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):
-            f.write(chunk)
-            sha256.update(chunk)
-            size_bytes += len(chunk)
+    try:
+        with open(dest_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                size_bytes += len(chunk)
+                # Enforce the cap on bytes actually received, not just the
+                # declared Content-Length — that header can be absent (chunked
+                # transfer) or simply untrue.
+                if size_bytes > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Model file exceeds the {MAX_UPLOAD_SIZE // (1024*1024)} MB upload limit.",
+                    )
+                f.write(chunk)
+                sha256.update(chunk)
+    except Exception:
+        # Never leave a partial file behind on disk.
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise
 
     if size_bytes == 0:
         os.remove(dest_path)
@@ -2448,6 +2476,7 @@ async def lookup_model_sha256(hf_model_id: str, filename: str) -> Optional[str]:
 
 
 @app.post("/deployments")
+@limiter.limit("10/minute", key_func=_user_or_ip_key)
 async def create_deployment(req: DeploymentRequest, request: Request, user_id: str = Depends(get_current_user)):
     """v3 wireless deployment: resolve HF CDN URL, push instruction to the
     phone over WebSocket. The phone downloads the model itself and reports

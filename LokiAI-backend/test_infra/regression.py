@@ -78,11 +78,16 @@ class Ctx:
     a_email = f"{PREFIX}-a@example.com"
     b_email = f"{PREFIX}-b@example.com"
     password = "RegressPass123"
+    # Account C exists solely for the rate-limit check: exhausting a per-user
+    # budget must not starve any other check's requests.
+    c_email = f"{PREFIX}-c@example.com"
     a_token = None
     b_token = None
+    c_token = None
     a_user_id = None
     b_user_id = None
     a_device_id = None
+    c_device_id = None
 
 
 def _psql(sql):
@@ -142,6 +147,16 @@ def setup():
         "storage_free_gb": 32.0, "android_version": "13",
     })
     Ctx.a_device_id = dev.get("device_id") if isinstance(dev, dict) else None
+
+    # Account C + its own device, isolated for the rate-limit check.
+    Ctx.c_token = _register_and_login(Ctx.c_email, "Regress C")
+    _, pair_c = _req("POST", "/pairing/generate", token=Ctx.c_token)
+    _, dev_c = _req("POST", "/devices/pair", {
+        "token": pair_c["token"], "phone_model": f"{PREFIX}-phone-c",
+        "cpu_arch": "arm64-v8a", "ram_mb": 6144,
+        "storage_free_gb": 32.0, "android_version": "13",
+    })
+    Ctx.c_device_id = dev_c.get("device_id") if isinstance(dev_c, dict) else None
 
 
 # ── checks ────────────────────────────────────────────────────────────────────
@@ -394,6 +409,54 @@ def c_cors_real_dashboard_still_allowed():
     return False, f"dashboard origin NOT allowed: allow-origin={allow!r}, credentials={creds!r}"
 
 
+def c_p0_8_upload_size_capped():
+    """P0-8 / Batch 5: /models/upload must reject an oversized body.
+
+    Sends only the headers with an over-limit Content-Length, so the check is
+    cheap — the middleware must reject before any body is read.
+    """
+    cap_mb = int(os.getenv("MAX_UPLOAD_MB", "600"))
+    oversized = (cap_mb + 50) * 1024 * 1024
+    req = urllib.request.Request(f"{BASE_URL}/models/upload", method="POST", data=b"")
+    req.add_header("Authorization", f"Bearer {Ctx.a_token}")
+    req.add_header("Content-Type", "multipart/form-data; boundary=x")
+    req.add_header("Content-Length", str(oversized))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return False, f"oversized upload accepted: HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        if e.code == 413:
+            return True, "oversized upload -> HTTP 413 (rejected before body read)"
+        return False, f"expected 413, got HTTP {e.code}"
+    except Exception as e:
+        # urllib may refuse to send a body it doesn't have; treat a transport
+        # failure as inconclusive rather than a pass.
+        return False, f"inconclusive (transport): {e}"
+
+
+def c_p1_2_search_rate_limited():
+    """P1-2 / Batch 5: /models/search must throttle sustained abuse.
+
+    Uses dedicated account C — the limit is per authenticated user, so burning
+    a budget here must not affect any other check.
+    """
+    if not Ctx.c_device_id:
+        return False, "no device paired to C during setup"
+    saw_429 = False
+    codes = []
+    for _ in range(26):
+        status, _ = _req("POST", "/models/search", {
+            "device_id": Ctx.c_device_id, "user_message": "chatbot",
+        }, token=Ctx.c_token)
+        codes.append(status)
+        if status == 429:
+            saw_429 = True
+            break
+    if saw_429:
+        return True, f"429 after {len(codes)} calls (limit 20/min)"
+    return False, f"no 429 in {len(codes)} rapid calls; codes={sorted(set(codes))}"
+
+
 def c_no_secret_in_error_bodies():
     """Error responses must never carry secrets or stack traces."""
     status, body = _req("GET", "/devices/not-a-uuid", token=Ctx.a_token)
@@ -413,6 +476,8 @@ CHECKS = [
     ("P0-3", "/monitor/* rejects anonymous callers", c_p0_3_monitor_requires_auth),
     ("P0-5", "/devices/register cannot hijack another user's device", c_p0_5_device_register_no_hijack),
     ("P0-7", "CORS rejects arbitrary *.vercel.app origins", c_p0_7_cors_no_vercel_wildcard),
+    ("P0-8", "/models/upload rejects oversized bodies", c_p0_8_upload_size_capped),
+    ("P1-2", "/models/search is rate limited", c_p1_2_search_rate_limited),
     ("CORS-1", "configured dashboard origin still allowed with credentials", c_cors_real_dashboard_still_allowed),
     ("ISO-1", "cross-tenant device read blocked", c_cross_tenant_device_read),
     ("ISO-2", "cross-tenant device delete blocked", c_cross_tenant_device_delete),
