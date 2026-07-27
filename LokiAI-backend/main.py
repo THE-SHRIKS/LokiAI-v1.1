@@ -1311,41 +1311,22 @@ async def get_device(device_id: str, request: Request, user_id: str = Depends(ge
     return d
 
 
-class DeviceRegister(BaseModel):
-    name: str
-    phone_model: str
-    cpu_arch: str
-    ram_mb: int
-    storage_free_gb: float
-    android_version: str
-    adb_serial: str
+# POST /devices/register was removed here (Batch 4).
+#
+# It upserted on the globally-unique adb_serial and unconditionally set
+# user_id = EXCLUDED.user_id on conflict, with no check on the existing row's
+# owner — so any authenticated account that knew or guessed another user's
+# adb_serial could move that device into its own account in a single call,
+# locking the real owner out (their next GET /devices/{id} 404s) and making
+# the device a valid target for the attacker's own deployments.
+#
+# It was ADB-era surface area from v2 with no remaining callers: the current
+# wireless flow registers devices through POST /devices/pair, which is scoped
+# to a single-use, expiring, user-bound pairing token. Verified before removal
+# that neither the dashboard (LokiAI-Desktop/.../src) nor the Flutter app
+# (LokiAImobile UI/lib) references this route. See Docs/06_RULES.md Rule 12
+# ("No USB, No ADB").
 
-@app.post("/devices/register")
-async def register_device(device: DeviceRegister, request: Request, user_id: str = Depends(get_current_user)):
-    pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        # Idempotent registration keyed on the unique adb_serial. If this phone
-        # was registered before (possibly by another user), the person who is
-        # physically connected and authenticated now claims it and its specs are
-        # refreshed. This keeps registration safe to run repeatedly and ensures
-        # the device always shows up under the current user's GET /devices.
-        row = await conn.fetchrow("""
-            INSERT INTO devices
-                (user_id, name, phone_model, cpu_arch, ram_mb, storage_free_gb, android_version, adb_serial, status, last_seen)
-            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, 'online', NOW())
-            ON CONFLICT (adb_serial) DO UPDATE SET
-                user_id         = EXCLUDED.user_id,
-                name            = EXCLUDED.name,
-                phone_model     = EXCLUDED.phone_model,
-                cpu_arch        = EXCLUDED.cpu_arch,
-                ram_mb          = EXCLUDED.ram_mb,
-                storage_free_gb = EXCLUDED.storage_free_gb,
-                android_version = EXCLUDED.android_version,
-                status          = 'online',
-                last_seen       = NOW()
-            RETURNING id
-        """, user_id, device.name, device.phone_model, device.cpu_arch, device.ram_mb, device.storage_free_gb, device.android_version, device.adb_serial)
-        return {"device_id": str(row["id"])}
 
 @app.get("/devices")
 async def get_devices(request: Request, user_id: str = Depends(get_current_user)):
