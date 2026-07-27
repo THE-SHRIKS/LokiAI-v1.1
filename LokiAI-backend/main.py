@@ -313,8 +313,33 @@ async def get_current_user(request: Request, credentials: HTTPAuthorizationCrede
     return user_id
 
 
+# Operator-only routes (cross-tenant aggregates and request logs). There is no
+# role column on users, so membership is an explicit email allowlist from the
+# environment. Empty by default: with ADMIN_EMAILS unset nobody is an admin and
+# these routes are closed to everyone, which is the safe failure mode.
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
+
+
+async def require_admin(request: Request, user_id: str = Depends(get_current_user)) -> str:
+    """Authenticated AND on the operator allowlist.
+
+    Returns 404 rather than 403 for non-admins so the existence of these
+    routes isn't confirmed to an authenticated attacker probing for them.
+    """
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        email = await conn.fetchval("SELECT email FROM users WHERE id = $1::uuid", user_id)
+    if not email or email.lower() not in ADMIN_EMAILS:
+        raise HTTPException(status_code=404, detail="Not found")
+    return user_id
+
+
 @app.get("/monitor/status")
-async def monitor_status(request: Request):
+async def monitor_status(request: Request, _admin: str = Depends(require_admin)):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         device_count = await conn.fetchval("SELECT COUNT(*) FROM devices")
@@ -331,7 +356,7 @@ async def monitor_status(request: Request):
     }
 
 @app.get("/monitor/log")
-async def monitor_get_log(limit: int = 50):
+async def monitor_get_log(limit: int = 50, _admin: str = Depends(require_admin)):
     return monitor_log[-limit:]
 
 # ── Feedback ──────────────────────────────────────────────────────────────────
@@ -404,9 +429,15 @@ async def submit_feedback(payload: FeedbackPayload, request: Request, user_id: s
 
 @app.get("/feedback")
 async def get_feedback(user_id: str = Depends(get_current_user)):
-    # Same undefined-`verify_token` crash as the POST above. Ownership scoping
-    # (this currently returns every user's feedback to any authenticated
-    # caller) is a separate defect, fixed in the next batch.
+    # Own submissions only. This previously returned every user's feedback
+    # (including their email address) to any authenticated caller.
+    return [e for e in reversed(feedback_store) if e.get("user_id") == user_id]
+
+
+@app.get("/admin/feedback")
+async def get_all_feedback(_admin: str = Depends(require_admin)):
+    """Cross-tenant feedback view, operator-only — replaces the unrestricted
+    listing that GET /feedback used to provide."""
     return list(reversed(feedback_store))
 
 
@@ -2573,14 +2604,10 @@ async def list_deployments(request: Request, user_id: str = Depends(get_current_
 
 @app.get("/deployments/{deployment_id}")
 async def get_deployment_status(deployment_id: str, request: Request, user_id: str = Depends(get_current_user)):
-    # Check in-memory status first (fastest)
-    if deployment_id in deployment_status:
-        return {
-            "deployment_id": deployment_id,
-            **deployment_status[deployment_id]
-        }
-
-    # Fall back to database
+    # Ownership is checked FIRST, against the database, for every request.
+    # The in-memory fast path below used to return before any such check, so
+    # any authenticated user holding a deployment id could read another
+    # account's live progress and error text.
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -2589,6 +2616,13 @@ async def get_deployment_status(deployment_id: str, request: Request, user_id: s
         )
         if not row:
             raise HTTPException(status_code=404, detail="Deployment not found")
+
+        # Owner confirmed — the in-memory entry (written by the WebSocket
+        # progress handler) is fresher than the row for anything still active.
+        live = deployment_status.get(deployment_id)
+        if live:
+            return {"deployment_id": deployment_id, **live}
+
         return {
             "deployment_id": str(row["id"]),
             "status": row["status"],
@@ -2597,9 +2631,10 @@ async def get_deployment_status(deployment_id: str, request: Request, user_id: s
         }
 
 @app.get("/admin/stats")
-async def get_admin_stats(request: Request):
-    # This is a local admin dashboard endpoint. 
-    # In a real production app, we would secure this with an admin role.
+async def get_admin_stats(request: Request, _admin: str = Depends(require_admin)):
+    # Cross-tenant: returns every user's email and activity. Restricted to the
+    # ADMIN_EMAILS allowlist (see require_admin) — it was previously reachable
+    # with no authentication at all.
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         # Get overall counts

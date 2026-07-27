@@ -47,9 +47,20 @@ function AdminDashboard() {
 
   const fetchStats = async () => {
     try {
+      const token = getToken();
+      if (!token) {
+        setError("Sign in with an operator account to view this page.");
+        return;
+      }
       const res = await fetch(`${backendUrl()}/admin/stats`, {
-        headers: { Authorization: `Bearer ${getToken()}` },
+        headers: { Authorization: `Bearer ${token}` },
       });
+      // The backend answers 404 (not 403) for non-operators so it doesn't
+      // confirm the route exists to anyone probing for it.
+      if (res.status === 401 || res.status === 404) {
+        setError("This page is restricted to LokiAI operators.");
+        return;
+      }
       if (!res.ok) throw new Error("Failed to load admin stats");
       const data = await res.json();
       setStats(data);
