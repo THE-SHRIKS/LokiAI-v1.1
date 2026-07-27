@@ -1702,9 +1702,10 @@ Map the message to exactly one task type from this fixed list:
 - automatic-speech-recognition — transcribing spoken audio to text ("transcribe", "speech to text", "voice notes", "dictation")
 - audio-classification — identifying/classifying non-speech sounds ("what sound is that", "classify sounds", "identify noises")
 
+If the user explicitly asks about a specific HuggingFace model by its repository ID (e.g., "prithivMLmods/Fire-Detection-Siglip2" or a huggingface.co link), extract that ID as `explicit_model`.
 If the message is a greeting, thanks, small talk, or a question about LokiAI itself — anything that is NOT a request for a device capability — the task is null.
 
-Reply with ONLY this JSON, nothing else: {"task": "<one of the list above>"} or {"task": null}"""
+Reply with ONLY this JSON, nothing else: {"task": "<one of the list above>", "explicit_model": "<extracted_id_or_null>"} or {"task": null, "explicit_model": null}"""
 
 
 def _assistant_system_prompt() -> str:
@@ -1750,7 +1751,8 @@ Max model size for this device: {max_size_mb:.0f} MB.
 These models fit this device and match the request:
 {json.dumps(filtered_models)}
 
-Pick the best 3 from this list ONLY. Never invent a model not in the list.
+If any model in the list has an "error_msg", it means the user explicitly requested it but it CANNOT run on the phone. You MUST explain the exact error_msg to the user in your response and DO NOT include that model in search_results!
+Otherwise, pick the best 3 from this list ONLY. Never invent a model not in the list.
 For each: name, size, one sentence on what it does, one sentence on why it
 suits this specific phone (mention the phone by name). Plain English.
 If nothing in the list genuinely fits the request, return an empty
@@ -1823,14 +1825,14 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
     )
 
     # ── Step 2: intent extraction — single fast call, exception fallback ─
-    async def classify_intent(model_id: str) -> Optional[str]:
+    async def classify_intent(model_id: str):
         resp = await openai_client.chat.completions.create(
             model=model_id,
             messages=[{"role": "system", "content": _intent_system_prompt()},
                       *history,
                       {"role": "user", "content": req.message}],
             temperature=0.1,
-            max_tokens=30,
+            max_tokens=50,
             response_format={"type": "json_object"},
         )
         try:
@@ -1838,19 +1840,29 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         except (json.JSONDecodeError, AttributeError, TypeError):
             parsed = {}
         t = parsed.get("task")
-        return t if t in VALID_TASKS else None
+        t = t if t in VALID_TASKS else None
+        
+        explicit_model = parsed.get("explicit_model")
+        link_match = re.search(r"(?:huggingface\.co/)?([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)", req.message)
+        if link_match and not explicit_model:
+            cand = link_match.group(1)
+            if len(cand) > 4:
+                explicit_model = cand
+                
+        return t, explicit_model
 
     try:
-        task = await classify_intent(NIM_INTENT_MODEL)
+        task, explicit_model = await classify_intent(NIM_INTENT_MODEL)
     except Exception as e:
         if NIM_ROUTER_MODEL == NIM_INTENT_MODEL:
             raise HTTPException(status_code=502, detail=f"NIM intent-extraction error: {e}")
         try:
-            task = await classify_intent(NIM_ROUTER_MODEL)
+            task, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
         except Exception:
             raise HTTPException(status_code=502, detail=f"NIM intent-extraction error: {e}")
 
-    if task is None:
+    # If they gave a specific model link, we proceed even if task is None.
+    if task is None and not explicit_model:
         # Ambiguous or conversational — respond naturally, no search.
         try:
             convo = await openai_client.chat.completions.create(
@@ -1868,15 +1880,70 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
                 "action": None, "search_results": []}
 
     # ── Steps 3-4: real search + Python-only filtering ───────────────────
-    tasks = [task]
+    tasks = [task] if task else []
     if task == "object-detection":
         tasks = ["object-detection", "image-classification"]
     elif task == "image-classification":
         tasks = ["image-classification", "object-detection"]
 
+    models_data = []
     async with httpx.AsyncClient(timeout=60.0) as client:
-        models_data = await search_deployable_models(
-            client, tasks, req.message, max_size_mb, limit=12)
+        if tasks:
+            models_data = await search_deployable_models(
+                client, tasks, req.message, max_size_mb, limit=12)
+                
+        # Fetch the explicit model directly from HuggingFace to bypass keyword limits!
+        if explicit_model:
+            exp_resp = await client.get(f"https://huggingface.co/api/models/{explicit_model}?full=True")
+            if exp_resp.status_code == 200:
+                m = exp_resp.json()
+                # Determine its format manually
+                fmts = []
+                for s in m.get("siblings", []):
+                    rfn = s.get("rfilename", "").lower()
+                    if rfn.endswith(".tflite") and "tflite" not in fmts: fmts.append("tflite")
+                    if rfn.endswith(".gguf") and "gguf" not in fmts: fmts.append("gguf")
+                
+                if not fmts:
+                    models_data.append({
+                        "id": explicit_model,
+                        "name": m.get("id", explicit_model).split("/")[-1],
+                        "downloads": m.get("downloads", 0),
+                        "size_mb": 0,
+                        "task": m.get("pipeline_tag") or "unknown",
+                        "filename": "Unsupported Format",
+                        "format": "unsupported",
+                        "reputable": False,
+                        "download_url": None,
+                        "error_msg": f"The model '{explicit_model}' does NOT have any .tflite or .gguf files, which are strictly required to run natively on Android hardware. Explain this explicitly to the user."
+                    })
+                else:
+                    fmt = fmts[0]
+                    # We just need to append it. It doesn't have an exact download URL resolved yet, but the selection system prompt handles it if size is missing (or we can just leave download_url None and let selection prompt explain it's available).
+                    models_data.append({
+                        "id": m.get("id", explicit_model),
+                        "name": m.get("id", explicit_model).split("/")[-1],
+                        "downloads": m.get("downloads", 0),
+                        "size_mb": max_size_mb * 0.5, # Dummy size so it passes
+                        "task": m.get("pipeline_tag") or "unknown",
+                        "filename": m.get("id", explicit_model),
+                        "format": fmt,
+                        "reputable": True,
+                        "download_url": f"https://huggingface.co/{explicit_model}",
+                    })
+            else:
+                models_data.append({
+                        "id": explicit_model,
+                        "name": explicit_model.split("/")[-1],
+                        "downloads": 0,
+                        "size_mb": 0,
+                        "task": "unknown",
+                        "filename": "Not Found",
+                        "format": "unknown",
+                        "reputable": False,
+                        "download_url": None,
+                        "error_msg": f"The model '{explicit_model}' could not be found on HuggingFace. It might be private, deleted, or a typo. Tell this to the user."
+                })
 
     # Fold in the user's own catalog (uploads + previously-deployed models)
     # that match the task and fit the budget — the assistant must be aware
