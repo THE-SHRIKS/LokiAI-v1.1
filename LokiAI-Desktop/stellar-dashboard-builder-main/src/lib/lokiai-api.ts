@@ -92,7 +92,7 @@ export async function logout(): Promise<void> {
 
 async function doFetch(path: string, headers: Record<string, string>, init: RequestInit): Promise<Response> {
   try {
-    return await fetch(`${backendUrl()}${path}`, { ...init, headers, credentials: "include" });
+    return await fetch(`${backendUrl()}${path}`, { cache: "no-store", ...init, headers, credentials: "include" });
   } catch {
     throw new ApiError(0, `Backend unreachable at ${backendUrl()}`);
   }
