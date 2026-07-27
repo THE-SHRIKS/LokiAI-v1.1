@@ -1067,20 +1067,17 @@ def _detect_lan_ip() -> Optional[str]:
 
 
 def _public_base_url(request: Request) -> str:
-    """Base URL embedded in QR codes / WebSocket URLs / served file links —
-    must be reachable from the PHONE, not just from whoever made the request.
-
-    request.base_url reflects the host the CLIENT connected to. When the
-    dashboard's own browser calls the backend at the default
-    http://localhost:8000, request.base_url is "http://localhost:8000/" —
-    which is correct for that browser but useless once embedded in a QR
-    code, because "localhost" on the phone means the phone itself. That bug
-    made every pairing QR unreachable while looking like a real network
-    problem. Priority: explicit BACKEND_PUBLIC_URL (e.g. a Railway domain)
-    > this machine's real LAN IP > request.base_url as a last resort.
+    """
+    Priority: explicit BACKEND_PUBLIC_URL > Render auto-detect > LAN IP > request.base_url
     """
     if BACKEND_PUBLIC_URL:
         return BACKEND_PUBLIC_URL.rstrip("/")
+        
+    # Render auto-detection (for QR codes to work everywhere)
+    import os
+    if os.getenv("RENDER") or "onrender.com" in str(request.base_url):
+        return "https://lokiai.onrender.com"
+
     lan_ip = _detect_lan_ip()
     if lan_ip:
         port = request.url.port or 8000
@@ -1126,6 +1123,9 @@ async def system_info(request: Request):
     dashboard_port = 8080
     if DASHBOARD_URL and not DASHBOARD_URL.startswith("http://localhost"):
         dashboard_base = DASHBOARD_URL.rstrip("/")
+    elif os.getenv("RENDER") or "onrender.com" in str(request.base_url):
+        # If backend is on Render, dashboard is on Vercel
+        dashboard_base = "https://lokiai-v11.vercel.app"
     elif lan_ip:
         dashboard_base = f"http://{lan_ip}:{dashboard_port}"
     else:
