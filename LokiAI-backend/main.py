@@ -173,10 +173,23 @@ ALLOWED_ORIGINS = list(dict.fromkeys(
     o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
 ))
 
+# Credentialed CORS (allow_credentials=True + a SameSite=None refresh cookie in
+# production) means any origin accepted here can call /auth/refresh from a
+# victim's browser and read a fresh access token out of the response — a full
+# session takeover with no XSS on our own origin required.
+#
+# This previously matched `https://.*\.vercel\.app`, i.e. EVERY site on a
+# public PaaS anyone can deploy to for free. Vercel preview deployments that
+# genuinely need API access must now be listed explicitly in
+# CORS_ALLOWED_ORIGINS. Localhost stays regex-matched: dev servers pick
+# arbitrary ports (Vite falls back to 8081+ when 8080 is taken) and a local
+# origin cannot be registered by an attacker.
+_LOCALHOST_ORIGIN_REGEX = r"http://(localhost|127\.0\.0\.1)(:\d+)?"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:.*|http://127\.0\.0\.1:.*",
+    allow_origin_regex=_LOCALHOST_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

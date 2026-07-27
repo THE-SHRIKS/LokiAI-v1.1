@@ -345,6 +345,55 @@ def c_user_flow_intact():
     return True, "; ".join(steps)
 
 
+def c_p0_7_cors_no_vercel_wildcard():
+    """P0-7 / Batch 6: an arbitrary *.vercel.app origin must not be allowed.
+
+    With allow_credentials=True, any accepted origin can call /auth/refresh
+    from a victim's browser and read the new access token — session takeover.
+    """
+    evil = "https://evil-attacker-poc.vercel.app"
+    status, _ = _req("OPTIONS", "/auth/refresh", headers={
+        "Origin": evil,
+        "Access-Control-Request-Method": "POST",
+    })
+    # Re-issue to read headers directly.
+    req = urllib.request.Request(f"{BASE_URL}/auth/refresh", method="OPTIONS")
+    req.add_header("Origin", evil)
+    req.add_header("Access-Control-Request-Method", "POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            allow = r.headers.get("access-control-allow-origin")
+    except urllib.error.HTTPError as e:
+        allow = e.headers.get("access-control-allow-origin")
+    except Exception as e:
+        return False, f"transport error: {e}"
+
+    if allow and evil in allow:
+        return False, f"attacker origin allowed by CORS: allow-origin={allow!r}"
+    return True, f"attacker origin rejected (allow-origin={allow!r})"
+
+
+def c_cors_real_dashboard_still_allowed():
+    """Regression guard: the configured dashboard origin must keep working."""
+    good = "http://localhost:8080"
+    req = urllib.request.Request(f"{BASE_URL}/auth/refresh", method="OPTIONS")
+    req.add_header("Origin", good)
+    req.add_header("Access-Control-Request-Method", "POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            allow = r.headers.get("access-control-allow-origin")
+            creds = r.headers.get("access-control-allow-credentials")
+    except urllib.error.HTTPError as e:
+        allow = e.headers.get("access-control-allow-origin")
+        creds = e.headers.get("access-control-allow-credentials")
+    except Exception as e:
+        return False, f"transport error: {e}"
+
+    if allow and good in allow and creds == "true":
+        return True, f"dashboard origin allowed (allow-origin={allow!r}, credentials={creds})"
+    return False, f"dashboard origin NOT allowed: allow-origin={allow!r}, credentials={creds!r}"
+
+
 def c_no_secret_in_error_bodies():
     """Error responses must never carry secrets or stack traces."""
     status, body = _req("GET", "/devices/not-a-uuid", token=Ctx.a_token)
@@ -363,6 +412,8 @@ CHECKS = [
     ("P0-2b", "/deployments/{id} enforces ownership on all paths", c_p0_2b_deployment_status_ownership),
     ("P0-3", "/monitor/* rejects anonymous callers", c_p0_3_monitor_requires_auth),
     ("P0-5", "/devices/register cannot hijack another user's device", c_p0_5_device_register_no_hijack),
+    ("P0-7", "CORS rejects arbitrary *.vercel.app origins", c_p0_7_cors_no_vercel_wildcard),
+    ("CORS-1", "configured dashboard origin still allowed with credentials", c_cors_real_dashboard_still_allowed),
     ("ISO-1", "cross-tenant device read blocked", c_cross_tenant_device_read),
     ("ISO-2", "cross-tenant device delete blocked", c_cross_tenant_device_delete),
     ("ISO-3", "cross-tenant deployment blocked", c_cross_tenant_deploy_to_foreign_device),
