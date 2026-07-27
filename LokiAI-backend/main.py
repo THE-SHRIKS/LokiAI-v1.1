@@ -173,25 +173,14 @@ ALLOWED_ORIGINS = list(dict.fromkeys(
     o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
 ))
 
-class DynamicCORSMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        origin = request.headers.get("origin")
-        
-        # Preflight
-        if request.method == "OPTIONS":
-            response = Response()
-        else:
-            response = await call_next(request)
-
-        if origin:
-            if origin in ALLOWED_ORIGINS or origin.endswith(".vercel.app") or "localhost" in origin or "127.0.0.1" in origin:
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-                response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-        return response
-
-app.add_middleware(DynamicCORSMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:.*|http://127\.0\.0\.1:.*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
