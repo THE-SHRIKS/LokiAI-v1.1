@@ -1,0 +1,6 @@
+# Everything here is disposable test infrastructure — never committed.
+pg_portable/
+pgdata/
+pg_log.txt
+venv_test/
+.env.test
