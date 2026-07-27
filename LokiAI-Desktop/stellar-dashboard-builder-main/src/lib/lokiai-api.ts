@@ -208,8 +208,9 @@ export interface Me {
   name: string;
   email_verified: boolean;
   created_at: string | null;
+  // Configured-status only. The backend never returns the key itself — it is
+  // decrypted server-side inside the NIM call and nowhere else.
   has_nim_key: boolean;
-  nim_key?: string | null;
 }
 
 export async function getMe() {

@@ -285,6 +285,34 @@ class MonitorMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(MonitorMiddleware)
 
+
+# ── Authenticated-user dependency ────────────────────────────────────────────
+# Defined here (rather than beside the /auth routes) because FastAPI evaluates
+# Depends(...) at import time, and the first route that needs it — /feedback —
+# appears immediately below.
+security = HTTPBearer()
+
+
+async def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id: str = payload.get("sub")
+    jti: str = payload.get("jti")
+    token_type: str = payload.get("type")
+    if not user_id or not jti or token_type != "access":
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        blacklisted = await conn.fetchval("SELECT 1 FROM token_blacklist WHERE jti = $1", jti)
+    if blacklisted:
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+    return user_id
+
+
 @app.get("/monitor/status")
 async def monitor_status(request: Request):
     pool = request.app.state.pool
@@ -314,22 +342,28 @@ class FeedbackPayload(BaseModel):
     message: str
 
 @app.post("/feedback")
-async def submit_feedback(payload: FeedbackPayload, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    token_data = verify_token(credentials.credentials)
-    if not token_data:
-        raise HTTPException(status_code=401, detail="Invalid token")
+async def submit_feedback(payload: FeedbackPayload, request: Request, user_id: str = Depends(get_current_user)):
+    # Previously called a `verify_token` helper that was never defined, so both
+    # /feedback endpoints raised NameError -> 500 on every call. get_current_user
+    # is the same JWT validation every other authenticated route already uses
+    # (signature, expiry, jti, type, and blacklist revocation).
     if not payload.message.strip():
         raise HTTPException(status_code=422, detail="Message cannot be empty")
     if len(payload.message) > 2000:
         raise HTTPException(status_code=422, detail="Message too long (max 2000 chars)")
 
-    user_email = token_data.get("sub", "unknown")
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        user_email = await conn.fetchval("SELECT email FROM users WHERE id = $1::uuid", user_id)
+    user_email = user_email or "unknown"
+
     ts = datetime.now(timezone.utc).isoformat()
     entry_id = _uuid.uuid4().hex[:8]
 
     entry = {
         "id": entry_id,
         "ts": ts,
+        "user_id": user_id,
         "user": user_email,
         "category": payload.category,
         "message": payload.message.strip(),
@@ -369,10 +403,10 @@ async def submit_feedback(payload: FeedbackPayload, credentials: HTTPAuthorizati
     return {"ok": True, "id": entry_id}
 
 @app.get("/feedback")
-async def get_feedback(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    token_data = verify_token(credentials.credentials)
-    if not token_data:
-        raise HTTPException(status_code=401, detail="Invalid token")
+async def get_feedback(user_id: str = Depends(get_current_user)):
+    # Same undefined-`verify_token` crash as the POST above. Ownership scoping
+    # (this currently returns every user's feedback to any authenticated
+    # caller) is a separate defect, fixed in the next batch.
     return list(reversed(feedback_store))
 
 
@@ -848,28 +882,6 @@ async def logout(request: Request, response: Response, credentials: HTTPAuthoriz
     return {"logged_out": True}
 
 
-security = HTTPBearer()
-
-async def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user_id: str = payload.get("sub")
-    jti: str = payload.get("jti")
-    token_type: str = payload.get("type")
-    if not user_id or not jti or token_type != "access":
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        blacklisted = await conn.fetchval("SELECT 1 FROM token_blacklist WHERE jti = $1", jti)
-    if blacklisted:
-        raise HTTPException(status_code=401, detail="Token has been revoked")
-    return user_id
-
-
 @app.get("/auth/me")
 async def get_me(request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
@@ -887,8 +899,12 @@ async def get_me(request: Request, user_id: str = Depends(get_current_user)):
         "name": row["name"] or row["email"].split("@")[0],
         "email_verified": row["email_verified"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        # Status only — the key itself is never returned to any client. It is
+        # decrypted exclusively inside the NIM provider call in assistant_chat().
+        # (A previous revision returned the decrypted key here via a
+        # `_decrypt_key` helper that never existed, so this endpoint 500'd for
+        # every user who had saved a key.)
         "has_nim_key": row["nvidia_api_key_encrypted"] is not None,
-        "nim_key": _decrypt_key(row["nvidia_api_key_encrypted"]) if row["nvidia_api_key_encrypted"] else None,
     }
 
 
