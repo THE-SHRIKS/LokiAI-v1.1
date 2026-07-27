@@ -1068,20 +1068,21 @@ def _detect_lan_ip() -> Optional[str]:
 
 def _public_base_url(request: Request) -> str:
     """
-    Priority: explicit BACKEND_PUBLIC_URL > Render auto-detect > LAN IP > request.base_url
+    Priority: explicit BACKEND_PUBLIC_URL > Host Header > LAN IP
     """
     if BACKEND_PUBLIC_URL:
         return BACKEND_PUBLIC_URL.rstrip("/")
         
-    # Render auto-detection (for QR codes to work everywhere)
-    import os
-    if os.getenv("RENDER") or "onrender.com" in str(request.base_url):
-        return "https://lokiai.onrender.com"
+    # Trust the Host header (e.g. lokiai.onrender.com)
+    host_header = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    if "onrender.com" in host_header:
+        proto = request.headers.get("x-forwarded-proto", "https")
+        return f"{proto}://{host_header}"
 
     lan_ip = _detect_lan_ip()
     if lan_ip:
         port = request.url.port or 8000
-        scheme = request.url.scheme
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
         return f"{scheme}://{lan_ip}:{port}"
     return str(request.base_url).rstrip("/")
 
