@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import { getMe, saveNimKey, type Me } from "@/lib/lokiai-api";
-import { User, KeyRound, Smartphone, ArrowLeft, ExternalLink, Eye, EyeOff } from "lucide-react";
+import { getMe, saveNimKey, deleteNimKey, type Me } from "@/lib/lokiai-api";
+import { User, KeyRound, Smartphone, ArrowLeft, ExternalLink } from "lucide-react";
 
 export const Route = createFileRoute("/account")({
   head: () => ({
@@ -13,20 +13,15 @@ export const Route = createFileRoute("/account")({
 function AccountSettings() {
   const [me, setMe] = useState<Me | null>(null);
   const [apiKey, setApiKey] = useState("");
+  const [replacing, setReplacing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "error" | "success" } | null>(null);
-
-  const [showKey, setShowKey] = useState(false);
 
   useEffect(() => {
     getMe().then((m) => {
       setMe(m);
-      if (m.has_nim_key) {
-        // Placeholder only. A saved key is never sent back to the browser, so
-        // there is nothing real to prefill here — the Eye toggle below reveals
-        // only what the user types in this session.
-        setApiKey("••••••••••••••••••••••••");
-      }
+      // Never pre-fill a saved key — the backend never sends it back.
+      // We only track whether one exists (has_nim_key boolean).
     });
   }, []);
 
@@ -42,14 +37,35 @@ function AccountSettings() {
       await saveNimKey(key);
       setMessage({ text: "API key updated successfully.", type: "success" });
       setMe((prev) => (prev ? { ...prev, has_nim_key: true } : null));
-      setApiKey("••••••••••••••••••••••••");
-      setShowKey(false);
+      // Clear the field immediately — the key must not persist in state.
+      setApiKey("");
+      setReplacing(false);
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : String(e), type: "error" });
     } finally {
       setBusy(false);
     }
   };
+
+  const handleRemoveKey = async () => {
+    if (!confirm("Remove your NVIDIA NIM API key? The AI assistant will stop working until you add a new one.")) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      await deleteNimKey();
+      setMe((prev) => (prev ? { ...prev, has_nim_key: false } : null));
+      setApiKey("");
+      setReplacing(false);
+      setMessage({ text: "API key removed.", type: "success" });
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : String(e), type: "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const hasKey = me?.has_nim_key ?? false;
+  const showInput = !hasKey || replacing;
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground overflow-y-auto">
@@ -101,31 +117,63 @@ function AccountSettings() {
               Get a free API key at build.nvidia.com <ExternalLink className="h-3 w-3" />
             </a>
 
-            <div className="mt-4 flex gap-3">
-              <div className="relative flex-1">
+            {/* Configured state — key exists and user is not replacing */}
+            {hasKey && !replacing && (
+              <div className="mt-4 rounded border border-olive/30 bg-olive/5 px-4 py-3">
+                <div className="mb-3 text-sm text-olive-glow">NVIDIA NIM API key configured</div>
+                <div className="flex gap-2">
+                  <button
+                    id="nim-key-replace-btn"
+                    onClick={() => { setReplacing(true); setMessage(null); setApiKey(""); }}
+                    disabled={busy}
+                    className="rounded border border-border bg-background px-3 py-1.5 text-xs text-foreground transition-colors hover:border-olive hover:text-foreground disabled:opacity-50"
+                  >
+                    Replace key
+                  </button>
+                  <button
+                    id="nim-key-remove-btn"
+                    onClick={handleRemoveKey}
+                    disabled={busy}
+                    className="rounded border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-xs text-destructive-foreground transition-colors hover:bg-destructive/20 disabled:opacity-50"
+                  >
+                    {busy ? "Removing…" : "Remove key"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Input — shown when no key exists or user clicked Replace */}
+            {showInput && (
+              <div className="mt-4 flex gap-3">
+                {/* type=password: value is always masked while typing.
+                    No reveal button — a saved key must never be retrievable. */}
                 <input
-                  type={showKey ? "text" : "password"}
+                  id="nim-key-input"
+                  type="password"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
                   placeholder="nvapi-..."
-                  className="w-full rounded border border-border bg-background pl-3 pr-10 py-2 text-sm text-foreground focus:border-olive focus:outline-none"
+                  autoComplete="new-password"
+                  className="flex-1 rounded border border-border bg-background px-3 py-2 text-sm text-foreground focus:border-olive focus:outline-none"
                 />
                 <button
-                  type="button"
-                  onClick={() => setShowKey(!showKey)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  id="nim-key-save-btn"
+                  onClick={handleUpdateKey}
+                  disabled={busy || !apiKey}
+                  className="rounded-md bg-olive px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-olive-bright disabled:opacity-50"
                 >
-                  {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  {busy ? "Saving…" : "Save key"}
                 </button>
+                {replacing && (
+                  <button
+                    onClick={() => { setReplacing(false); setApiKey(""); setMessage(null); }}
+                    className="rounded border border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    Cancel
+                  </button>
+                )}
               </div>
-              <button
-                onClick={handleUpdateKey}
-                disabled={busy || !apiKey || apiKey.startsWith("•••")}
-                className="rounded-md bg-olive px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-olive-bright disabled:opacity-50"
-              >
-                {busy ? "Updating..." : "Update Key"}
-              </button>
-            </div>
+            )}
 
             {message && (
               <div className={`mt-4 rounded border px-3 py-2 text-xs ${
