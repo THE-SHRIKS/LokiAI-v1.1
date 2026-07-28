@@ -226,9 +226,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 import time, collections, uuid as _uuid
 
+# The production dashboard origin is always allowed, whether or not
+# CORS_ALLOWED_ORIGINS names it.
+#
+# This is an EXPLICIT single origin, not a wildcard — the defect being fixed
+# was `https://.*\.vercel\.app`, which trusted every site on a public PaaS.
+# Naming our own dashboard is the opposite of that.
+#
+# It exists because removing the wildcard makes the dashboard's access depend
+# entirely on an environment variable that cannot be read from outside the
+# Render console. If it were unset or wrong, the deploy that closes the
+# security hole would simultaneously take the whole dashboard offline. The app
+# already hardcodes this same origin in /system/info, so it is not new
+# knowledge — just applied where a mistake is unrecoverable.
+PRODUCTION_DASHBOARD_ORIGIN = "https://lokiai-v11.vercel.app"
+
 _default_origins = "http://localhost:8080,http://127.0.0.1:8080"
 ALLOWED_ORIGINS = list(dict.fromkeys(
-    o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
+    [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()]
+    + [PRODUCTION_DASHBOARD_ORIGIN]
 ))
 
 # Credentialed CORS (allow_credentials=True + a SameSite=None refresh cookie in
@@ -1202,7 +1218,13 @@ BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL")
 
 # Base URL of the dashboard (browser app), used to build links that must
 # open in the browser rather than hit the API — e.g. password reset links.
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:8080")
+#
+# On Render, defaulting to localhost would put an unusable link in every
+# password-reset email, so the real dashboard origin is the default there.
+# An explicit DASHBOARD_URL still wins.
+DASHBOARD_URL = os.getenv("DASHBOARD_URL") or (
+    PRODUCTION_DASHBOARD_ORIGIN if os.getenv("RENDER") else "http://localhost:8080"
+)
 
 _cached_lan_ip: Optional[str] = None
 
