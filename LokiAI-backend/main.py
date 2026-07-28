@@ -2814,6 +2814,14 @@ async def device_websocket(websocket: WebSocket, device_id: str, token: str = ""
 import tempfile
 import hashlib
 
+# Live in-memory progress for in-flight deployments, keyed by deployment_id.
+# Written by the WebSocket progress handler and read by GET /deployments and
+# GET /deployments/{id}, which is fresher than the database row while a
+# download is running. It happened to be declared inside the old ADB block, so
+# the first pass of that removal took it with it and every POST /deployments
+# 500'd with NameError. Kept here, with the wireless path that actually uses it.
+deployment_status: dict = {}
+
 
 class DeploymentConfig(BaseModel):
     inference_mode: str = "camera"
