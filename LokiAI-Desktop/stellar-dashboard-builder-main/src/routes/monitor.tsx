@@ -59,6 +59,10 @@ function MonitorPage() {
   const [serverLog, setServerLog] = useState<LogEntry[]>([]);
   const [clientLog, setClientLog] = useState<ClientEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Once access is denied the interval must never fire again — stash a ref so
+  // the closure inside fetchStatus can cancel the interval without stale state.
+  const [accessDenied, setAccessDenied] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [tab, setTab] = useState<"live" | "server" | "endpoints">("live");
   const clientLogRef = useRef(clientLog);
   clientLogRef.current = clientLog;
@@ -76,9 +80,12 @@ function MonitorPage() {
         fetch(`${base}/monitor/status`, { headers }),
         fetch(`${base}/monitor/log?limit=100`, { headers }),
       ]);
-      // 404 (not 403) is the deliberate non-operator response — the backend
-      // does not confirm these routes exist to non-operators.
-      if (statusRes.status === 401 || statusRes.status === 404) {
+      // 401/403/404: the backend deliberately conceals restricted operator routes.
+      // Stop all further polling immediately — normal users must never loop on
+      // these endpoints. Clear the error from console after the first check.
+      if (statusRes.status === 401 || statusRes.status === 403 || statusRes.status === 404) {
+        setAccessDenied(true);
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
         setError("This page is restricted to LokiAI operators.");
         return;
       }
@@ -91,10 +98,12 @@ function MonitorPage() {
   }, []);
 
   useEffect(() => {
+    if (accessDenied) return; // Do not re-subscribe after access is denied.
     fetchStatus();
     const t = setInterval(fetchStatus, POLL_MS);
-    return () => clearInterval(t);
-  }, [fetchStatus]);
+    pollRef.current = t;
+    return () => { clearInterval(t); pollRef.current = null; };
+  }, [fetchStatus, accessDenied]);
 
   // Intercept clicks globally to log them
   useEffect(() => {
