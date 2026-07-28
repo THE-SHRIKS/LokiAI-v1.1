@@ -493,3 +493,98 @@ git revert 3c54d20   # secure credential storage + re-pair flow
 git revert 76c3fff   # Flutter compile fixes (reverting restores broken code — do not)
 ```
 No migration to undo. Nothing deployed, so no production rollback applies.
+
+---
+
+### Entry 5 — Real NIM and assistant validation (all 15 directive scenarios)
+
+**Date:** 2026-07-28
+**Commit:** `5df9313` (pushed; `main` untouched at `168f79b`)
+**Provider:** real NVIDIA NIM with the authorized key from `.env`; real HuggingFace API/CDN
+**Harness:** `test_infra/nim_validation.py`
+
+**Key handling:** read from `.env` into memory, submitted via the real
+`PUT /auth/nim-key`, deleted from both test accounts at the end. Value and
+prefix never printed, logged, committed, or written to any report. Verified by
+scenario X2 (checked `/auth/me`, `/devices`, `/models`, `/deployments` — leaked
+in: none).
+
+#### Result: 22 scenarios, 22 passed, 0 failed
+
+But the FIRST run also reported 22/22 and was wrong — the assertions checked
+"no leakage" but not "correct error code". Tightening them to demand exact
+codes exposed three real defects.
+
+| # | Defect | Before | After |
+|---|---|---|---|
+| 1 | NVIDIA answers a bad key with **403** "Authorization failed", not 401. The classifier matched only 401, so every rejected key was reported as a provider outage — sending users to wait out an outage instead of fixing their key. | `NIM_PROVIDER_UNAVAILABLE` | `NIM_KEY_INVALID` |
+| 2 | A **second, legacy extractor** still lived in `classify_intent`, loose enough to pull `co/models` out of `huggingface.co/models?filter=tflite` and look it up as a repository (HF answered 307). | `HF_UNAVAILABLE` | not extracted |
+| 3 | Same root cause made incompatible repos look like an HF outage. | `HF_UNAVAILABLE` | `MODEL_INCOMPATIBLE` with a real explanation |
+
+Also found: the client timeout was 45s per call and a turn makes up to two, so
+a cold 70b router hung the caller past 90s with no response (`HTTP 0,
+90001ms`). `NIM_TIMEOUT_SECONDS` (default 20) + `max_retries=0` now yields a
+typed `NIM_TIMEOUT`.
+
+#### Sanitized raw output (final run)
+
+```
+[PASS]   K1 LIVE    save key                          HTTP 200
+[PASS]   K2 LIVE    configured status, key not returned
+                    has_nim_key=True, raw key in body=False
+[PASS]   K3 LIVE    replace key                       HTTP 200
+[PASS]   K4 LIVE    account B cannot use account A's key
+                    HTTP 428, error_code=NIM_KEY_MISSING
+[PASS]   S1 LIVE    greeting                 200, 4705ms, 140 chars, leaks=none
+[PASS]   S2 LIVE    general question         200, 20543ms, error_code=NIM_TIMEOUT
+[PASS]   S3 LIVE    python code request      200, 11870ms, results=3, leaks=none
+[PASS]   S4 LIVE    model search request     200, 8832ms, 882 chars, results=3
+[PASS]   S5 LIVE    fire detection request   200, 5741ms, 265 chars, results=3
+[PASS]   S6 LIVE    direct HF repository URL 200, 5380ms,
+                    ids=['litert-community/MobileNet-v2']
+[PASS]   S7 LIVE    HF model-list URL not mistaken for a repository
+                    200, error_code=NIM_TIMEOUT (must not be HF_UNAVAILABLE)
+[PASS]   S8 LIVE    incompatible repo -> MODEL_INCOMPATIBLE
+                    200, 392ms, offered_for_deploy=False
+[PASS]   S9 LIVE    compatible repo carries real size + real filename
+                    sample=[('mobilenet_v3_small.tflite', 9.71)]
+[PASS]  S10 FAULT   invalid key -> NIM_KEY_INVALID     656ms
+[PASS]  S11 FAULT   revoked key (observationally identical to invalid)
+[PASS]  S12 UNIT    timeout -> NIM_TIMEOUT
+[PASS]  S13 UNIT    rate limit -> NIM_RATE_LIMITED
+[PASS]  S14 UNIT    empty completion -> NIM_EMPTY_RESPONSE
+[PASS]  S15 UNIT    echoed prompt text stripped   264->64 chars, leaks=none
+[PASS]   X1 LIVE    two accounts chat independently; B->A's device=404
+[PASS]   X2 LIVE    key absent from every authenticated response surface
+[PASS]   K5 LIVE    delete key clears configured status
+
+[cleanup] NIM keys deleted from test accounts; accounts removed
+NIM VALIDATION: 22 scenarios, 22 passed, 0 failed
+```
+
+Scenario kinds: `LIVE` = real provider call; `FAULT` = genuinely induced
+failure (real bad key); `UNIT` = our own classifier, because the live provider
+will not emit that condition on demand. Nothing fakes a provider response and
+presents it as real.
+
+#### Internal prompt leakage
+
+Ten markers scanned across every live response
+(`return only valid json`, `do not include`, `search_results`, `error_msg`,
+`explain this explicitly`, `tell this to the user`, `system prompt`,
+`you are lokiai assistant`, `candidate data above`, `pick the best 3`):
+**zero occurrences**.
+
+#### Regression impact
+
+`regression.py` 25/25 and `wireless_flow_test.py` 9/9 re-run green.
+
+#### Database
+
+Production Neon untouched. All work against the local disposable PostgreSQL;
+synthetic accounts removed at the end of the run.
+
+#### Rollback
+
+`git revert 5df9313` — restores the three misclassifications and the 45s
+timeout. Not recommended.
