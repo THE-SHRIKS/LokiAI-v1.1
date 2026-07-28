@@ -1,30 +1,27 @@
-// This is a basic Flutter widget test.
+// Smoke test for the LokiAI app shell.
 //
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// This file previously contained the unmodified Flutter "counter" scaffold
+// test, which referenced a `MyApp` class that has never existed in this
+// project — the root widget is `LokiApp`. It therefore failed to compile and
+// broke `flutter test` for the entire package, masking every other test.
+// Replaced with a test that builds the real root widget.
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:lokiai_app/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('LokiApp builds its first frame without throwing',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const LokiApp());
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+    // Only one frame is pumped deliberately. PairingGate resolves
+    // asynchronously against SharedPreferences, and pumpAndSettle() would time
+    // out waiting for a platform channel that no plain unit-test binding
+    // answers. The first frame is enough to catch a build-time regression in
+    // the widget tree.
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }

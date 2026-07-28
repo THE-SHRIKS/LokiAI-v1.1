@@ -205,16 +205,23 @@ class BackendConnection {
   /// Reports the deployment/runtime state actually present on this device.
   Future<void> _sendStateReport() async {
     try {
-      final cfg = await ConfigReader.load();
+      // ConfigReader.load() returns a ConfigResult wrapper: `config` is null
+      // when nothing is deployed OR when the config failed to load, with the
+      // reason in `error`. Only a successfully parsed config counts as a real
+      // deployment — a read/parse failure must not be reported as 'complete'.
+      final result = await ConfigReader.load();
+      final cfg = result.config;
       send({
         'type': 'state_report',
         'device_id': _deviceId,
         'deployment_id': cfg?.deploymentId,
         'model_name': cfg?.modelName,
         'inference_mode': cfg?.inferenceMode,
-        // A config that loaded and whose model file is present means the
-        // deployment really did land on this device.
         'status': cfg == null ? 'none' : 'complete',
+        // Distinguishes "nothing deployed" from "a deployment exists but its
+        // config is unreadable", so the backend does not silently treat a
+        // broken install as a clean one.
+        'config_error': result.error,
         'timestamp': DateTime.now().toUtc().toIso8601String(),
       });
     } catch (e) {
