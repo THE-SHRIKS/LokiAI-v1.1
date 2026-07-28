@@ -1586,6 +1586,31 @@ _HF_URL_RE = re.compile(
 _BARE_REPO_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]{1,}/[A-Za-z0-9][\w.-]{2,})(?![\w/])")
 
 
+_RESERVED_HF_SEGMENTS = {
+    "models", "datasets", "spaces", "docs", "blog", "papers",
+    "collections", "settings", "join", "login",
+}
+
+
+def _looks_like_repo_id(cand: str) -> bool:
+    """Shape check for a HuggingFace `org/name`.
+
+    Applied to anything headed for the HF API — including values the language
+    model extracted — so prose or a URL fragment is never looked up as a
+    repository.
+    """
+    if not cand or cand.count("/") != 1:
+        return False
+    org, _, name = cand.partition("/")
+    if not org or not name:
+        return False
+    if "." in org or org.lower() in _RESERVED_HF_SEGMENTS:
+        return False
+    if len(org) < 2 or len(name) < 3:
+        return False
+    return all(c.isalnum() or c in "._-" for c in org + name)
+
+
 def _extract_direct_repo(message: str) -> Optional[str]:
     """Return an explicit HF repo id when the user clearly named one.
 
@@ -1599,9 +1624,11 @@ def _extract_direct_repo(message: str) -> Optional[str]:
     m = _BARE_REPO_RE.search(message.strip())
     if m:
         cand = m.group(1).rstrip(".,)")
-        org, _, name = cand.partition("/")
-        # Reject things that are obviously prose or paths rather than repo ids.
-        if len(org) >= 2 and len(name) >= 3 and not cand.lower().endswith(
+        # _looks_like_repo_id rejects a dotted "org" (a hostname, not an owner)
+        # and HuggingFace's own reserved path segments — without which
+        # "huggingface.co/models?filter=tflite" was extracted as a repository
+        # and looked up, surfacing as a misleading HF_UNAVAILABLE.
+        if _looks_like_repo_id(cand) and not cand.lower().endswith(
                 (".com", ".org", ".net", ".io", ".py", ".md", ".json")):
             return cand
     return None
@@ -2146,7 +2173,17 @@ def _classify_provider_error(exc: Exception) -> "AssistantError":
     text = str(exc)
     low = text.lower()
 
-    if status == 401 or "authenticationerror" in name.lower() or "invalid api key" in low or "unauthorized" in low:
+    # NVIDIA NIM answers a bad key with 403 "Authorization failed", not 401.
+    # Matching only 401 sent every rejected key down the generic path, so the
+    # user was told "could not reach the AI provider" when the real problem was
+    # their key — verified live against the provider on 2026-07-28.
+    if (status in (401, 403)
+            or "authenticationerror" in name.lower()
+            or "permissiondenied" in name.lower()
+            or "invalid api key" in low
+            or "authorization failed" in low
+            or "unauthorized" in low
+            or "forbidden" in low):
         return AssistantError(
             "NIM_KEY_INVALID",
             "Your NVIDIA NIM API key was rejected. Check it in Account Settings, "
@@ -2317,7 +2354,14 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
     openai_client = AsyncOpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=user_nvidia_key,
-        timeout=45.0,
+        # Per-call ceiling. A chat turn can make two provider calls (intent,
+        # then conversation or selection), so this bounds a turn at ~2x. At the
+        # previous 45s a cold 70b router could leave the caller hanging past
+        # 90s with no response at all — measured 2026-07-28. Failing at 20s
+        # yields a typed NIM_TIMEOUT the UI can act on, which is far better
+        # than an indefinite spinner.
+        timeout=float(os.getenv("NIM_TIMEOUT_SECONDS", "20")),
+        max_retries=0,
     )
 
     # ── Step 2: intent extraction — single fast call, exception fallback ─
@@ -2339,12 +2383,19 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         t = t if t in VALID_TASKS else None
         
         explicit_model = parsed.get("explicit_model")
-        link_match = re.search(r"(?:huggingface\.co/)?([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)", req.message)
-        if link_match and not explicit_model:
-            cand = link_match.group(1)
-            if len(cand) > 4:
-                explicit_model = cand
-                
+        if not explicit_model:
+            # Use the same validated extractor as the fast path. The previous
+            # pattern here — (?:huggingface\.co/)?([\w-]+/[\w.-]+) — was loose
+            # enough to pull "co/models" out of "huggingface.co/models?...",
+            # which was then looked up as a repository and surfaced as a
+            # misleading HF_UNAVAILABLE.
+            explicit_model = _extract_direct_repo(req.message)
+        elif not _looks_like_repo_id(explicit_model):
+            # The model is asked to extract a repo id; it can return prose.
+            # Anything that isn't shaped like org/name is discarded rather
+            # than sent to the HuggingFace API.
+            explicit_model = None
+
         return t, explicit_model
 
     # A pasted repo URL is unambiguous — resolving it needs no model call at
