@@ -1,5 +1,9 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+
+// Custom-model upload is hidden in production until the feature is ready.
+// Set VITE_ENABLE_CUSTOM_UPLOAD=true in .env to enable during development.
+const ENABLE_CUSTOM_UPLOAD = import.meta.env.VITE_ENABLE_CUSTOM_UPLOAD === "true";
 import {
   ArrowLeft,
   Box,
@@ -176,7 +180,7 @@ function ModelsPage() {
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
         <TopPicks navigate={navigate} />
 
-        <UploadZone onUploaded={load} />
+        {ENABLE_CUSTOM_UPLOAD && <UploadZone onUploaded={load} />}
 
         {error && (
           <div className="mb-3 rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">{error}</div>
@@ -189,7 +193,7 @@ function ModelsPage() {
             <Box className="mx-auto mb-3 h-6 w-6 text-olive-bright" />
             <div className="mb-1 text-sm text-foreground">No models yet.</div>
             <div className="text-xs text-muted-foreground">
-              Ask LokiAI to find one, or drop your own .tflite/.gguf file above.
+              Ask LokiAI to find a model and hit Deploy.
             </div>
           </div>
         ) : (
