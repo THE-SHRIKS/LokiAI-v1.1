@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config_reader.dart';
+import 'device_credential_store.dart';
 import 'device_registration.dart';
 import 'model_downloader.dart';
 
@@ -37,7 +39,19 @@ class BackendConnection {
   static const Duration maxReconnectDelay = Duration(minutes: 2);
   static const Duration heartbeatInterval = Duration(seconds: 20);
 
+  /// Application close codes sent by the backend (see device_websocket in
+  /// LokiAI-backend/main.py). 4401 means this device's credential is missing,
+  /// invalid, for a different device, or the device is no longer paired —
+  /// none of which retrying can fix.
+  static const int closeUnauthorized = 4401;
+  static const int closeSuperseded = 4000;
+
   final Random _rng = Random();
+
+  /// True once the backend has rejected our credential. The UI watches this to
+  /// prompt a re-pair instead of leaving the user staring at a device that
+  /// silently never comes online. Retrying is suspended while set.
+  final ValueNotifier<bool> needsRePair = ValueNotifier<bool>(false);
 
   bool get isConnected => _socket != null && _socket!.readyState == WebSocket.open;
 
@@ -80,7 +94,8 @@ class BackendConnection {
   Future<bool> _loadPairingData() async {
     final prefs = await SharedPreferences.getInstance();
     _deviceId = prefs.getString(DeviceRegistration.prefsDeviceId);
-    final deviceToken = prefs.getString(DeviceRegistration.prefsDeviceToken);
+    // Keystore-backed; also migrates any plaintext token left by an older build.
+    final deviceToken = await DeviceCredentialStore.read();
     _wsUrl = prefs.getString(DeviceRegistration.prefsWebsocketUrl);
 
     if ((_wsUrl == null || _wsUrl!.isEmpty) &&
@@ -141,8 +156,13 @@ class BackendConnection {
       _socket!.listen(
         _onMessage,
         onDone: () {
+          final code = _socket?.closeCode;
           // ignore: avoid_print
-          print('VERIFICATION: ws -> closed (code=${_socket?.closeCode})');
+          print('VERIFICATION: ws -> closed (code=$code)');
+          if (code == closeUnauthorized) {
+            _onCredentialRejected();
+            return;
+          }
           _onDisconnected();
         },
         onError: (Object e) {
@@ -181,6 +201,33 @@ class BackendConnection {
     _heartbeatTimer?.cancel();
     _socket = null;
     _scheduleReconnect();
+  }
+
+  /// The backend rejected this device's credential (close 4401).
+  ///
+  /// Retrying cannot succeed — the token is invalid, belongs to another
+  /// device, or the device was unpaired server-side. Stop the reconnect loop,
+  /// discard the dead credential so it cannot be replayed, and surface a
+  /// re-pair prompt. This is the controlled migration path for installs that
+  /// predate WebSocket authentication; there is deliberately no unauthenticated
+  /// fallback.
+  void _onCredentialRejected() {
+    // ignore: avoid_print
+    print('VERIFICATION: ws -> credential rejected by backend; re-pair required');
+    _heartbeatTimer?.cancel();
+    _reconnectTimer?.cancel();
+    _socket = null;
+    _started = false;
+    DeviceCredentialStore.clear();
+    needsRePair.value = true;
+  }
+
+  /// Called after a successful re-pair so the connection can be armed again.
+  Future<void> restartAfterRePair() async {
+    needsRePair.value = false;
+    _reconnectAttempts = 0;
+    _started = false;
+    await start();
   }
 
   /// Exponential backoff with full jitter, capped, and never giving up.

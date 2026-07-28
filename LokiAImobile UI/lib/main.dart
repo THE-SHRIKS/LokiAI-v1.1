@@ -122,7 +122,8 @@ class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
   Future<String?> _onScanned(PairingQrData data) async {
     final result = await DeviceRegistration.register(data);
     if (!result.ok) return result.error;
-    BackendConnection.instance.start();
+    // Re-arms the connection and clears any re-pair prompt.
+    await BackendConnection.instance.restartAfterRePair();
     if (mounted) {
       setState(() {
         _justPaired = true;
@@ -145,6 +146,29 @@ class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
     if (_paired == false) {
       return PairingScreen(onScanned: _onScanned);
     }
+    // The backend rejected this device's credential (WebSocket close 4401):
+    // missing/invalid token, a token for another device, or the device was
+    // unpaired server-side. Retrying cannot fix any of those, so send the user
+    // straight back through pairing rather than leaving the phone silently
+    // offline. This is the migration path for installs that predate WebSocket
+    // authentication.
+    return ValueListenableBuilder<bool>(
+      valueListenable: BackendConnection.instance.needsRePair,
+      builder: (context, needsRePair, child) {
+        if (needsRePair) {
+          return PairingScreen(
+            onScanned: _onScanned,
+            notice: 'This phone needs to be paired again. '
+                'Scan a new QR code from the LokiAI dashboard to reconnect.',
+          );
+        }
+        return child!;
+      },
+      child: _buildPairedUi(),
+    );
+  }
+
+  Widget _buildPairedUi() {
     if (_justPaired) {
       return Scaffold(
         backgroundColor: LokiColors.baseBlack,

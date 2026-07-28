@@ -43,7 +43,12 @@ class PairingQrData {
 class PairingScreen extends StatefulWidget {
   final Future<String?> Function(PairingQrData data) onScanned;
 
-  const PairingScreen({super.key, required this.onScanned});
+  /// Shown above the scanner when the user is here because something went
+  /// wrong rather than because this is first-time setup — e.g. the backend
+  /// rejected this device's credential and a re-pair is required.
+  final String? notice;
+
+  const PairingScreen({super.key, required this.onScanned, this.notice});
 
   @override
   State<PairingScreen> createState() => _PairingScreenState();
@@ -140,6 +145,25 @@ class _PairingScreenState extends State<PairingScreen> {
               ),
             ),
             const SizedBox(height: 24),
+            if (widget.notice != null) ...[
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2A1F14),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF8A6A3A)),
+                  ),
+                  child: Text(
+                    widget.notice!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: _textPrimary, fontSize: 13),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
             const Text(
               'Scan QR code to connect to your dashboard',
               textAlign: TextAlign.center,

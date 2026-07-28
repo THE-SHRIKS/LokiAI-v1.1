@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'device_credential_store.dart';
 import 'pairing_screen.dart';
 
 /// Hardware specs the phone reads about itself (v3: no ADB, the app is the
@@ -47,10 +48,11 @@ class DeviceRegistration {
   static const String prefsBackendUrl = 'backend_url';
   static const String prefsWebsocketUrl = 'websocket_url';
 
-  /// Device-scoped credential issued by POST /devices/pair. Required on every
-  /// WebSocket connect — the socket used to accept a bare device_id, so anyone
-  /// who learned that id could impersonate this phone.
-  static const String prefsDeviceToken = 'device_token';
+  /// Legacy plaintext location of the device credential. Retained only so
+  /// DeviceCredentialStore can migrate existing installs off it — new writes
+  /// go to Keystore-backed secure storage. Do not read this directly.
+  @Deprecated('Use DeviceCredentialStore.read() — this location is plaintext')
+  static const String prefsDeviceToken = DeviceCredentialStore.legacyPrefsKey;
 
   /// Reads the phone's own hardware specs via Flutter platform APIs.
   static Future<DeviceSpecs> readOwnSpecs() async {
@@ -111,7 +113,9 @@ class DeviceRegistration {
           await prefs.setString(prefsWebsocketUrl, websocketUrl);
         }
         if (deviceToken != null && deviceToken.isNotEmpty) {
-          await prefs.setString(prefsDeviceToken, deviceToken);
+          // Keystore-backed, never shared_preferences — this is a bearer
+          // credential for this device's WebSocket.
+          await DeviceCredentialStore.write(deviceToken);
         }
         return RegistrationResult(
             deviceId: deviceId, websocketUrl: websocketUrl);

@@ -45,6 +45,16 @@ dependencies:
   device_info_plus: ^13.2.0
   crypto: ^3.0.7
   path_provider: ^2.1.6
+  # DEPENDENCY ADDED (device-credential hardening, risk R-3).
+  # The WebSocket device token issued by POST /devices/pair is a real bearer
+  # credential for this phone. shared_preferences stores it in a plain XML file
+  # that is readable on a rooted device and eligible for Android cloud backup,
+  # so it is kept in the Android Keystore-backed EncryptedSharedPreferences
+  # instead. Non-secret pairing data (device_id, backend_url, websocket_url)
+  # stays in shared_preferences.
+  # ^10.x is required to stay compatible with the pinned device_info_plus 13.x;
+  # ^9.x fails resolution against it.
+  flutter_secure_storage: ^10.3.1
 
 # fllama 0.0.1 (latest on pub.dev) ships an android/build.gradle that uses
 # getDefaultProguardFile('proguard-android.txt'), which modern AGP rejects.
