@@ -2,12 +2,11 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "dashboard",
+      "name": "lokiai-dashboard",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": ["run", "dev", "--", "--port", "8080", "--strictPort"],
       "cwd": "LokiAI-Desktop/stellar-dashboard-builder-main",
-      "autoPort": true,
-      "port": 3000
+      "port": 8080
     }
   ]
 }

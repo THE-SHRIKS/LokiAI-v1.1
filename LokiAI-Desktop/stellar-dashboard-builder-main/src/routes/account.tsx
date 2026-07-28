@@ -21,10 +21,11 @@ function AccountSettings() {
   useEffect(() => {
     getMe().then((m) => {
       setMe(m);
-      if (m.nim_key) {
-        setApiKey(m.nim_key);
-      } else if (m.has_nim_key) {
-        setApiKey("••••••••••••••••••••••••"); // Masked for security fallback
+      if (m.has_nim_key) {
+        // Placeholder only. A saved key is never sent back to the browser, so
+        // there is nothing real to prefill here — the Eye toggle below reveals
+        // only what the user types in this session.
+        setApiKey("••••••••••••••••••••••••");
       }
     });
   }, []);
@@ -40,7 +41,9 @@ function AccountSettings() {
     try {
       await saveNimKey(key);
       setMessage({ text: "API key updated successfully.", type: "success" });
-      setMe((prev) => (prev ? { ...prev, has_nim_key: true, nim_key: key } : null));
+      setMe((prev) => (prev ? { ...prev, has_nim_key: true } : null));
+      setApiKey("••••••••••••••••••••••••");
+      setShowKey(false);
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : String(e), type: "error" });
     } finally {

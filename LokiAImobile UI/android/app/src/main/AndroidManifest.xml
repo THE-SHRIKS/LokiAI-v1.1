@@ -8,10 +8,21 @@
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <uses-feature android:name="android.hardware.microphone" android:required="false"/>
 
+    <!--
+      allowBackup / dataExtractionRules: the app holds a device-scoped bearer
+      credential for its WebSocket. Android's default allowBackup="true" would
+      make that credential eligible for cloud backup and restore onto a
+      DIFFERENT handset, which would hand that phone this device's identity.
+      Backup and device-to-device transfer are therefore disabled outright;
+      re-pairing on a new device is the intended (and only) path.
+    -->
     <application
         android:label="lokiai_app"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"

@@ -76,6 +76,12 @@ function MonitorPage() {
         fetch(`${base}/monitor/status`, { headers }),
         fetch(`${base}/monitor/log?limit=100`, { headers }),
       ]);
+      // 404 (not 403) is the deliberate non-operator response — the backend
+      // does not confirm these routes exist to non-operators.
+      if (statusRes.status === 401 || statusRes.status === 404) {
+        setError("This page is restricted to LokiAI operators.");
+        return;
+      }
       if (statusRes.ok) setStatus(await statusRes.json());
       if (logRes.ok) setServerLog(await logRes.json());
       setError(null);

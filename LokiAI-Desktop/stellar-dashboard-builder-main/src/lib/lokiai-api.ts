@@ -208,8 +208,9 @@ export interface Me {
   name: string;
   email_verified: boolean;
   created_at: string | null;
+  // Configured-status only. The backend never returns the key itself — it is
+  // decrypted server-side inside the NIM call and nowhere else.
   has_nim_key: boolean;
-  nim_key?: string | null;
 }
 
 export async function getMe() {
@@ -283,10 +284,28 @@ export interface ModelRecommendation {
   download_url?: string;
 }
 
+/** Stable, machine-readable outcome codes from the assistant. `null` on a
+ *  normal reply. The backend guarantees `response` is always human-readable
+ *  text safe to show as-is — provider/SDK detail is logged server-side and
+ *  never sent here. */
+export type AssistantErrorCode =
+  | "NIM_KEY_MISSING"
+  | "NIM_KEY_INVALID"
+  | "NIM_RATE_LIMITED"
+  | "NIM_TIMEOUT"
+  | "NIM_EMPTY_RESPONSE"
+  | "NIM_SCHEMA_INVALID"
+  | "NIM_PROVIDER_UNAVAILABLE"
+  | "HF_UNAVAILABLE"
+  | "MODEL_NOT_FOUND"
+  | "MODEL_INCOMPATIBLE"
+  | "NO_DEVICE_SELECTED";
+
 export interface AssistantReply {
   response: string;
   action: string | null;
   search_results: ModelRecommendation[];
+  error_code?: AssistantErrorCode | null;
 }
 
 export interface ConversationTurn {

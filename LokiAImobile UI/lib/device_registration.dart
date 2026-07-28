@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'device_credential_store.dart';
 import 'pairing_screen.dart';
 
 /// Hardware specs the phone reads about itself (v3: no ADB, the app is the
@@ -46,6 +47,12 @@ class DeviceRegistration {
   static const String prefsDeviceId = 'device_id';
   static const String prefsBackendUrl = 'backend_url';
   static const String prefsWebsocketUrl = 'websocket_url';
+
+  /// Legacy plaintext location of the device credential. Retained only so
+  /// DeviceCredentialStore can migrate existing installs off it — new writes
+  /// go to Keystore-backed secure storage. Do not read this directly.
+  @Deprecated('Use DeviceCredentialStore.read() — this location is plaintext')
+  static const String prefsDeviceToken = DeviceCredentialStore.legacyPrefsKey;
 
   /// Reads the phone's own hardware specs via Flutter platform APIs.
   static Future<DeviceSpecs> readOwnSpecs() async {
@@ -98,11 +105,17 @@ class DeviceRegistration {
           return const RegistrationResult(
               error: 'Backend returned no device_id. Try again.');
         }
+        final deviceToken = json['device_token'] as String?;
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString(prefsDeviceId, deviceId);
         await prefs.setString(prefsBackendUrl, qr.backendUrl);
         if (websocketUrl != null && websocketUrl.isNotEmpty) {
           await prefs.setString(prefsWebsocketUrl, websocketUrl);
+        }
+        if (deviceToken != null && deviceToken.isNotEmpty) {
+          // Keystore-backed, never shared_preferences — this is a bearer
+          // credential for this device's WebSocket.
+          await DeviceCredentialStore.write(deviceToken);
         }
         return RegistrationResult(
             deviceId: deviceId, websocketUrl: websocketUrl);

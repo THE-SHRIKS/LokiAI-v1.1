@@ -10,6 +10,25 @@ import 'package:path_provider/path_provider.dart';
 class ModelDownloader {
   static const int maxAttempts = 3;
 
+  /// Reduces a server-supplied model_name to a bare, safe filename.
+  ///
+  /// model_name arrives over the WebSocket and was previously concatenated
+  /// straight into a filesystem path, so a value like "../../shared_prefs/x"
+  /// would have written outside the models directory. Strips any directory
+  /// component and anything outside a conservative character set.
+  static String sanitizeFilename(String raw) {
+    // Take the last path segment only — kills ../, absolute paths, and both
+    // separator styles in one step.
+    var name = raw.split(RegExp(r'[/\\]')).where((s) => s.isNotEmpty).lastOrNull ?? '';
+    name = name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    // '.'/'..' survive the character filter but are not usable filenames.
+    while (name.startsWith('.')) {
+      name = name.substring(1);
+    }
+    if (name.isEmpty) name = 'model.bin';
+    return name;
+  }
+
   /// Entry point for a WebSocket "deploy" instruction.
   static Future<void> handleDeploy(
     Map<String, dynamic> data,
@@ -42,8 +61,10 @@ class ModelDownloader {
             'url=$modelUrl');
         final saved = await _download(
             modelUrl, modelName, deploymentId, expectedSha, send);
-        await _saveConfig(modelName, saved.path, config, deploymentId,
-            saved.bytes, saved.sha256);
+        // Record the sanitized name that was actually written to disk, so
+        // config.json can never disagree with the real file.
+        await _saveConfig(sanitizeFilename(modelName), saved.path, config,
+            deploymentId, saved.bytes, saved.sha256);
         send({
           'deployment_id': deploymentId,
           'status': 'complete',
@@ -85,11 +106,13 @@ class ModelDownloader {
     if (!await modelsDir.exists()) {
       await modelsDir.create(recursive: true);
     }
-    final file = File('${modelsDir.path}/$filename');
+    // Never trust the server-supplied name as a path (see sanitizeFilename).
+    final safeName = sanitizeFilename(filename);
+    final file = File('${modelsDir.path}/$safeName');
     // Atomic download: stream into a .part file and only rename over the
     // live model after the hash checks out. An interrupted download can
     // never leave a truncated file at the real path.
-    final partFile = File('${modelsDir.path}/$filename.part');
+    final partFile = File('${modelsDir.path}/$safeName.part');
 
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 30);

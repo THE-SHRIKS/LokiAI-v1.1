@@ -124,12 +124,70 @@ async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> 
     raise last_error
 
 
+# Presence liveness. The phone heartbeats every 20s; a device whose last_seen
+# is older than this is treated as gone regardless of what the status column
+# says. Without this, a device that vanished without a clean socket close
+# (process killed, network black-holed, backend restarted) stayed 'connected'
+# in the database forever, because only an orderly WebSocketDisconnect ever
+# wrote 'offline'.
+PRESENCE_TTL_SECONDS = int(os.getenv("PRESENCE_TTL_SECONDS", "70"))
+PRESENCE_SWEEP_SECONDS = 30
+
+
+async def _presence_sweep(pool):
+    """Mark devices offline once their heartbeat goes stale."""
+    while True:
+        try:
+            await asyncio.sleep(PRESENCE_SWEEP_SECONDS)
+            async with pool.acquire() as conn:
+                stale = await conn.fetch(
+                    """UPDATE devices SET status = 'offline'
+                       WHERE status = 'connected'
+                         AND (last_seen IS NULL
+                              OR last_seen < NOW() - ($1 || ' seconds')::interval)
+                       RETURNING id""",
+                    str(PRESENCE_TTL_SECONDS),
+                )
+            for row in stale:
+                device_id = str(row["id"])
+                # Drop any socket we still think is live for a device that has
+                # stopped heartbeating.
+                socket = ws_manager.active.pop(device_id, None)
+                if socket is not None:
+                    try:
+                        await socket.close(code=WS_CLOSE_SUPERSEDED, reason="heartbeat expired")
+                    except Exception:
+                        pass
+                print(f"[presence] device {device_id} -> offline (heartbeat stale)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # A sweep failure must never kill the loop.
+            print(f"[presence] sweep error: {type(e).__name__}: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await _create_pool_with_retry()
     await _run_migrations(app.state.pool)
-    yield
-    await app.state.pool.close()
+
+    # A restart wipes the in-memory socket registry while the database still
+    # says 'connected'. Reconcile immediately so presence reflects reality
+    # until each device reconnects and heartbeats again.
+    async with app.state.pool.acquire() as conn:
+        reset = await conn.execute("UPDATE devices SET status = 'offline' WHERE status = 'connected'")
+    print(f"[presence] startup reconciliation: {reset}")
+
+    sweep_task = asyncio.create_task(_presence_sweep(app.state.pool))
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
+        await app.state.pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -168,15 +226,44 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 import time, collections, uuid as _uuid
 
+# The production dashboard origin is always allowed, whether or not
+# CORS_ALLOWED_ORIGINS names it.
+#
+# This is an EXPLICIT single origin, not a wildcard — the defect being fixed
+# was `https://.*\.vercel\.app`, which trusted every site on a public PaaS.
+# Naming our own dashboard is the opposite of that.
+#
+# It exists because removing the wildcard makes the dashboard's access depend
+# entirely on an environment variable that cannot be read from outside the
+# Render console. If it were unset or wrong, the deploy that closes the
+# security hole would simultaneously take the whole dashboard offline. The app
+# already hardcodes this same origin in /system/info, so it is not new
+# knowledge — just applied where a mistake is unrecoverable.
+PRODUCTION_DASHBOARD_ORIGIN = "https://lokiai-v11.vercel.app"
+
 _default_origins = "http://localhost:8080,http://127.0.0.1:8080"
 ALLOWED_ORIGINS = list(dict.fromkeys(
-    o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
+    [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()]
+    + [PRODUCTION_DASHBOARD_ORIGIN]
 ))
+
+# Credentialed CORS (allow_credentials=True + a SameSite=None refresh cookie in
+# production) means any origin accepted here can call /auth/refresh from a
+# victim's browser and read a fresh access token out of the response — a full
+# session takeover with no XSS on our own origin required.
+#
+# This previously matched `https://.*\.vercel\.app`, i.e. EVERY site on a
+# public PaaS anyone can deploy to for free. Vercel preview deployments that
+# genuinely need API access must now be listed explicitly in
+# CORS_ALLOWED_ORIGINS. Localhost stays regex-matched: dev servers pick
+# arbitrary ports (Vite falls back to 8081+ when 8080 is taken) and a local
+# origin cannot be registered by an attacker.
+_LOCALHOST_ORIGIN_REGEX = r"http://(localhost|127\.0\.0\.1)(:\d+)?"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:.*|http://127\.0\.0\.1:.*",
+    allow_origin_regex=_LOCALHOST_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -197,19 +284,26 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# 10MB cap on request bodies to blunt abuse — except /models/upload, whose
-# entire job is accepting real GGUF/TFLite model files that routinely run
-# into the hundreds of MB (see uploaded_models/ and the deploy history in
-# REPORT.md). Capping that route at 10MB would break a working feature.
+# 10MB cap on request bodies to blunt abuse. /models/upload gets a much larger
+# but still finite cap — its job is accepting real GGUF/TFLite model files that
+# routinely run to hundreds of MB (see uploaded_models/ and the deploy history
+# in REPORT.md), so 10MB would break a working feature. It was previously
+# exempt entirely, which let any authenticated account fill the server's disk.
 MAX_BODY_SIZE = 10 * 1024 * 1024
-_BODY_SIZE_EXEMPT_PATHS = ("/models/upload",)
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_MB", "600")) * 1024 * 1024
+_LARGE_BODY_PATHS = {"/models/upload": MAX_UPLOAD_SIZE}
 
 
 class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path not in _BODY_SIZE_EXEMPT_PATHS:
-            content_length = request.headers.get("content-length")
-            if content_length and int(content_length) > MAX_BODY_SIZE:
+        limit = _LARGE_BODY_PATHS.get(request.url.path, MAX_BODY_SIZE)
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                declared = int(content_length)
+            except ValueError:
+                return JSONResponse(status_code=400, content={"error": "Invalid Content-Length"})
+            if declared > limit:
                 return JSONResponse(status_code=413, content={"error": "Request body too large"})
         return await call_next(request)
 
@@ -217,11 +311,57 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 app.add_middleware(BodySizeLimitMiddleware)
 
 
+# ── Typed assistant outcome boundary ─────────────────────────────────────────
+# Every failure path in the assistant used to collapse into a 502 carrying the
+# raw provider exception string — internal detail the user cannot act on, and
+# a channel through which provider/SDK text reached the UI. These codes are the
+# contract: the frontend branches on `error_code`, the `message` is written for
+# a human, and the raw provider text is logged server-side only.
+#
+# Defined here (well above its first use) because FastAPI resolves
+# @app.exception_handler(...) at import time.
+class AssistantError(Exception):
+    """A failure with a stable machine-readable code and a user-safe message."""
+
+    def __init__(self, code: str, message: str, http_status: int = 200, detail: str = ""):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+        self.http_status = http_status
+        # Server-side only. Never serialized to a client.
+        self.detail = detail
+
+
+ASSISTANT_ERROR_CODES = (
+    "NIM_KEY_MISSING", "NIM_KEY_INVALID", "NIM_RATE_LIMITED", "NIM_TIMEOUT",
+    "NIM_EMPTY_RESPONSE", "NIM_SCHEMA_INVALID", "NIM_PROVIDER_UNAVAILABLE",
+    "HF_UNAVAILABLE", "MODEL_NOT_FOUND", "MODEL_INCOMPATIBLE",
+    "NO_DEVICE_SELECTED",
+)
+
+
 @app.exception_handler(asyncpg.exceptions.DataError)
 async def _pg_data_error_handler(request: Request, exc: asyncpg.exceptions.DataError):
     # Malformed UUIDs (or other bad literals) hitting a $1::uuid cast land
     # here instead of surfacing as a raw 500 with DB internals in the body.
     return JSONResponse(status_code=422, content={"error": "Invalid ID format"})
+
+
+@app.exception_handler(AssistantError)
+async def _assistant_error_handler(request: Request, exc: "AssistantError"):
+    """Typed assistant failures. The user-safe message and a stable code go to
+    the client; the raw provider text is logged and never serialized."""
+    if exc.detail:
+        print(f"[assistant] {exc.code} on {request.url.path}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={
+            "response": exc.message,
+            "action": None,
+            "search_results": [],
+            "error_code": exc.code,
+        },
+    )
 
 
 @app.exception_handler(Exception)
@@ -285,8 +425,61 @@ class MonitorMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(MonitorMiddleware)
 
+
+# ── Authenticated-user dependency ────────────────────────────────────────────
+# Defined here (rather than beside the /auth routes) because FastAPI evaluates
+# Depends(...) at import time, and the first route that needs it — /feedback —
+# appears immediately below.
+security = HTTPBearer()
+
+
+async def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id: str = payload.get("sub")
+    jti: str = payload.get("jti")
+    token_type: str = payload.get("type")
+    if not user_id or not jti or token_type != "access":
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        blacklisted = await conn.fetchval("SELECT 1 FROM token_blacklist WHERE jti = $1", jti)
+    if blacklisted:
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+    return user_id
+
+
+# Operator-only routes (cross-tenant aggregates and request logs). There is no
+# role column on users, so membership is an explicit email allowlist from the
+# environment. Empty by default: with ADMIN_EMAILS unset nobody is an admin and
+# these routes are closed to everyone, which is the safe failure mode.
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
+
+
+async def require_admin(request: Request, user_id: str = Depends(get_current_user)) -> str:
+    """Authenticated AND on the operator allowlist.
+
+    Returns 404 rather than 403 for non-admins so the existence of these
+    routes isn't confirmed to an authenticated attacker probing for them.
+    """
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        email = await conn.fetchval("SELECT email FROM users WHERE id = $1::uuid", user_id)
+    if not email or email.lower() not in ADMIN_EMAILS:
+        raise HTTPException(status_code=404, detail="Not found")
+    return user_id
+
+
 @app.get("/monitor/status")
-async def monitor_status(request: Request):
+async def monitor_status(request: Request, _admin: str = Depends(require_admin)):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         device_count = await conn.fetchval("SELECT COUNT(*) FROM devices")
@@ -303,7 +496,7 @@ async def monitor_status(request: Request):
     }
 
 @app.get("/monitor/log")
-async def monitor_get_log(limit: int = 50):
+async def monitor_get_log(limit: int = 50, _admin: str = Depends(require_admin)):
     return monitor_log[-limit:]
 
 # ── Feedback ──────────────────────────────────────────────────────────────────
@@ -314,22 +507,28 @@ class FeedbackPayload(BaseModel):
     message: str
 
 @app.post("/feedback")
-async def submit_feedback(payload: FeedbackPayload, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    token_data = verify_token(credentials.credentials)
-    if not token_data:
-        raise HTTPException(status_code=401, detail="Invalid token")
+async def submit_feedback(payload: FeedbackPayload, request: Request, user_id: str = Depends(get_current_user)):
+    # Previously called a `verify_token` helper that was never defined, so both
+    # /feedback endpoints raised NameError -> 500 on every call. get_current_user
+    # is the same JWT validation every other authenticated route already uses
+    # (signature, expiry, jti, type, and blacklist revocation).
     if not payload.message.strip():
         raise HTTPException(status_code=422, detail="Message cannot be empty")
     if len(payload.message) > 2000:
         raise HTTPException(status_code=422, detail="Message too long (max 2000 chars)")
 
-    user_email = token_data.get("sub", "unknown")
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        user_email = await conn.fetchval("SELECT email FROM users WHERE id = $1::uuid", user_id)
+    user_email = user_email or "unknown"
+
     ts = datetime.now(timezone.utc).isoformat()
     entry_id = _uuid.uuid4().hex[:8]
 
     entry = {
         "id": entry_id,
         "ts": ts,
+        "user_id": user_id,
         "user": user_email,
         "category": payload.category,
         "message": payload.message.strip(),
@@ -369,10 +568,16 @@ async def submit_feedback(payload: FeedbackPayload, credentials: HTTPAuthorizati
     return {"ok": True, "id": entry_id}
 
 @app.get("/feedback")
-async def get_feedback(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    token_data = verify_token(credentials.credentials)
-    if not token_data:
-        raise HTTPException(status_code=401, detail="Invalid token")
+async def get_feedback(user_id: str = Depends(get_current_user)):
+    # Own submissions only. This previously returned every user's feedback
+    # (including their email address) to any authenticated caller.
+    return [e for e in reversed(feedback_store) if e.get("user_id") == user_id]
+
+
+@app.get("/admin/feedback")
+async def get_all_feedback(_admin: str = Depends(require_admin)):
+    """Cross-tenant feedback view, operator-only — replaces the unrestricted
+    listing that GET /feedback used to provide."""
     return list(reversed(feedback_store))
 
 
@@ -565,38 +770,37 @@ def health_check():
 # downloads the APK in its browser, and sideloads it — no USB install.
 # ------------------------------------------------------------------
 
-APK_PATH = os.path.normpath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "LokiAImobile UI", "build", "app", "outputs", "flutter-apk", "app-debug.apk"
-))
-
-# Production hosts the APK as a GitHub Release asset (Render's filesystem is
-# ephemeral and the repo never carries the ~140MB build artifact — see
-# LokiAI-backend/README.md). When set, /apk redirects there instead of
-# serving APK_PATH from local disk (the local-dev flutter-build path).
+# Optional external host for the APK (e.g. a GitHub Release asset). When set,
+# /apk/download redirects there instead of serving the file shipped in the
+# repo. Preferred for production: it keeps a ~141MB binary out of git.
 APK_DOWNLOAD_URL = os.getenv("APK_DOWNLOAD_URL")
 APK_SIZE_MB = os.getenv("APK_SIZE_MB")
 
-
-@app.api_route("/apk", methods=["GET", "HEAD"])
-async def download_apk():
-    if APK_DOWNLOAD_URL:
-        return RedirectResponse(APK_DOWNLOAD_URL, status_code=302)
-    if not os.path.isfile(APK_PATH):
-        raise HTTPException(status_code=404, detail="APK not built yet. Run flutter build first.")
-    return FileResponse(
-        APK_PATH,
-        media_type="application/vnd.android.package-archive",
-        filename="lokiai.apk"
-    )
+# There is exactly ONE APK delivery route: GET /apk/download (defined below).
+#
+# A second route lived here — GET /apk — serving
+# ../LokiAImobile UI/build/app/outputs/flutter-apk/app-debug.apk, a path that
+# only exists on a machine that has just run `flutter build`. It does not exist
+# on Render, so /apk returned 404 in production while /install linked straight
+# at it: the QR onboarding flow could not deliver the app to any phone at all.
+# Removed rather than repaired, so there is no second path to drift out of sync
+# again.
+#
+# /apk is deliberately NOT redirected to /apk/download. Nothing in the current
+# app or dashboard references it (verified), and a silent alias would hide the
+# same class of mistake next time.
 
 
 @app.get("/install", response_class=HTMLResponse)
 async def install_page():
+    # Size is read from the file this page actually links to. It previously
+    # measured a different file (the local flutter build output) than the one
+    # served, so the advertised size could not be trusted.
     if APK_DOWNLOAD_URL:
         size_mb = float(APK_SIZE_MB) if APK_SIZE_MB else None
     else:
-        size_mb = round(os.path.getsize(APK_PATH) / (1024 * 1024), 1) if os.path.isfile(APK_PATH) else None
+        size_mb = (round(os.path.getsize(_APK_PATH) / (1024 * 1024), 1)
+                   if os.path.isfile(_APK_PATH) else None)
     size_text = f" ({size_mb} MB)" if size_mb else ""
     return f"""<!DOCTYPE html>
 <html>
@@ -621,7 +825,7 @@ async def install_page():
 <body>
   <h1>LokiAI</h1>
   <p>On-device AI for your phone. Tap below to download the app{size_text}, then open the file and allow the install when prompted.</p>
-  <a class="btn" href="/apk">Download LokiAI</a>
+  <a class="btn" href="/apk/download">Download LokiAI</a>
 </body>
 </html>"""
 
@@ -706,6 +910,7 @@ async def register(user: RegisterUser, request: Request):
 
 
 @app.post("/auth/verify-otp")
+@limiter.limit("10/minute")
 async def verify_otp(req: VerifyOtpRequest, request: Request, response: Response):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -754,6 +959,7 @@ async def verify_otp(req: VerifyOtpRequest, request: Request, response: Response
 
 
 @app.post("/auth/resend-otp")
+@limiter.limit("5/minute")
 async def resend_otp(req: ResendOtpRequest, request: Request):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -848,28 +1054,6 @@ async def logout(request: Request, response: Response, credentials: HTTPAuthoriz
     return {"logged_out": True}
 
 
-security = HTTPBearer()
-
-async def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user_id: str = payload.get("sub")
-    jti: str = payload.get("jti")
-    token_type: str = payload.get("type")
-    if not user_id or not jti or token_type != "access":
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        blacklisted = await conn.fetchval("SELECT 1 FROM token_blacklist WHERE jti = $1", jti)
-    if blacklisted:
-        raise HTTPException(status_code=401, detail="Token has been revoked")
-    return user_id
-
-
 @app.get("/auth/me")
 async def get_me(request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
@@ -887,8 +1071,12 @@ async def get_me(request: Request, user_id: str = Depends(get_current_user)):
         "name": row["name"] or row["email"].split("@")[0],
         "email_verified": row["email_verified"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        # Status only — the key itself is never returned to any client. It is
+        # decrypted exclusively inside the NIM provider call in assistant_chat().
+        # (A previous revision returned the decrypted key here via a
+        # `_decrypt_key` helper that never existed, so this endpoint 500'd for
+        # every user who had saved a key.)
         "has_nim_key": row["nvidia_api_key_encrypted"] is not None,
-        "nim_key": _decrypt_key(row["nvidia_api_key_encrypted"]) if row["nvidia_api_key_encrypted"] else None,
     }
 
 
@@ -1030,7 +1218,13 @@ BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL")
 
 # Base URL of the dashboard (browser app), used to build links that must
 # open in the browser rather than hit the API — e.g. password reset links.
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:8080")
+#
+# On Render, defaulting to localhost would put an unusable link in every
+# password-reset email, so the real dashboard origin is the default there.
+# An explicit DASHBOARD_URL still wins.
+DASHBOARD_URL = os.getenv("DASHBOARD_URL") or (
+    PRODUCTION_DASHBOARD_ORIGIN if os.getenv("RENDER") else "http://localhost:8080"
+)
 
 _cached_lan_ip: Optional[str] = None
 
@@ -1080,9 +1274,16 @@ def _public_base_url(request: Request) -> str:
 # ── APK distribution ──────────────────────────────────────────────────────────
 _APK_PATH = os.path.join(os.path.dirname(__file__), "apk", "lokiai.apk")
 
-@app.get("/apk/download")
+@app.api_route("/apk/download", methods=["GET", "HEAD"])
 async def download_apk():
-    """Serves the LokiAI Android APK directly — no GitHub login required."""
+    """The single canonical APK delivery route, linked from GET /install.
+
+    Redirects to APK_DOWNLOAD_URL when one is configured (preferred in
+    production — it keeps a ~141MB binary out of the repository); otherwise
+    serves the copy shipped alongside the backend.
+    """
+    if APK_DOWNLOAD_URL:
+        return RedirectResponse(APK_DOWNLOAD_URL, status_code=302)
     if not os.path.exists(_APK_PATH):
         raise HTTPException(status_code=404, detail="APK not found on server")
     return FileResponse(
@@ -1129,6 +1330,7 @@ async def system_info(request: Request):
 
 
 @app.post("/pairing/generate")
+@limiter.limit("20/minute", key_func=_user_or_ip_key)
 async def generate_pairing_token(request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
     token = secrets.token_urlsafe(32)
@@ -1159,10 +1361,52 @@ class DevicePairRequest(BaseModel):
     android_version: str
 
 
-def _websocket_url(request: Request, device_id: str) -> str:
+def _websocket_url(request: Request, device_id: str, device_token: Optional[str] = None) -> str:
     base = _public_base_url(request)
     ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
-    return f"{ws_base}/ws/device/{device_id}"
+    url = f"{ws_base}/ws/device/{device_id}"
+    if device_token:
+        # Carried as a query parameter because the WebSocket browser/Dart APIs
+        # cannot set arbitrary headers on the upgrade request.
+        url = f"{url}?token={device_token}"
+    return url
+
+
+# Device credentials are long-lived: the phone must be able to reconnect on its
+# own after being offline for days without the user re-pairing. Revocation is
+# by deleting the device (DELETE /devices/{id}), which the WS handler checks on
+# every connect.
+DEVICE_TOKEN_TTL_DAYS = 365
+
+
+def _make_device_token(device_id: str, user_id) -> str:
+    """Bearer credential proving 'I am this specific paired device'.
+
+    Signed with the same key as user sessions but carries type='device', so it
+    can never be used as a user access token (get_current_user requires
+    type='access') and vice versa.
+    """
+    payload = {
+        "sub": str(device_id),
+        "uid": str(user_id),
+        "jti": str(_uuid.uuid4()),
+        "type": "device",
+        "exp": datetime.now(timezone.utc) + timedelta(days=DEVICE_TOKEN_TTL_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _verify_device_token(token: str, device_id: str) -> Optional[str]:
+    """Returns the owning user_id when the token is valid FOR THIS device_id."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+    if payload.get("type") != "device":
+        return None
+    if payload.get("sub") != str(device_id):
+        return None
+    return payload.get("uid")
 
 
 @app.post("/devices/pair")
@@ -1209,7 +1453,15 @@ async def pair_device(req: DevicePairRequest, request: Request):
                 token_row["id"]
             )
 
-    return {"device_id": device_id, "websocket_url": _websocket_url(request, device_id)}
+    # Device-scoped credential for the WebSocket. The socket used to accept any
+    # device_id with no proof at all; the phone stores this and presents it on
+    # every connect.
+    device_token = _make_device_token(device_id, user_id)
+    return {
+        "device_id": device_id,
+        "device_token": device_token,
+        "websocket_url": _websocket_url(request, device_id, device_token),
+    }
 
 
 @app.get("/devices/{device_id}")
@@ -1241,41 +1493,22 @@ async def get_device(device_id: str, request: Request, user_id: str = Depends(ge
     return d
 
 
-class DeviceRegister(BaseModel):
-    name: str
-    phone_model: str
-    cpu_arch: str
-    ram_mb: int
-    storage_free_gb: float
-    android_version: str
-    adb_serial: str
+# POST /devices/register was removed here (Batch 4).
+#
+# It upserted on the globally-unique adb_serial and unconditionally set
+# user_id = EXCLUDED.user_id on conflict, with no check on the existing row's
+# owner — so any authenticated account that knew or guessed another user's
+# adb_serial could move that device into its own account in a single call,
+# locking the real owner out (their next GET /devices/{id} 404s) and making
+# the device a valid target for the attacker's own deployments.
+#
+# It was ADB-era surface area from v2 with no remaining callers: the current
+# wireless flow registers devices through POST /devices/pair, which is scoped
+# to a single-use, expiring, user-bound pairing token. Verified before removal
+# that neither the dashboard (LokiAI-Desktop/.../src) nor the Flutter app
+# (LokiAImobile UI/lib) references this route. See Docs/06_RULES.md Rule 12
+# ("No USB, No ADB").
 
-@app.post("/devices/register")
-async def register_device(device: DeviceRegister, request: Request, user_id: str = Depends(get_current_user)):
-    pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        # Idempotent registration keyed on the unique adb_serial. If this phone
-        # was registered before (possibly by another user), the person who is
-        # physically connected and authenticated now claims it and its specs are
-        # refreshed. This keeps registration safe to run repeatedly and ensures
-        # the device always shows up under the current user's GET /devices.
-        row = await conn.fetchrow("""
-            INSERT INTO devices
-                (user_id, name, phone_model, cpu_arch, ram_mb, storage_free_gb, android_version, adb_serial, status, last_seen)
-            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, 'online', NOW())
-            ON CONFLICT (adb_serial) DO UPDATE SET
-                user_id         = EXCLUDED.user_id,
-                name            = EXCLUDED.name,
-                phone_model     = EXCLUDED.phone_model,
-                cpu_arch        = EXCLUDED.cpu_arch,
-                ram_mb          = EXCLUDED.ram_mb,
-                storage_free_gb = EXCLUDED.storage_free_gb,
-                android_version = EXCLUDED.android_version,
-                status          = 'online',
-                last_seen       = NOW()
-            RETURNING id
-        """, user_id, device.name, device.phone_model, device.cpu_arch, device.ram_mb, device.storage_free_gb, device.android_version, device.adb_serial)
-        return {"device_id": str(row["id"])}
 
 @app.get("/devices")
 async def get_devices(request: Request, user_id: str = Depends(get_current_user)):
@@ -1371,6 +1604,62 @@ _STOP_WORDS = {
     "my", "me", "please", "can", "you", "get", "give", "model", "models",
     "that", "which", "with", "and", "or", "of", "in", "on", "some", "do",
 }
+
+
+# A HuggingFace repo reference the user typed or pasted. Deliberately strict:
+# it must look like a real huggingface.co link or a bare `org/name` that is not
+# an ordinary sentence, so plain prose is never mistaken for a repo id.
+_HF_URL_RE = re.compile(
+    r"https?://(?:www\.)?huggingface\.co/([A-Za-z0-9][\w.-]*/[\w.-]+)", re.IGNORECASE)
+_BARE_REPO_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]{1,}/[A-Za-z0-9][\w.-]{2,})(?![\w/])")
+
+
+_RESERVED_HF_SEGMENTS = {
+    "models", "datasets", "spaces", "docs", "blog", "papers",
+    "collections", "settings", "join", "login",
+}
+
+
+def _looks_like_repo_id(cand: str) -> bool:
+    """Shape check for a HuggingFace `org/name`.
+
+    Applied to anything headed for the HF API — including values the language
+    model extracted — so prose or a URL fragment is never looked up as a
+    repository.
+    """
+    if not cand or cand.count("/") != 1:
+        return False
+    org, _, name = cand.partition("/")
+    if not org or not name:
+        return False
+    if "." in org or org.lower() in _RESERVED_HF_SEGMENTS:
+        return False
+    if len(org) < 2 or len(name) < 3:
+        return False
+    return all(c.isalnum() or c in "._-" for c in org + name)
+
+
+def _extract_direct_repo(message: str) -> Optional[str]:
+    """Return an explicit HF repo id when the user clearly named one.
+
+    Used to bypass the intent model entirely for direct-link requests, which
+    are unambiguous and should not depend on a provider round trip.
+    """
+    m = _HF_URL_RE.search(message)
+    if m:
+        # Trim trailing path segments (/tree/main, /blob/...) — keep org/name.
+        return "/".join(m.group(1).split("/")[:2]).rstrip("/.,)")
+    m = _BARE_REPO_RE.search(message.strip())
+    if m:
+        cand = m.group(1).rstrip(".,)")
+        # _looks_like_repo_id rejects a dotted "org" (a hostname, not an owner)
+        # and HuggingFace's own reserved path segments — without which
+        # "huggingface.co/models?filter=tflite" was extracted as a repository
+        # and looked up, surfacing as a misleading HF_UNAVAILABLE.
+        if _looks_like_repo_id(cand) and not cand.lower().endswith(
+                (".com", ".org", ".net", ".io", ".py", ".md", ".json")):
+            return cand
+    return None
 
 
 def _extract_keywords(message: str) -> str:
@@ -1479,13 +1768,34 @@ async def search_deployable_models(
             detail=f"HuggingFace search is currently unavailable: {last_error or 'unknown error'}"
         )
 
+    # Resolving candidate sizes dominates this endpoint's latency: it is one
+    # redirect-following CDN HEAD per candidate. Measured before this change at
+    # p50 4.8s / p95 13.3s for the whole request (see
+    # test_infra/perf_probe.py and Docs/test/LOKIAI_PERFORMANCE_REPORT.md).
+    #
+    # Two bounded fixes, no behaviour change:
+    #  - cache the size per (repo, file): the size of a file on `main` is
+    #    stable, and the same popular repos come back for most queries;
+    #  - bound concurrency, because firing 40 simultaneous HEADs at the public
+    #    (unauthenticated) CDN invites the 429s that produce the slow tail.
+    sem = asyncio.Semaphore(HF_HEAD_CONCURRENCY)
+
     async def sized(m, fname):
-        try:
-            head = await _hf_head(client, f"https://huggingface.co/{m['id']}/resolve/main/{fname}")
-            cl = head.headers.get("content-length")
-            return (m, fname, int(cl) / (1024 * 1024)) if cl else None
-        except httpx.HTTPError:
+        cache_key = f"size|{m['id']}|{fname}"
+        cached = _hf_cache_get(cache_key)
+        if cached is not None:
+            return (m, fname, cached) if cached > 0 else None
+        async with sem:
+            try:
+                head = await _hf_head(client, f"https://huggingface.co/{m['id']}/resolve/main/{fname}")
+                cl = head.headers.get("content-length")
+            except httpx.HTTPError:
+                return None
+        if not cl:
             return None
+        size_mb = int(cl) / (1024 * 1024)
+        _hf_cache_put(cache_key, size_mb)
+        return (m, fname, size_mb)
 
     checked = await asyncio.gather(*(sized(m, f) for m, f in candidates[:40]))
 
@@ -1517,6 +1827,7 @@ class ModelSearchRequest(BaseModel):
     user_message: str
 
 @app.post("/models/search")
+@limiter.limit("20/minute", key_func=_user_or_ip_key)
 async def search_models(req: ModelSearchRequest, request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -1593,6 +1904,7 @@ async def list_models(request: Request, user_id: str = Depends(get_current_user)
 
 
 @app.post("/models/upload")
+@limiter.limit("5/hour", key_func=_user_or_ip_key)
 async def upload_model(
     request: Request,
     file: UploadFile = File(...),
@@ -1621,11 +1933,27 @@ async def upload_model(
 
     sha256 = hashlib.sha256()
     size_bytes = 0
-    with open(dest_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):
-            f.write(chunk)
-            sha256.update(chunk)
-            size_bytes += len(chunk)
+    try:
+        with open(dest_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                size_bytes += len(chunk)
+                # Enforce the cap on bytes actually received, not just the
+                # declared Content-Length — that header can be absent (chunked
+                # transfer) or simply untrue.
+                if size_bytes > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Model file exceeds the {MAX_UPLOAD_SIZE // (1024*1024)} MB upload limit.",
+                    )
+                f.write(chunk)
+                sha256.update(chunk)
+    except Exception:
+        # Never leave a partial file behind on disk.
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise
 
     if size_bytes == 0:
         os.remove(dest_path)
@@ -1716,6 +2044,238 @@ A user pairs their Android phone by scanning a QR code — no cables, no ADB, no
 Talk like a smart, friendly person — warm but not cheesy. Keep it conversational, the way you'd text a friend who asked for help. Use natural language, contractions, casual phrasing. Vary your sentence length. Match the user's energy — if they're excited, be excited back; if they're chill, keep it easy. Never say "Great question", "Certainly", "I'd be happy to", or other robotic filler."""
 
 
+# ── HuggingFace repo metadata cache ──────────────────────────────────────────
+# A direct repo URL used to cost a fresh API call plus a HEAD on every message,
+# even when the same user pasted the same link twice. Entries are small and
+# short-lived; HF repo contents change rarely relative to a chat session.
+_HF_REPO_CACHE: dict = {}
+_HF_CACHE_TTL_SECONDS = int(os.getenv("HF_CACHE_TTL_SECONDS", "300"))
+_HF_CACHE_MAX = 512
+
+# Simultaneous CDN HEAD requests when sizing search candidates. The endpoint
+# previously fired one per candidate with no bound (up to 40), which is what
+# produced the long tail: the public HuggingFace CDN throttles bursts, and
+# _hf_head then sleeps on Retry-After.
+HF_HEAD_CONCURRENCY = int(os.getenv("HF_HEAD_CONCURRENCY", "8"))
+
+
+def _hf_cache_get(key: str):
+    entry = _HF_REPO_CACHE.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["at"] > _HF_CACHE_TTL_SECONDS:
+        _HF_REPO_CACHE.pop(key, None)
+        return None
+    return entry["value"]
+
+
+def _hf_cache_put(key: str, value) -> None:
+    if len(_HF_REPO_CACHE) >= _HF_CACHE_MAX:
+        # Cheap eviction: drop the oldest entry.
+        oldest = min(_HF_REPO_CACHE.items(), key=lambda kv: kv[1]["at"])[0]
+        _HF_REPO_CACHE.pop(oldest, None)
+    _HF_REPO_CACHE[key] = {"at": time.time(), "value": value}
+
+
+async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
+                                 max_size_mb: float) -> dict:
+    """Deterministically decide whether a named HF repo can run on this phone.
+
+    Returns either {"ok": True, "model": <candidate>} or
+    {"ok": False, "code": <taxonomy code>, "message": <user-safe text>}.
+
+    Every value in the returned candidate is real: the filename comes from the
+    repo's own file list, the size from a CDN HEAD. Nothing is assumed and
+    nothing is invented, because this feeds both the recommendation shown to
+    the user and the deploy action they can press.
+    """
+    cache_key = f"{repo_id}|{max_size_mb:.0f}"
+    cached = _hf_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = await _hf_get(client, f"https://huggingface.co/api/models/{repo_id}",
+                             params={"full": "True"})
+    except httpx.HTTPError as e:
+        # Not cached: a transport failure is transient and must not stick.
+        return {"ok": False, "code": "HF_UNAVAILABLE",
+                "message": "Could not reach HuggingFace to look that model up. "
+                           "Try again in a moment.",
+                "detail": str(e)}
+
+    if resp.status_code == 404:
+        result = {"ok": False, "code": "MODEL_NOT_FOUND",
+                  "message": f"I couldn't find “{repo_id}” on HuggingFace. "
+                             "It may be private, renamed, deleted, or a typo."}
+        _hf_cache_put(cache_key, result)
+        return result
+    if resp.status_code != 200:
+        return {"ok": False, "code": "HF_UNAVAILABLE",
+                "message": "HuggingFace returned an error looking that model up. "
+                           "Try again in a moment.",
+                "detail": f"HTTP {resp.status_code}"}
+
+    meta = resp.json()
+    siblings = meta.get("siblings", [])
+
+    # The phone runs TFLite (camera/audio) and GGUF (chat) only.
+    candidates = [s.get("rfilename", "") for s in siblings
+                  if s.get("rfilename", "").endswith((".tflite", ".gguf"))]
+    if not candidates:
+        present = sorted({os.path.splitext(s.get("rfilename", ""))[1]
+                          for s in siblings if os.path.splitext(s.get("rfilename", ""))[1]})
+        result = {
+            "ok": False, "code": "MODEL_INCOMPATIBLE",
+            "message": f"“{repo_id}” has no .tflite or .gguf file, so it can't run "
+                       f"on the phone. It ships {', '.join(present[:6]) or 'no recognisable model files'}. "
+                       "On-device inference needs TFLite (camera/audio) or GGUF (chat).",
+        }
+        _hf_cache_put(cache_key, result)
+        return result
+
+    # Prefer q4 GGUF — best size/quality tradeoff for phone-class RAM.
+    q4 = [f for f in candidates if f.endswith(".gguf") and "q4" in f.lower()]
+    ordered = q4 + [f for f in candidates if f not in q4]
+
+    # Real sizes, from the CDN, for the smallest few candidates.
+    sized = []
+    for fname in ordered[:6]:
+        try:
+            head = await _hf_head(
+                client, f"https://huggingface.co/{repo_id}/resolve/main/{fname}")
+            cl = head.headers.get("content-length")
+            if cl:
+                sized.append((fname, int(cl) / (1024 * 1024)))
+        except httpx.HTTPError:
+            continue
+
+    if not sized:
+        return {"ok": False, "code": "HF_UNAVAILABLE",
+                "message": f"I found “{repo_id}” but couldn't read its file sizes "
+                           "from the CDN just now. Try again in a moment."}
+
+    fitting = [(f, s) for f, s in sized if 0 < s <= max_size_mb]
+    if not fitting:
+        smallest_name, smallest_size = min(sized, key=lambda t: t[1])
+        result = {
+            "ok": False, "code": "MODEL_INCOMPATIBLE",
+            "message": f"“{repo_id}” is too large for this phone. Its smallest "
+                       f"runnable file ({smallest_name}) is {smallest_size:.0f} MB, "
+                       f"and this device's budget is {max_size_mb:.0f} MB.",
+        }
+        _hf_cache_put(cache_key, result)
+        return result
+
+    # Largest variant that still fits = most capable within budget.
+    fitting.sort(key=lambda t: t[1], reverse=True)
+    fname, size_mb = fitting[0]
+    result = {
+        "ok": True,
+        "model": {
+            "id": meta.get("id", repo_id),
+            "name": meta.get("id", repo_id).split("/")[-1],
+            "downloads": meta.get("downloads", 0),
+            "size_mb": round(size_mb, 2),
+            "task": meta.get("pipeline_tag") or "unknown",
+            "filename": fname,
+            "format": fname.rsplit(".", 1)[-1],
+            "reputable": repo_id.split("/")[0].lower() in REPUTABLE_ORGS,
+            "download_url": f"https://huggingface.co/{repo_id}/resolve/main/{fname}",
+        },
+    }
+    _hf_cache_put(cache_key, result)
+    return result
+
+
+def _classify_provider_error(exc: Exception) -> "AssistantError":
+    """Map a provider exception onto the typed taxonomy.
+
+    Classification is by exception type first (the SDK's own hierarchy), then
+    by status code, and only then by string matching — string matching alone is
+    brittle across SDK versions.
+    """
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None)
+    text = str(exc)
+    low = text.lower()
+
+    # NVIDIA NIM answers a bad key with 403 "Authorization failed", not 401.
+    # Matching only 401 sent every rejected key down the generic path, so the
+    # user was told "could not reach the AI provider" when the real problem was
+    # their key — verified live against the provider on 2026-07-28.
+    if (status in (401, 403)
+            or "authenticationerror" in name.lower()
+            or "permissiondenied" in name.lower()
+            or "invalid api key" in low
+            or "authorization failed" in low
+            or "unauthorized" in low
+            or "forbidden" in low):
+        return AssistantError(
+            "NIM_KEY_INVALID",
+            "Your NVIDIA NIM API key was rejected. Check it in Account Settings, "
+            "or generate a new one at build.nvidia.com.",
+            detail=text)
+    if status == 429 or "ratelimit" in name.lower() or "rate limit" in low or "too many requests" in low:
+        return AssistantError(
+            "NIM_RATE_LIMITED",
+            "NVIDIA NIM is rate-limiting this key right now. Wait a moment and try again.",
+            detail=text)
+    if "timeout" in name.lower() or "timeout" in low or "timed out" in low:
+        return AssistantError(
+            "NIM_TIMEOUT",
+            "The AI provider took too long to respond. Try again — this is usually temporary.",
+            detail=text)
+    if status is not None and 500 <= int(status) < 600:
+        return AssistantError(
+            "NIM_PROVIDER_UNAVAILABLE",
+            "NVIDIA NIM is having trouble right now. Try again shortly.",
+            detail=text)
+    return AssistantError(
+        "NIM_PROVIDER_UNAVAILABLE",
+        "Could not reach the AI provider. Try again shortly.",
+        detail=text)
+
+
+# Phrases that only ever appear in instructions written TO the model. If any
+# survives into a user-visible reply, the model has echoed its own prompt.
+_PROMPT_LEAK_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"\bexplain (?:the )?(?:this|exact)\b[^.]*\bto the user\b",
+        r"\btell this to the user\b",
+        r"\bdo not include\b",
+        r"\breturn only valid json\b",
+        r"\breturn only\b[^.]*\bjson\b",
+        r"\bsearch_results\b",
+        r"\berror_msg\b",
+        r"\bsystem prompt\b",
+        r"\byou must\b[^.]*\bin your response\b",
+        r"^\s*\{.*\"response\"\s*:.*\}\s*$",
+    )
+]
+
+
+def _strip_prompt_leakage(text: str) -> str:
+    """Remove any internal instruction text the model echoed back.
+
+    Defence in depth: the prompts were also rewritten so the model is no longer
+    *told* to repeat these strings, but a model can still parrot its
+    instructions, and that must never reach the UI.
+    """
+    if not text:
+        return text
+    cleaned_lines = []
+    for line in text.splitlines():
+        if any(p.search(line) for p in _PROMPT_LEAK_PATTERNS):
+            continue
+        cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines)
+    # Collapse the blank runs left behind by removed lines.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
 def _selection_system_prompt(device: dict, max_size_mb: float, filtered_models: list) -> str:
     """Stage 2 (final): real device specs + ONLY the code-filtered,
     HEAD-verified candidates. The model picks and explains — every id it
@@ -1741,20 +2301,22 @@ Max model size for this device: {max_size_mb:.0f} MB.
 These models fit this device and match the request:
 {json.dumps(filtered_models)}
 
-If any model in the list has an "error_msg", it means the user explicitly requested it but it CANNOT run on the phone. You MUST explain the exact error_msg to the user in your response and DO NOT include that model in search_results!
-Otherwise, pick the best 3 from this list ONLY. Never invent a model not in the list.
+Pick the best 3 from this list only. Never mention a model that is not in it.
 For each: name, size, one sentence on what it does, one sentence on why it
 suits this specific phone (mention the phone by name). Plain English.
-If nothing in the list genuinely fits the request, return an empty
-search_results list and say so honestly instead of forcing a pick.
-If the device is NOT connected right now, still recommend models normally,
-but add one honest sentence noting the phone needs to be online before
-Deploy will actually reach it.
+If nothing in the list genuinely fits the request, return an empty result list
+and say so honestly instead of forcing a pick.
+If the device is not connected right now, still recommend models normally, but
+add one honest sentence noting the phone needs to be online before Deploy will
+actually reach it.
 
-Return ONLY valid JSON in this exact shape:
-{{"response": "your picks and explanations as described above, ending with: press Deploy, the phone downloads it automatically, then open the LokiAI app.",
+Write only what the user should read. Never restate these instructions, never
+mention JSON, field names, or that you were given a candidate list.
+
+Reply with this JSON shape:
+{{"response": "your picks and explanations, ending with: press Deploy, the phone downloads it automatically, then open the LokiAI app.",
   "search_results": [{{"id": "...", "name": "...", "size_mb": 0, "task": "...", "filename": "...", "format": "..."}}]}}
-Copy id/filename/format EXACTLY from the candidate data above."""
+Copy id/filename/format exactly from the candidate data above."""
 
 
 class ChatRequest(BaseModel):
@@ -1785,10 +2347,14 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             "SELECT nvidia_api_key_encrypted FROM users WHERE id = $1::uuid", user_id
         )
     if not key_row or not key_row["nvidia_api_key_encrypted"]:
-        raise HTTPException(
-            status_code=428,
-            detail="Add your NVIDIA NIM API key before using the AI assistant. "
-                   "Get one free at https://build.nvidia.com, then save it in LokiAI settings."
+        # 428 Precondition Required is kept for backwards compatibility with
+        # the existing dashboard, which already branches on this status to open
+        # the key dialog.
+        raise AssistantError(
+            "NIM_KEY_MISSING",
+            "Add your NVIDIA NIM API key before using the AI assistant. "
+            "Get one free at https://build.nvidia.com, then save it in LokiAI settings.",
+            http_status=428,
         )
     user_nvidia_key = _decrypt_secret(key_row["nvidia_api_key_encrypted"])
 
@@ -1798,7 +2364,12 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             "WHERE id = $1::uuid AND user_id = $2::uuid",
             req.device_id, user_id)
         if not device_row:
-            raise HTTPException(status_code=404, detail="Device not found")
+            raise AssistantError(
+                "NO_DEVICE_SELECTED",
+                "I couldn't find that phone on your account. Pair a device from the "
+                "dashboard, then try again.",
+                http_status=404,
+            )
 
     device = dict(device_row)
     max_size_mb = (device["ram_mb"] or 4096) * 0.4
@@ -1811,7 +2382,14 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
     openai_client = AsyncOpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=user_nvidia_key,
-        timeout=45.0,
+        # Per-call ceiling. A chat turn can make two provider calls (intent,
+        # then conversation or selection), so this bounds a turn at ~2x. At the
+        # previous 45s a cold 70b router could leave the caller hanging past
+        # 90s with no response at all — measured 2026-07-28. Failing at 20s
+        # yields a typed NIM_TIMEOUT the UI can act on, which is far better
+        # than an indefinite spinner.
+        timeout=float(os.getenv("NIM_TIMEOUT_SECONDS", "20")),
+        max_retries=0,
     )
 
     # ── Step 2: intent extraction — single fast call, exception fallback ─
@@ -1833,23 +2411,37 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         t = t if t in VALID_TASKS else None
         
         explicit_model = parsed.get("explicit_model")
-        link_match = re.search(r"(?:huggingface\.co/)?([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)", req.message)
-        if link_match and not explicit_model:
-            cand = link_match.group(1)
-            if len(cand) > 4:
-                explicit_model = cand
-                
+        if not explicit_model:
+            # Use the same validated extractor as the fast path. The previous
+            # pattern here — (?:huggingface\.co/)?([\w-]+/[\w.-]+) — was loose
+            # enough to pull "co/models" out of "huggingface.co/models?...",
+            # which was then looked up as a repository and surfaced as a
+            # misleading HF_UNAVAILABLE.
+            explicit_model = _extract_direct_repo(req.message)
+        elif not _looks_like_repo_id(explicit_model):
+            # The model is asked to extract a repo id; it can return prose.
+            # Anything that isn't shaped like org/name is discarded rather
+            # than sent to the HuggingFace API.
+            explicit_model = None
+
         return t, explicit_model
 
-    try:
-        task, explicit_model = await classify_intent(NIM_INTENT_MODEL)
-    except Exception as e:
-        if NIM_ROUTER_MODEL == NIM_INTENT_MODEL:
-            raise HTTPException(status_code=502, detail=f"NIM intent-extraction error: {e}")
+    # A pasted repo URL is unambiguous — resolving it needs no model call at
+    # all. Skipping the intent hop here removes a whole provider round trip
+    # (and its failure modes) from the most deterministic request we handle.
+    direct_repo = _extract_direct_repo(req.message)
+    if direct_repo:
+        task, explicit_model = None, direct_repo
+    else:
         try:
-            task, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
-        except Exception:
-            raise HTTPException(status_code=502, detail=f"NIM intent-extraction error: {e}")
+            task, explicit_model = await classify_intent(NIM_INTENT_MODEL)
+        except Exception as e:
+            if NIM_ROUTER_MODEL == NIM_INTENT_MODEL:
+                raise _classify_provider_error(e)
+            try:
+                task, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
+            except Exception as e2:
+                raise _classify_provider_error(e2)
 
     # If they gave a specific model link, we proceed even if task is None.
     if task is None and not explicit_model:
@@ -1865,9 +2457,9 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             )
             reply = (convo.choices[0].message.content or "").strip()
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"NIM conversation error: {e}")
-        return {"response": reply or "Hey! I'm Loki — your AI sidekick for getting models onto your phone. What are you looking to do?",
-                "action": None, "search_results": []}
+            raise _classify_provider_error(e)
+        return {"response": _strip_prompt_leakage(reply) or "Hey! I'm Loki — your AI sidekick for getting models onto your phone. What are you looking to do?",
+                "action": None, "search_results": [], "error_code": None}
 
     # ── Steps 3-4: real search + Python-only filtering ───────────────────
     tasks = [task] if task else []
@@ -1877,63 +2469,26 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         tasks = ["image-classification", "object-detection"]
 
     models_data = []
+    explicit_rejection = None
     async with httpx.AsyncClient(timeout=60.0) as client:
         if tasks:
             models_data = await search_deployable_models(
                 client, tasks, req.message, max_size_mb, limit=12)
                 
-        # Fetch the explicit model directly from HuggingFace to bypass keyword limits!
+        # A user naming a specific repo bypasses keyword search entirely. The
+        # outcome is decided deterministically here, from real HuggingFace
+        # metadata and a real CDN HEAD — never by the language model, and never
+        # from invented values. (This path previously fabricated a size of
+        # `max_size_mb * 0.5` "so it passes" and used the repo id as a
+        # filename, so a repo could be recommended and deployed on the strength
+        # of numbers nobody had checked.)
         if explicit_model:
-            exp_resp = await client.get(f"https://huggingface.co/api/models/{explicit_model}?full=True")
-            if exp_resp.status_code == 200:
-                m = exp_resp.json()
-                # Determine its format manually
-                fmts = []
-                for s in m.get("siblings", []):
-                    rfn = s.get("rfilename", "").lower()
-                    if rfn.endswith(".tflite") and "tflite" not in fmts: fmts.append("tflite")
-                    if rfn.endswith(".gguf") and "gguf" not in fmts: fmts.append("gguf")
-                
-                if not fmts:
-                    models_data.append({
-                        "id": explicit_model,
-                        "name": m.get("id", explicit_model).split("/")[-1],
-                        "downloads": m.get("downloads", 0),
-                        "size_mb": 0,
-                        "task": m.get("pipeline_tag") or "unknown",
-                        "filename": "Unsupported Format",
-                        "format": "unsupported",
-                        "reputable": False,
-                        "download_url": None,
-                        "error_msg": f"The model '{explicit_model}' does NOT have any .tflite or .gguf files, which are strictly required to run natively on Android hardware. Explain this explicitly to the user."
-                    })
-                else:
-                    fmt = fmts[0]
-                    # We just need to append it. It doesn't have an exact download URL resolved yet, but the selection system prompt handles it if size is missing (or we can just leave download_url None and let selection prompt explain it's available).
-                    models_data.append({
-                        "id": m.get("id", explicit_model),
-                        "name": m.get("id", explicit_model).split("/")[-1],
-                        "downloads": m.get("downloads", 0),
-                        "size_mb": max_size_mb * 0.5, # Dummy size so it passes
-                        "task": m.get("pipeline_tag") or "unknown",
-                        "filename": m.get("id", explicit_model),
-                        "format": fmt,
-                        "reputable": True,
-                        "download_url": f"https://huggingface.co/{explicit_model}",
-                    })
+            explicit_outcome = await _resolve_explicit_repo(
+                client, explicit_model, max_size_mb)
+            if explicit_outcome["ok"]:
+                models_data.append(explicit_outcome["model"])
             else:
-                models_data.append({
-                        "id": explicit_model,
-                        "name": explicit_model.split("/")[-1],
-                        "downloads": 0,
-                        "size_mb": 0,
-                        "task": "unknown",
-                        "filename": "Not Found",
-                        "format": "unknown",
-                        "reputable": False,
-                        "download_url": None,
-                        "error_msg": f"The model '{explicit_model}' could not be found on HuggingFace. It might be private, deleted, or a typo. Tell this to the user."
-                })
+                explicit_rejection = explicit_outcome
 
     # Fold in the user's own catalog (uploads + previously-deployed models)
     # that match the task and fit the budget — the assistant must be aware
@@ -1965,12 +2520,24 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             "download_url": row["download_url"],
         })
 
+    # A specifically-named repo that the backend proved unusable is answered
+    # directly, with no model call. The verdict and the wording are both the
+    # backend's — the provider is never asked to explain a decision it did not
+    # make, which is how internal instruction text used to reach the UI.
+    if explicit_rejection is not None and not models_data:
+        if explicit_rejection.get("detail"):
+            print(f"[assistant] {explicit_rejection['code']}: {explicit_rejection['detail']}")
+        return {"response": explicit_rejection["message"],
+                "action": "search_models",
+                "search_results": [],
+                "error_code": explicit_rejection["code"]}
+
     if not models_data:
         return {"response": "I searched the live model hubs and found nothing deployable "
                             "that fits your phone for that request. Try different wording "
                             "(e.g. 'recognize objects with my camera', 'offline chatbot', "
                             "'identify sounds').",
-                "action": "search_models", "search_results": []}
+                "action": "search_models", "search_results": [], "error_code": None}
 
     # ── Step 5: NIM ranks and explains, nothing more ─────────────────────
     try:
@@ -1982,24 +2549,46 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             max_tokens=700,
             response_format={"type": "json_object"},
         )
-        parsed = json.loads(sel.choices[0].message.content)
+        raw = sel.choices[0].message.content
+        if not (raw or "").strip():
+            raise AssistantError("NIM_EMPTY_RESPONSE", "empty completion")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise AssistantError("NIM_SCHEMA_INVALID", "completion was not a JSON object")
     except Exception as e:
-        # Selector failure: fall back to the ranked search results directly.
-        print(f"[assistant] selector failed ({e}); returning ranked search results")
-        parsed = {"response": "Here are the best deployable matches I found. "
-                              "Press Deploy on one — the phone downloads it "
-                              "automatically, then open the LokiAI app.",
-                  "search_results": models_data[:3]}
+        # The selector only ranks and phrases — the candidate list is already
+        # decided. Its failure therefore degrades to the backend's own ranking
+        # rather than failing the request, but the reason is still surfaced as
+        # a typed code so the UI knows the wording is a fallback.
+        fallback_code = e.code if isinstance(e, AssistantError) else _classify_provider_error(e).code
+        print(f"[assistant] selector failed ({fallback_code}: {type(e).__name__}); "
+              f"returning backend-ranked results")
+        return {"response": "Here are the best deployable matches I found. "
+                            "Press Deploy on one — the phone downloads it "
+                            "automatically, then open the LokiAI app.",
+                "action": "search_models",
+                "search_results": models_data[:3],
+                "error_code": fallback_code}
 
     # ── Step 6: every returned model must exist in the real candidates ───
+    # The model's free-form output can never introduce a repository id, a size,
+    # a compatibility verdict, or a deploy target — it may only reorder and
+    # describe entries the backend already verified.
     by_id = {m["id"]: m for m in models_data}
     validated = []
     for r in parsed.get("search_results") or []:
         if isinstance(r, dict) and r.get("id") in by_id:
             validated.append(by_id[r["id"]])
-    return {"response": str(parsed.get("response") or "").strip(),
+
+    prose = _strip_prompt_leakage(str(parsed.get("response") or "").strip())
+    if not prose:
+        prose = ("Here are the best deployable matches I found. Press Deploy on one — "
+                 "the phone downloads it automatically, then open the LokiAI app.")
+
+    return {"response": prose,
             "action": "search_models",
-            "search_results": validated}
+            "search_results": validated,
+            "error_code": None}
 
 
 # ------------------------------------------------------------------
@@ -2015,10 +2604,28 @@ class DeviceConnectionManager:
         self.active: dict = {}
 
     async def connect(self, device_id: str, websocket: WebSocket):
-        await websocket.accept()
+        """Register an already-accepted socket, superseding any previous one.
+
+        A reconnecting phone (backgrounded, network flapped, process restarted)
+        can leave the old socket half-open on the server. Replacing the map
+        entry without closing the old socket leaked connections and left a
+        stale peer that could still receive deployment pushes, so the
+        superseded socket is closed explicitly.
+        """
+        previous = self.active.get(device_id)
+        if previous is not None and previous is not websocket:
+            try:
+                await previous.close(code=4000, reason="superseded by a newer connection")
+            except Exception:
+                pass
         self.active[device_id] = websocket
 
-    def disconnect(self, device_id: str):
+    def disconnect(self, device_id: str, websocket: Optional[WebSocket] = None):
+        """Remove the socket. When `websocket` is given, only removes it if it
+        is still the live one — so a late teardown from a superseded connection
+        cannot evict the connection that replaced it."""
+        if websocket is not None and self.active.get(device_id) is not websocket:
+            return
         self.active.pop(device_id, None)
 
     def is_connected(self, device_id: str) -> bool:
@@ -2059,6 +2666,22 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
     error_message = data.get("error_message")
     if not deployment_id or status not in ("downloading", "complete", "failed"):
         return
+
+    # The deployment must belong to the device reporting on it. Without this a
+    # connected device could rewrite the status, progress and error text of ANY
+    # deployment in the system just by naming its id.
+    try:
+        async with pool.acquire() as conn:
+            owns = await conn.fetchval(
+                "SELECT 1 FROM deployments WHERE id = $1::uuid AND device_id = $2::uuid",
+                deployment_id, device_id,
+            )
+    except (asyncpg.PostgresError, ValueError):
+        return
+    if not owns:
+        print(f"[WS] device {device_id} tried to update foreign deployment {deployment_id} — ignored")
+        return
+
     deployment_status[deployment_id] = {
         "status": status,
         "progress_percent": progress,
@@ -2085,11 +2708,125 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
         pass
 
 
+async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebSocket):
+    """Phone → server reconciliation of ACTUAL on-device state.
+
+    Sent by the app on connect/resume. The phone previously never told the
+    backend what it actually had installed, so after any missed message (offline
+    window, backend restart, dropped socket) the two sides could disagree
+    permanently with no way to converge. Reported state is advisory: it can only
+    resolve a deployment the server already believes is in flight FOR THIS
+    device, never create one or alter another device's.
+    """
+    reported_id = data.get("deployment_id")
+    reported_status = data.get("status")
+
+    try:
+        async with pool.acquire() as conn:
+            if reported_id and reported_status in ("complete", "failed"):
+                row = await conn.fetchrow(
+                    """SELECT id, status FROM deployments
+                       WHERE id = $1::uuid AND device_id = $2::uuid""",
+                    reported_id, device_id,
+                )
+                if row and row["status"] in ("queued", "downloading"):
+                    # Server thought it was still running; the device says it
+                    # finished while we weren't listening.
+                    if reported_status == "complete":
+                        await conn.execute(
+                            "UPDATE deployments SET status='complete', progress=100, "
+                            "completed_at=COALESCE(completed_at, NOW()) WHERE id=$1::uuid",
+                            reported_id,
+                        )
+                    else:
+                        await conn.execute(
+                            "UPDATE deployments SET status='failed', error_message=$2 WHERE id=$1::uuid",
+                            reported_id,
+                            str(data.get("error_message") or "Device reported failure after reconnect")[:500],
+                        )
+                    deployment_status[str(reported_id)] = {
+                        "status": reported_status,
+                        "progress_percent": 100 if reported_status == "complete" else 0,
+                        "error_message": data.get("error_message"),
+                    }
+                    print(f"[WS] reconciled deployment {reported_id} -> {reported_status} from device report")
+
+            # Anything the server still believes is in flight for this device
+            # that the phone did NOT mention is unresolvable from the device's
+            # side; leave it for the stale-deployment timeout rather than
+            # guessing.
+            pending = await conn.fetch(
+                """SELECT id, status FROM deployments
+                   WHERE device_id = $1::uuid AND status IN ('queued', 'downloading')
+                   ORDER BY deployed_at DESC LIMIT 5""",
+                device_id,
+            )
+    except (asyncpg.PostgresError, ValueError) as e:
+        print(f"[WS] state_report handling failed for {device_id}: {type(e).__name__}")
+        return
+
+    # Tell the device what the server still considers outstanding, so it can
+    # resume or re-report rather than both sides waiting on each other.
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "state_ack",
+            "pending_deployments": [
+                {"deployment_id": str(p["id"]), "status": p["status"]} for p in pending
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }))
+    except Exception:
+        pass
+
+
+# Largest accepted inbound WebSocket frame. Real messages are heartbeats and
+# small progress updates; anything near this is abuse.
+WS_MAX_MESSAGE_BYTES = 64 * 1024
+
+# WebSocket close codes (4000-4999 is the application-defined range).
+WS_CLOSE_SUPERSEDED = 4000
+WS_CLOSE_UNAUTHORIZED = 4401
+WS_CLOSE_MESSAGE_TOO_LARGE = 4413
+
+
 @app.websocket("/ws/device/{device_id}")
-async def device_websocket(websocket: WebSocket, device_id: str):
+async def device_websocket(websocket: WebSocket, device_id: str, token: str = ""):
+    """Authenticated device socket.
+
+    This endpoint previously accepted ANY device_id with no credential at all,
+    so anyone who learned a device id could impersonate that phone: receive its
+    deployment instructions, forge heartbeats to fake presence while the real
+    device was offline, and corrupt deployment status. A device-scoped token
+    (issued by POST /devices/pair) is now required and must match both the
+    device_id in the path and a device row that still exists and is still owned
+    by the user the token was minted for.
+    """
     pool = websocket.app.state.pool
+
+    owner_user_id = _verify_device_token(token, device_id) if token else None
+    if not owner_user_id:
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Device authentication required")
+        print(f"[WS] rejected unauthenticated connect for device {device_id}")
+        return
+
+    # The token alone is not enough: the device must still exist and still
+    # belong to that user, so unpairing/deleting a device revokes its socket.
+    try:
+        async with pool.acquire() as conn:
+            still_owned = await conn.fetchval(
+                "SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid",
+                device_id, owner_user_id,
+            )
+    except (asyncpg.PostgresError, ValueError):
+        still_owned = None
+    if not still_owned:
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Device is no longer paired")
+        print(f"[WS] rejected connect for unpaired/unknown device {device_id}")
+        return
+
+    await websocket.accept()
     await ws_manager.connect(device_id, websocket)
-    print(f"[WS] device {device_id} connected")
+    print(f"[WS] device {device_id} connected (authenticated)")
     await _set_device_status(pool, device_id, "connected")
     await ws_manager.send_json(device_id, {
         "type": "connected",
@@ -2099,123 +2836,70 @@ async def device_websocket(websocket: WebSocket, device_id: str):
     try:
         while True:
             raw = await websocket.receive_text()
+            if len(raw) > WS_MAX_MESSAGE_BYTES:
+                await websocket.close(code=WS_CLOSE_MESSAGE_TOO_LARGE, reason="Message too large")
+                break
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
                 await websocket.send_text(json.dumps(
                     {"type": "error", "detail": "Message was not valid JSON"}))
                 continue
-            print(f"[WS] from {device_id}: {data}")
+            if not isinstance(data, dict):
+                await websocket.send_text(json.dumps(
+                    {"type": "error", "detail": "Message must be a JSON object"}))
+                continue
+            print(f"[WS] from {device_id}: {str(data)[:200]}")
             if data.get("type") == "heartbeat":
                 await _set_device_status(pool, device_id, "connected")
                 await websocket.send_text(json.dumps({
                     "type": "heartbeat_ack",
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }))
+            elif data.get("type") == "state_report":
+                await _handle_state_report(pool, device_id, data, websocket)
             elif "deployment_id" in data:
                 await _handle_deployment_update(pool, device_id, data)
     except WebSocketDisconnect:
-        ws_manager.disconnect(device_id)
+        pass
+    finally:
+        ws_manager.disconnect(device_id, websocket)
         print(f"[WS] device {device_id} disconnected")
-        await _set_device_status(pool, device_id, "offline")
+        # Only flip to offline if this socket is genuinely the current one —
+        # otherwise a superseded connection's teardown would mark a device
+        # offline that has already reconnected.
+        if ws_manager.active.get(device_id) is None:
+            await _set_device_status(pool, device_id, "offline")
 
 
 # ============================================================
 # Phase 3 — Deployment
 # ============================================================
 
+# Deployment is wireless-only (v3). The backend resolves a CDN URL and pushes a
+# deploy instruction over the authenticated device WebSocket; the phone
+# downloads the model itself. The backend never touches the device directly.
+#
+# Removed here: the entire v2 ADB/USB cluster — _resolve_adb_path, ADB_PATH,
+# push_to_device, adb_shell, check_apk_installed, install_apk,
+# download_model_to_temp and run_deployment (~245 lines, with their
+# subprocess/threading/shutil imports). It had ZERO call sites: run_deployment
+# was the only caller of the adb helpers, and nothing called run_deployment.
+# It contradicted Docs/06_RULES.md Rule 12 ("No USB, No ADB") while sitting in
+# the same file as the live wireless path, and it invoked subprocess against a
+# path resolved from an env var. Dead code that shells out is worth deleting
+# rather than leaving for someone to re-wire by accident.
+
 import tempfile
 import hashlib
-import subprocess
-import threading
 
-import shutil
-
-def _resolve_adb_path() -> str:
-    """Locate adb without hardcoded drive letters.
-
-    Resolution order:
-      1. ADB_PATH env var (if it points at an existing file)
-      2. platform-tools/adb.exe bundled in the project root (one level above
-         this backend directory)
-      3. adb on the system PATH
-    Raises at call sites with a clear error if none resolve.
-    """
-    env_path = os.getenv("ADB_PATH")
-    if env_path and os.path.isfile(env_path):
-        return env_path
-
-    adb_name = "adb.exe" if os.name == "nt" else "adb"
-    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "platform-tools", adb_name)
-    bundled = os.path.normpath(bundled)
-    if os.path.isfile(bundled):
-        return bundled
-
-    on_path = shutil.which(adb_name)
-    if on_path:
-        return on_path
-
-    # Return the bare name; subprocess will fail with a clear FileNotFoundError
-    # that surfaces in the deployment error_message.
-    return adb_name
-
-ADB_PATH = _resolve_adb_path()
-
-# In-memory deployment status tracker (sufficient for local single-server use)
-deployment_status = {}
-
-async def download_model_to_temp(hf_model_id: str, filename: str):
-    """Download model from HuggingFace to a local temp folder. Returns (temp_path, sha256, size_bytes)."""
-    url = f"https://huggingface.co/{hf_model_id}/resolve/main/{filename}"
-    temp_dir = tempfile.mkdtemp(prefix="edgemind_")
-    # rfilename may contain repo subdirectories — store flat locally
-    temp_path = os.path.join(temp_dir, os.path.basename(filename))
-    sha256 = hashlib.sha256()
-    total_bytes = 0
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        async with client.stream("GET", url, follow_redirects=True) as response:
-            response.raise_for_status()
-            with open(temp_path, "wb") as f:
-                async for chunk in response.aiter_bytes():
-                    f.write(chunk)
-                    sha256.update(chunk)
-                    total_bytes += len(chunk)
-
-    return temp_path, sha256.hexdigest(), total_bytes
-
-def push_to_device(adb_serial: str, local_path: str, remote_path: str):
-    """Push a file to Android device via ADB."""
-    result = subprocess.run(
-        [ADB_PATH, "-s", adb_serial, "push", local_path, remote_path],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise Exception(f"ADB push failed: {result.stderr}")
-    return True
-
-def adb_shell(adb_serial: str, cmd: str):
-    """Run a shell command on the device via ADB."""
-    result = subprocess.run(
-        [ADB_PATH, "-s", adb_serial, "shell"] + cmd.split(),
-        capture_output=True, text=True
-    )
-    return result.stdout.strip(), result.returncode
-
-def check_apk_installed(adb_serial: str, package_name: str) -> bool:
-    """Check if a package is installed on the Android device."""
-    stdout, _ = adb_shell(adb_serial, f"pm list packages {package_name}")
-    return package_name in stdout
-
-def install_apk(adb_serial: str, apk_path: str):
-    """Install an APK on the device via ADB."""
-    result = subprocess.run(
-        [ADB_PATH, "-s", adb_serial, "install", "-r", apk_path],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise Exception(f"APK install failed: {result.stderr}")
-    return True
+# Live in-memory progress for in-flight deployments, keyed by deployment_id.
+# Written by the WebSocket progress handler and read by GET /deployments and
+# GET /deployments/{id}, which is fresher than the database row while a
+# download is running. It happened to be declared inside the old ADB block, so
+# the first pass of that removal took it with it and every POST /deployments
+# 500'd with NameError. Kept here, with the wireless path that actually uses it.
+deployment_status: dict = {}
 
 
 class DeploymentConfig(BaseModel):
@@ -2289,85 +2973,6 @@ async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".
         return fitting[0][0]
 
 
-async def run_deployment(deployment_id: str, device_adb_serial: str, req: DeploymentRequest, user_id: str, pool):
-    """Full deployment flow: download -> push -> config -> status update."""
-    try:
-        # Step 1: Update status to downloading
-        deployment_status[deployment_id] = {"status": "downloading", "progress_percent": 10, "error_message": None}
-        async with pool.acquire() as conn:
-            await conn.execute("UPDATE deployments SET status = 'downloading' WHERE id = $1::uuid", deployment_id)
-
-        # Step 2: Download model from HuggingFace to temp folder
-        temp_path, sha256_hash, size_bytes = await download_model_to_temp(req.hf_model_id, req.filename)
-        deployment_status[deployment_id] = {"status": "pushing", "progress_percent": 50, "error_message": None}
-        async with pool.acquire() as conn:
-            await conn.execute("UPDATE deployments SET status = 'pushing' WHERE id = $1::uuid", deployment_id)
-
-        # Step 3: Create remote directory and push model file
-        model_basename = os.path.basename(req.filename)
-        adb_shell(device_adb_serial, "mkdir -p /sdcard/edgemind/models/")
-        push_to_device(device_adb_serial, temp_path, f"/sdcard/edgemind/models/{model_basename}")
-
-        # Step 4: Delete temp file
-        try:
-            os.unlink(temp_path)
-            os.rmdir(os.path.dirname(temp_path))
-        except OSError:
-            pass
-
-        # Step 5: Generate and push config.json
-        config = {
-            "model_name": model_basename,
-            "model_path": f"/sdcard/edgemind/models/{model_basename}",
-            "inference_mode": req.effective_mode,
-            "format": model_basename.rsplit(".", 1)[-1] if "." in model_basename else "unknown",
-            "confidence_threshold": req.effective_threshold,
-            "deployed_at": datetime.now(timezone.utc).isoformat(),
-            "deployment_id": deployment_id
-        }
-        config_temp = os.path.join(tempfile.mkdtemp(prefix="edgemind_cfg_"), "config.json")
-        with open(config_temp, "w") as f:
-            json.dump(config, f, indent=2)
-        push_to_device(device_adb_serial, config_temp, "/sdcard/edgemind/config.json")
-        try:
-            os.unlink(config_temp)
-            os.rmdir(os.path.dirname(config_temp))
-        except OSError:
-            pass
-
-        deployment_status[deployment_id] = {"status": "installing", "progress_percent": 80, "error_message": None}
-
-        # Step 6: Check/install APK (skip if no APK file available yet — Phase 4)
-        # APK install will be added when Flutter app is built
-
-        # Step 7: Insert model record and update deployment to complete
-        async with pool.acquire() as conn:
-            model_row = await conn.fetchrow("""
-                INSERT INTO models (user_id, name, hf_model_id, source, format, size_mb, task_type, sha256)
-                VALUES ($1::uuid, $2, $3, 'huggingface', $4, $5, $6, $7)
-                RETURNING id
-            """, user_id, model_basename, req.hf_model_id,
-               config["format"], round(size_bytes / (1024*1024), 2),
-               req.effective_mode, sha256_hash)
-
-            await conn.execute("""
-                UPDATE deployments SET status = 'complete', model_id = $2::uuid, completed_at = NOW()
-                WHERE id = $1::uuid
-            """, deployment_id, str(model_row["id"]))
-
-        deployment_status[deployment_id] = {"status": "complete", "progress_percent": 100, "error_message": None}
-
-    except Exception as e:
-        error_msg = str(e)
-        deployment_status[deployment_id] = {"status": "failed", "progress_percent": 0, "error_message": error_msg}
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE deployments SET status = 'failed', error_message = $2 WHERE id = $1::uuid",
-                    deployment_id, error_msg
-                )
-        except Exception:
-            pass
 
 
 async def lookup_model_sha256(hf_model_id: str, filename: str) -> Optional[str]:
@@ -2388,6 +2993,7 @@ async def lookup_model_sha256(hf_model_id: str, filename: str) -> Optional[str]:
 
 
 @app.post("/deployments")
+@limiter.limit("10/minute", key_func=_user_or_ip_key)
 async def create_deployment(req: DeploymentRequest, request: Request, user_id: str = Depends(get_current_user)):
     """v3 wireless deployment: resolve HF CDN URL, push instruction to the
     phone over WebSocket. The phone downloads the model itself and reports
@@ -2557,14 +3163,10 @@ async def list_deployments(request: Request, user_id: str = Depends(get_current_
 
 @app.get("/deployments/{deployment_id}")
 async def get_deployment_status(deployment_id: str, request: Request, user_id: str = Depends(get_current_user)):
-    # Check in-memory status first (fastest)
-    if deployment_id in deployment_status:
-        return {
-            "deployment_id": deployment_id,
-            **deployment_status[deployment_id]
-        }
-
-    # Fall back to database
+    # Ownership is checked FIRST, against the database, for every request.
+    # The in-memory fast path below used to return before any such check, so
+    # any authenticated user holding a deployment id could read another
+    # account's live progress and error text.
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -2573,6 +3175,13 @@ async def get_deployment_status(deployment_id: str, request: Request, user_id: s
         )
         if not row:
             raise HTTPException(status_code=404, detail="Deployment not found")
+
+        # Owner confirmed — the in-memory entry (written by the WebSocket
+        # progress handler) is fresher than the row for anything still active.
+        live = deployment_status.get(deployment_id)
+        if live:
+            return {"deployment_id": deployment_id, **live}
+
         return {
             "deployment_id": str(row["id"]),
             "status": row["status"],
@@ -2581,9 +3190,10 @@ async def get_deployment_status(deployment_id: str, request: Request, user_id: s
         }
 
 @app.get("/admin/stats")
-async def get_admin_stats(request: Request):
-    # This is a local admin dashboard endpoint. 
-    # In a real production app, we would secure this with an admin role.
+async def get_admin_stats(request: Request, _admin: str = Depends(require_admin)):
+    # Cross-tenant: returns every user's email and activity. Restricted to the
+    # ADMIN_EMAILS allowlist (see require_admin) — it was previously reachable
+    # with no authentication at all.
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         # Get overall counts

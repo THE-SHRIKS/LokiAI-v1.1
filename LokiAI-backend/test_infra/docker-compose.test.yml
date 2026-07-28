@@ -1,0 +1,28 @@
+# Disposable local Postgres for Batch 0 testing ONLY.
+# Never point production DATABASE_URL at this. Container + volume are
+# fully throwaway — `docker compose -f docker-compose.test.yml down -v`
+# removes everything, including all data, with nothing left behind.
+#
+# Usage:
+#   docker compose -f test_infra/docker-compose.test.yml up -d
+#   docker cp test_infra/schema_baseline.sql lokiai-test-pg:/schema_baseline.sql
+#   docker exec lokiai-test-pg psql -U lokiai_test -d lokiai_test -f /schema_baseline.sql
+#
+# Resulting local connection string (test-only, not a real secret — the
+# password is a fixed throwaway value, container is not exposed beyond
+# localhost):
+#   postgresql://lokiai_test:lokiai_test@localhost:5433/lokiai_test
+
+services:
+  lokiai-test-pg:
+    image: postgres:16-alpine
+    container_name: lokiai-test-pg
+    restart: "no"
+    environment:
+      POSTGRES_USER: lokiai_test
+      POSTGRES_PASSWORD: lokiai_test
+      POSTGRES_DB: lokiai_test
+    ports:
+      - "127.0.0.1:5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data

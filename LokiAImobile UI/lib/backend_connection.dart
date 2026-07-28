@@ -1,16 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'config_reader.dart';
+import 'device_credential_store.dart';
 import 'device_registration.dart';
 import 'model_downloader.dart';
 
 /// Persistent WebSocket link to the backend (v3 wireless architecture).
-/// Connects after pairing, stays up while the app is in the foreground,
-/// reconnects every 5 seconds (up to 30 attempts) when dropped, sends
-/// heartbeats, and hands deployment instructions to ModelDownloader.
+/// Connects after pairing, reconnects with exponential backoff + jitter when
+/// dropped, sends heartbeats, reports actual on-device state after every
+/// (re)connect, and hands deployment instructions to ModelDownloader.
 class BackendConnection {
   static final BackendConnection instance = BackendConnection._();
   BackendConnection._();
@@ -20,12 +24,34 @@ class BackendConnection {
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
   bool _started = false;
+  bool _connecting = false;
   String? _wsUrl;
   String? _deviceId;
 
-  static const int maxReconnectAttempts = 30;
-  static const Duration reconnectDelay = Duration(seconds: 5);
+  /// Backoff schedule. Previously a flat 5s retry that stopped permanently
+  /// after 30 attempts (~2.5 min), so a phone offline any longer than that
+  /// stayed disconnected until the app was manually relaunched — the direct
+  /// cause of "phone still shows offline after I turned it back on". Retries
+  /// now continue indefinitely; the delay grows instead of the attempts
+  /// running out, and jitter keeps every paired device from reconnecting in
+  /// lockstep after a backend restart.
+  static const Duration minReconnectDelay = Duration(seconds: 2);
+  static const Duration maxReconnectDelay = Duration(minutes: 2);
   static const Duration heartbeatInterval = Duration(seconds: 20);
+
+  /// Application close codes sent by the backend (see device_websocket in
+  /// LokiAI-backend/main.py). 4401 means this device's credential is missing,
+  /// invalid, for a different device, or the device is no longer paired —
+  /// none of which retrying can fix.
+  static const int closeUnauthorized = 4401;
+  static const int closeSuperseded = 4000;
+
+  final Random _rng = Random();
+
+  /// True once the backend has rejected our credential. The UI watches this to
+  /// prompt a re-pair instead of leaving the user staring at a device that
+  /// silently never comes online. Retrying is suspended while set.
+  final ValueNotifier<bool> needsRePair = ValueNotifier<bool>(false);
 
   bool get isConnected => _socket != null && _socket!.readyState == WebSocket.open;
 
@@ -35,9 +61,43 @@ class BackendConnection {
     if (_started) return;
     _started = true;
 
+    if (!await _loadPairingData()) {
+      _started = false;
+      return;
+    }
+    await _connect();
+  }
+
+  /// Re-reads pairing data and reconnects immediately if the socket is down.
+  /// Called when the app returns to the foreground: the reconnect timer may be
+  /// deep into its backoff (or the OS may have frozen it entirely while
+  /// backgrounded), and the user expects the phone to be online as soon as
+  /// they open the app.
+  Future<void> resume() async {
+    if (!_started) {
+      await start();
+      return;
+    }
+    if (isConnected) {
+      // Prove the link is really alive rather than assuming.
+      _sendHeartbeat();
+      return;
+    }
+    // ignore: avoid_print
+    print('VERIFICATION: ws -> resume: reconnecting now');
+    _reconnectTimer?.cancel();
+    _reconnectAttempts = 0;
+    await _loadPairingData();
+    await _connect();
+  }
+
+  Future<bool> _loadPairingData() async {
     final prefs = await SharedPreferences.getInstance();
     _deviceId = prefs.getString(DeviceRegistration.prefsDeviceId);
+    // Keystore-backed; also migrates any plaintext token left by an older build.
+    final deviceToken = await DeviceCredentialStore.read();
     _wsUrl = prefs.getString(DeviceRegistration.prefsWebsocketUrl);
+
     if ((_wsUrl == null || _wsUrl!.isEmpty) &&
         _deviceId != null && _deviceId!.isNotEmpty) {
       final backend = prefs.getString(DeviceRegistration.prefsBackendUrl);
@@ -49,20 +109,40 @@ class BackendConnection {
       }
     }
 
+    // The backend requires a device-scoped token on the upgrade request. The
+    // saved websocket_url from pairing already carries it; older installs
+    // (paired before device tokens existed) have a stored token but a bare
+    // URL, so attach it here.
+    if (_wsUrl != null && _wsUrl!.isNotEmpty &&
+        deviceToken != null && deviceToken.isNotEmpty &&
+        !_wsUrl!.contains('token=')) {
+      final sep = _wsUrl!.contains('?') ? '&' : '?';
+      _wsUrl = '$_wsUrl${sep}token=$deviceToken';
+    }
+
     if (_wsUrl == null || _wsUrl!.isEmpty ||
         _deviceId == null || _deviceId!.isEmpty) {
       // ignore: avoid_print
       print('VERIFICATION: ws -> no pairing data saved, not connecting');
-      _started = false;
-      return;
+      return false;
     }
-    await _connect();
+    if (deviceToken == null || deviceToken.isEmpty) {
+      // Paired before device authentication shipped. The backend will refuse
+      // the socket; the user has to re-pair once from the dashboard.
+      // ignore: avoid_print
+      print('VERIFICATION: ws -> no device token saved; re-pair required');
+    }
+    return true;
   }
 
   Future<void> _connect() async {
+    // Guards against two connects racing (e.g. a resume() landing while the
+    // backoff timer is already firing), which would leave an orphaned socket.
+    if (_connecting || isConnected) return;
+    _connecting = true;
     try {
       // ignore: avoid_print
-      print('VERIFICATION: ws -> connecting to $_wsUrl');
+      print('VERIFICATION: ws -> connecting (attempt ${_reconnectAttempts + 1})');
       _socket = await WebSocket.connect(_wsUrl!)
           .timeout(const Duration(seconds: 15));
       _reconnectAttempts = 0;
@@ -76,8 +156,13 @@ class BackendConnection {
       _socket!.listen(
         _onMessage,
         onDone: () {
+          final code = _socket?.closeCode;
           // ignore: avoid_print
-          print('VERIFICATION: ws -> closed by server or network');
+          print('VERIFICATION: ws -> closed (code=$code)');
+          if (code == closeUnauthorized) {
+            _onCredentialRejected();
+            return;
+          }
           _onDisconnected();
         },
         onError: (Object e) {
@@ -87,18 +172,28 @@ class BackendConnection {
         },
         cancelOnError: true,
       );
+
+      // Tell the backend what this device ACTUALLY has, so anything that
+      // changed while the socket was down converges instead of the two sides
+      // disagreeing forever.
+      await _sendStateReport();
     } on TimeoutException {
       // ignore: avoid_print
       print('VERIFICATION: ws -> connect timed out');
+      _socket = null;
       _scheduleReconnect();
     } on SocketException catch (e) {
       // ignore: avoid_print
       print('VERIFICATION: ws -> connect failed: ${e.message}');
+      _socket = null;
       _scheduleReconnect();
     } on WebSocketException catch (e) {
       // ignore: avoid_print
       print('VERIFICATION: ws -> websocket error: $e');
+      _socket = null;
       _scheduleReconnect();
+    } finally {
+      _connecting = false;
     }
   }
 
@@ -108,19 +203,78 @@ class BackendConnection {
     _scheduleReconnect();
   }
 
-  void _scheduleReconnect() {
-    if (_reconnectAttempts >= maxReconnectAttempts) {
-      // ignore: avoid_print
-      print('VERIFICATION: ws -> gave up after $maxReconnectAttempts attempts');
-      return;
-    }
-    _reconnectAttempts += 1;
+  /// The backend rejected this device's credential (close 4401).
+  ///
+  /// Retrying cannot succeed — the token is invalid, belongs to another
+  /// device, or the device was unpaired server-side. Stop the reconnect loop,
+  /// discard the dead credential so it cannot be replayed, and surface a
+  /// re-pair prompt. This is the controlled migration path for installs that
+  /// predate WebSocket authentication; there is deliberately no unauthenticated
+  /// fallback.
+  void _onCredentialRejected() {
+    // ignore: avoid_print
+    print('VERIFICATION: ws -> credential rejected by backend; re-pair required');
+    _heartbeatTimer?.cancel();
     _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(reconnectDelay, () {
+    _socket = null;
+    _started = false;
+    DeviceCredentialStore.clear();
+    needsRePair.value = true;
+  }
+
+  /// Called after a successful re-pair so the connection can be armed again.
+  Future<void> restartAfterRePair() async {
+    needsRePair.value = false;
+    _reconnectAttempts = 0;
+    _started = false;
+    await start();
+  }
+
+  /// Exponential backoff with full jitter, capped, and never giving up.
+  void _scheduleReconnect() {
+    _reconnectAttempts += 1;
+    final expMs = minReconnectDelay.inMilliseconds * pow(2, _reconnectAttempts - 1);
+    final cappedMs = min(expMs.toDouble(), maxReconnectDelay.inMilliseconds.toDouble());
+    // Full jitter: pick uniformly in [min, capped] so a fleet of devices
+    // reconnecting after a backend restart spreads out instead of stampeding.
+    final jitteredMs = minReconnectDelay.inMilliseconds +
+        _rng.nextInt(max(1, (cappedMs - minReconnectDelay.inMilliseconds).round() + 1));
+
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(milliseconds: jitteredMs), () {
       // ignore: avoid_print
-      print('VERIFICATION: ws -> reconnect attempt $_reconnectAttempts');
+      print('VERIFICATION: ws -> reconnect attempt $_reconnectAttempts '
+          'after ${jitteredMs}ms');
       _connect();
     });
+  }
+
+  /// Reports the deployment/runtime state actually present on this device.
+  Future<void> _sendStateReport() async {
+    try {
+      // ConfigReader.load() returns a ConfigResult wrapper: `config` is null
+      // when nothing is deployed OR when the config failed to load, with the
+      // reason in `error`. Only a successfully parsed config counts as a real
+      // deployment — a read/parse failure must not be reported as 'complete'.
+      final result = await ConfigReader.load();
+      final cfg = result.config;
+      send({
+        'type': 'state_report',
+        'device_id': _deviceId,
+        'deployment_id': cfg?.deploymentId,
+        'model_name': cfg?.modelName,
+        'inference_mode': cfg?.inferenceMode,
+        'status': cfg == null ? 'none' : 'complete',
+        // Distinguishes "nothing deployed" from "a deployment exists but its
+        // config is unreadable", so the backend does not silently treat a
+        // broken install as a clean one.
+        'config_error': result.error,
+        'timestamp': DateTime.now().toUtc().toIso8601String(),
+      });
+    } catch (e) {
+      // ignore: avoid_print
+      print('VERIFICATION: ws -> state report skipped: $e');
+    }
   }
 
   void _sendHeartbeat() {
@@ -160,6 +314,16 @@ class BackendConnection {
 
     if (data['action'] == 'deploy') {
       ModelDownloader.handleDeploy(data, send);
+      return;
+    }
+
+    if (data['type'] == 'state_ack') {
+      // Server's view of what is still outstanding for this device after our
+      // state report. Logged for diagnosis; the server has already reconciled
+      // anything the report resolved.
+      final pending = data['pending_deployments'];
+      // ignore: avoid_print
+      print('VERIFICATION: ws -> state_ack pending=$pending');
     }
   }
 }
