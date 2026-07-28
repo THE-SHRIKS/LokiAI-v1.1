@@ -118,13 +118,26 @@ function Index() {
   // null = still checking, so nothing renders instead of a false flash.
   const [hasNimKey, setHasNimKey] = useState<boolean | null>(null);
   
+  const meRef = useRef<{ id: string } | null>(null);
+
   useEffect(() => {
     if (!getToken()) return;
     getMe()
       .then((m) => {
         setHasNimKey(m.has_nim_key);
         setMe(m as any);
-        setSessions(loadSessions(m.id));
+        meRef.current = m;
+        // Merge stored sessions INTO any sessions already created by the
+        // deploy-search effect — never replace the whole array, because
+        // the deploy effect may have run before getMe() resolved (Bug 3).
+        setSessions((existing) => {
+          const stored = loadSessions(m.id);
+          if (existing.length === 0) return stored;
+          const storedIds = new Set(stored.map((s) => s.id));
+          // Prepend new sessions (not in storage yet) ahead of the stored list.
+          const brandNew = existing.filter((s) => !storedIds.has(s.id));
+          return [...brandNew, ...stored];
+        });
         setSessionsLoaded(true);
       })
       .catch(() => {
@@ -133,9 +146,13 @@ function Index() {
       });
   }, []);
 
+  // Persist sessions whenever they change, but only after the user is known.
+  // saveSessions is cheap (JSON.stringify of at most 50 entries) so no debounce
+  // is needed, but we do guard against persisting before we know the user id.
   useEffect(() => {
-    if (me?.id && sessionsLoaded) {
-      saveSessions(me.id, sessions);
+    const userId = me?.id ?? meRef.current?.id;
+    if (userId && sessionsLoaded) {
+      saveSessions(userId, sessions);
     }
   }, [sessions, me, sessionsLoaded]);
 
