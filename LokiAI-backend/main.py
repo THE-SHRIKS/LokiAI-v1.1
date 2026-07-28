@@ -240,11 +240,12 @@ import time, collections, uuid as _uuid
 # already hardcodes this same origin in /system/info, so it is not new
 # knowledge — just applied where a mistake is unrecoverable.
 PRODUCTION_DASHBOARD_ORIGIN = "https://lokiai-v11.vercel.app"
+CUSTOM_DOMAIN_ORIGIN = "https://lokiai.theshriks.space"
 
 _default_origins = "http://localhost:8080,http://127.0.0.1:8080"
 ALLOWED_ORIGINS = list(dict.fromkeys(
     [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()]
-    + [PRODUCTION_DASHBOARD_ORIGIN]
+    + [PRODUCTION_DASHBOARD_ORIGIN, CUSTOM_DOMAIN_ORIGIN]
 ))
 
 # Credentialed CORS (allow_credentials=True + a SameSite=None refresh cookie in
