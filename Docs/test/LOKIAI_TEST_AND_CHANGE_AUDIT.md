@@ -375,3 +375,121 @@ Reverting Batches 2, 4, or 6 reintroduces a P0; prefer fixing forward. Fastest p
 #### Outcome
 
 All 8 audit P0s closed, plus 2 P0-class defects found during implementation (P0-2b, P0-9). Four P1s closed. 22/22 regression and 3/3 presence liveness passing; frontend typecheck, lint and build all exit 0. The user's originally-reported reconnect symptom is **proven fixed server-side** (a device abandoned without a clean close now expires to offline and returns to connected on reconnect) and **implemented but unproven client-side**. Not merged, not deployed, per instruction. Six reports produced under `Docs/test/`. Honest verdict recorded in `LOKIAI_RELEASE_READINESS_REPORT.md`: conditionally ready for backend + dashboard once two configuration prerequisites are met; mobile not ready until it can be built and verified on a real device.
+
+---
+
+### Entry 4 — Continuation: Flutter verification, typed errors, performance, ADB removal
+
+**Date:** 2026-07-28
+**Branch:** `chore/batch0-test-baseline`
+**Range:** `f8968be` → `eb886c7` (pushed to origin; `main` untouched at `168f79b`)
+
+#### Commits
+
+```
+76c3fff  fix(mobile): repair real compile errors found by the first actual Flutter build
+3c54d20  feat(mobile): keystore-backed device credential + controlled re-pair flow
+6036b12  fix(assistant): typed provider errors, no prompt leakage, no fabricated model data
+38a571c  perf(search): cache HF sizes and bound CDN concurrency — measured 5.1x on p50
+bddaa03  refactor: delete the dead v2 ADB/USB deployment cluster
+8247aa8  docs: reconcile stale reports and add pre-production deployment evidence
+eb886c7  fix: restore deployment_status, removed in error with the ADB cluster
+```
+
+#### Corrections to the prior record
+
+1. **"No Flutter SDK on this machine" was wrong.** One is in the repository at `./flutter` (3.44.2 / Dart 3.12.2). The previous session checked `PATH` and three common install locations but not the repo. Risk R-1 is closed for compile/analyze/test/build.
+
+2. **"Old APKs continue to work" was misleading.** Corrected matrix in the changelog: old APKs work only against an un-upgraded backend. Against the new backend they cannot connect at all, and re-pairing does not help because they have no code to store or send `device_token`. An APK update is mandatory.
+
+#### Real defects found by actually running things
+
+| # | Defect | Found by | Fixed in |
+|---|---|---|---|
+| 1 | `_sendStateReport()` read `.deploymentId`/`.modelName`/`.inferenceMode` off `ConfigResult`, which has none of them — 3 `undefined_getter` errors. Batch 8's reconciliation could never have compiled. | `flutter analyze` | `76c3fff` |
+| 2 | `test/widget_test.dart` was the stock counter scaffold referencing a non-existent `MyApp`; it failed to compile and masked the entire test suite. | `flutter test` | `76c3fff` |
+| 3 | First ADB removal also deleted `DeploymentConfig`, `DeploymentRequest`, `resolve_model_file`. Backend would not boot. **`ast.parse` and `py_compile` both passed** — only starting the server caught it. | uvicorn startup | same commit |
+| 4 | ADB removal also deleted `deployment_status`, used by the live wireless path. Every `POST /deployments` returned 500. The 25-check regression missed it (it tests deployment *authorization*, never a successful deployment). | new `wireless_flow_test.py` | `eb886c7` |
+| 5 | Direct-repo path set `"size_mb": max_size_mb * 0.5  # Dummy size so it passes` and used the repo id as `filename` — fabricated data feeding a real Deploy button. | code review during Step 5 | `6036b12` |
+
+#### Final gate run — commit `eb886c7`
+
+```
+backend py_compile                     OK
+regression.py                          25 checks, 25 passed, 0 failed
+presence_test.py (TTL=5s)               3 checks,  3 passed, 0 failed
+wireless_flow_test.py                   9 checks,  9 passed, 0 failed
+tsc --noEmit                           exit 0
+eslint .                               exit 0
+vite build + nitro                     exit 0
+flutter analyze lib test               0 errors
+flutter test                           11/11 passed
+flutter build apk --debug              OK, 284,693,073 bytes
+```
+
+Automated total: **48 checks, 48 passed, 0 failed.**
+
+#### Wireless chain verification (new)
+
+```
+[PASS] 1. backend advertises a network-reachable URL (no cable needed)
+[PASS] 2. QR payload carries backend_url + one-time token + user_id
+[PASS] 3. phone self-registers over HTTP and receives a device credential
+[PASS] 4. websocket_url is a network socket carrying the credential
+[PASS] 5. device connects over authenticated WebSocket
+[PASS] 6. deploy instruction is pushed over the socket
+[PASS] 7. instruction carries a public CDN URL the phone fetches itself
+        model_url scheme=https, host=huggingface.co
+[PASS] 8. no file bytes and no local/ADB path in the instruction
+[PASS] 9. adb_serial is never exposed in the devices API
+```
+
+#### ADB/USB removal — verified clean
+
+245 lines removed (`_resolve_adb_path`, `ADB_PATH`, `push_to_device`, `adb_shell`, `check_apk_installed`, `install_apk`, `download_model_to_temp`, `run_deployment`, plus `subprocess`/`threading`/`shutil` imports). All had zero call sites.
+
+Post-removal scan: backend has comments only; `adb_serial` survives solely as an inert DB column that is `pop()`ed out of every API response; mobile `lib/` has one comment (other hits are false positives on `statusBarColor`); frontend has marketing copy only. **Zero executable ADB/USB/cable paths.**
+
+#### Performance (measured, not estimated)
+
+`POST /models/search`, 7 runs, real HuggingFace:
+
+| | before | after | change |
+|---|---:|---:|---|
+| p50 | 4810.5 ms | 937.2 ms | **5.1× faster** |
+| p95 | 13326.3 ms | 3464.0 ms | **3.8× faster** |
+| min | 2628.0 ms | 430.5 ms | **6.1× faster** |
+
+Cause: up to 40 unbounded concurrent CDN HEADs triggering throttling, then `Retry-After` sleeps. Fixed by caching size per `(repo, file)` and bounding concurrency to 8. All other endpoints were already <20ms p50 and were left alone.
+
+#### Production state (unchanged, still vulnerable)
+
+```
+GET  /admin/stats     (no auth) -> 200   P0-1 LIVE
+GET  /monitor/status  (no auth) -> 200   P0-3 LIVE
+POST /devices/register          -> 401   route still present
+OPTIONS /auth/refresh  Origin: https://evil-poc-check.vercel.app
+   -> access-control-allow-origin echoed  P0-7 LIVE
+```
+
+Response bodies deliberately discarded so the exposure could be proven without collecting real user data.
+
+#### Database changes
+
+Production Neon: **none**. All testing ran against the local disposable PostgreSQL. Synthetic records use a per-run unique prefix and are deleted at the end of every run (`rc=0` each time).
+
+#### Secrets
+
+No secret value was printed, logged, committed, or placed in any report. `NVIDIA_API_KEY` was confirmed present in `.env` by length and prefix only.
+
+#### Rollback
+
+```
+git revert eb886c7   # deployment_status restore + wireless test
+git revert bddaa03   # ADB removal (restores 245 lines of dead v2 code)
+git revert 38a571c   # HF caching + concurrency bound
+git revert 6036b12   # typed errors, leak stripping, deterministic repo resolution
+git revert 3c54d20   # secure credential storage + re-pair flow
+git revert 76c3fff   # Flutter compile fixes (reverting restores broken code — do not)
+```
+No migration to undo. Nothing deployed, so no production rollback applies.

@@ -1,6 +1,71 @@
 # LokiAI — Final Test Report
 
-**Date:** 2026-07-27
+> ## UPDATED 2026-07-28 — final head `eb886c76eab805175ca6760e9e3fc7aa81dfc638`
+>
+> The 2026-07-27 sections below are retained as the record of that day's run. The authoritative totals are in **"Final gate run (2026-07-28)"** immediately below; the biggest change is that Flutter is no longer BLOCKED.
+>
+> ### Final gate run — commit `eb886c7`, all gates
+>
+> | Gate | Result | Status |
+> |---|---|---|
+> | Backend `py_compile` | clean | **PASS** |
+> | Backend regression (`regression.py`) | **25 / 25** | **PASS** |
+> | Presence + reconnect (`presence_test.py`, TTL=5s) | **3 / 3** | **PASS** |
+> | Wireless chain (`wireless_flow_test.py`) | **9 / 9** | **PASS** |
+> | Frontend `tsc --noEmit` | exit 0 | **PASS** |
+> | Frontend `eslint .` | exit 0 | **PASS** |
+> | Frontend `vite build` + Nitro | exit 0 | **PASS** |
+> | Flutter `analyze lib test` | **0 errors** | **PASS** |
+> | Flutter `test` | **11 / 11** | **PASS** |
+> | Flutter `build apk --debug` | 284,693,073 bytes | **PASS** |
+> | Real-device wireless validation | not performed | **BLOCKED** |
+> | Real NIM chat scenarios | not performed | **BLOCKED** |
+> | Deployed pre-production verification | not performed | **BLOCKED** |
+>
+> **Automated totals: 48 checks, 48 passed, 0 failed** (25 regression + 3 presence + 9 wireless + 11 Flutter), plus 6 toolchain gates.
+>
+> ### Two real defects found by this run
+>
+> **1. `POST /deployments` returned 500 on every call.** Removing the dead ADB cluster also removed `deployment_status`, which happened to be declared inside it but belongs to the live wireless path. The 25-check regression suite did **not** catch it — it verifies deployment *authorization* (a non-owner is rejected before reaching that code) but never completes a successful deployment. Caught by the new `wireless_flow_test.py`, fixed in `eb886c7`.
+>
+> **2. The first ADB removal cut too wide**, also taking `DeploymentConfig`, `DeploymentRequest` and `resolve_model_file`. The backend failed to boot with `NameError: name 'DeploymentRequest' is not defined`. Notably `ast.parse` and `py_compile` both **passed** — only actually starting the server revealed it. Restored verbatim.
+>
+> Both are recorded because they are exactly the class of defect that a syntax check cannot find, and both argue for running the server rather than trusting a parse.
+>
+> ### New: wireless chain verification (`wireless_flow_test.py`, 9/9)
+>
+> Added specifically to assert the v3 architecture after the ADB removal:
+>
+> ```
+> [PASS] 1. backend advertises a network-reachable URL (no cable needed)
+>         backend_url='http://192.168.31.233:8000'
+> [PASS] 2. QR payload carries backend_url + one-time token + user_id
+> [PASS] 3. phone self-registers over HTTP and receives a device credential
+> [PASS] 4. websocket_url is a network socket carrying the credential
+> [PASS] 5. device connects over authenticated WebSocket
+> [PASS] 6. deploy instruction is pushed over the socket
+> [PASS] 7. instruction carries a public CDN URL the phone fetches itself
+>         model_url scheme=https, host=huggingface.co
+> [PASS] 8. no file bytes and no local/ADB path in the instruction
+>         keys=['action','config','deployment_id','model_name','model_sha256','model_url']
+> [PASS] 9. adb_serial is never exposed in the devices API
+> ```
+>
+> ### No ADB/USB runtime path remains — verified
+>
+> ```
+> backend  : grep -nE "subprocess|threading|shutil.which|platform-tools|ADB_PATH|
+>                      adb_shell|push_to_device|install_apk"  -> comments only
+> backend  : adb_serial -> 2 x d.pop("adb_serial", None)  [stripped from responses]
+>                          + 2 comment lines
+> mobile   : lib/  -> 1 comment ("no ADB"); other hits are false positives on
+>                     "statusBarColor" / "statusBarIconBrightness"
+> frontend : src/ -> marketing copy only ("No cables. No ADB.")
+> ```
+>
+> Zero executable ADB/USB/cable paths in backend, mobile, or frontend.
+
+**Date (original run):** 2026-07-27
 **Branch:** `chore/batch0-test-baseline` @ `f7efca6807a2d715b9a3337fedf4c3b7d7f9b975`
 **Environment:** disposable local PostgreSQL 18.4.0 (`127.0.0.1:5433`), real backend process (unmodified `main.py`), real HuggingFace API, real WebSocket client. SMTP and NIM deliberately pointed at inert values.
 

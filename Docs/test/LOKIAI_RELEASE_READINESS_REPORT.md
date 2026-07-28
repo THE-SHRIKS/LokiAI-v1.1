@@ -1,14 +1,39 @@
 # LokiAI — Release Readiness Report
 
-**Date:** 2026-07-27
-**Branch:** `chore/batch0-test-baseline` @ `f7efca6807a2d715b9a3337fedf4c3b7d7f9b975`
-**Base:** `168f79b` (`main`)
+**Date:** 2026-07-28 (supersedes 2026-07-27)
+**Branch:** `chore/batch0-test-baseline` @ `eb886c76eab805175ca6760e9e3fc7aa81dfc638`
+**Pushed to origin:** yes. **Merged to `main`:** no. **Deployed:** no.
+**Base:** `168f79b` (`main`, unchanged)
 
 ---
 
 ## Verdict
 
+> # READY WITH DECLARED BLOCKERS
+
+Backend, dashboard and mobile all build and pass every automated gate available in this environment — **48/48 automated checks, 0 failures**, plus 6 clean toolchain gates. The mobile blocker from 2026-07-27 is **closed**: a Flutter SDK was found in-repo, and the app now analyzes, tests and builds.
+
+Three blockers remain, none of them code defects:
+
+| Blocker | Why |
+|---|---|
+| **Not deployed** | No Vercel/Render credentials in this environment. The branch is pushed and ready; the deploy needs console access. |
+| **No real-device wireless validation** | The phone must download the APK from `/install` and pair by QR over Wi-Fi. Needs the handset. |
+| **No real NIM chat scenarios** | A key is present in `.env`, but the 15 scenarios were not run in this session. |
+
+### ⚠ The most important fact in this report
+
+**Production is still running the pre-remediation code.** `origin/main` is `168f79b`. Verified live on 2026-07-28: `/admin/stats` returns every user's PII to anonymous callers, `/monitor/*` is open, and CORS echoes an arbitrary `*.vercel.app` origin, which permits session takeover.
+
+Every P0 this work fixed is **still exploitable right now**. Shipping is the remaining risk-reduction step; the fixes sitting on an unmerged branch protect nobody.
+
+---
+
+## Prior verdict (2026-07-27), superseded
+
 > **CONDITIONALLY READY — backend and dashboard are ready to deploy once the two configuration prerequisites are met. The mobile app is NOT ready: its code has never been compiled and the reconnect fix has never run on a real phone.**
+
+That verdict rested on "no Flutter SDK exists on this machine", which was **wrong** — one is in the repo at `./flutter`. Compiling it found two genuine defects (a `ConfigResult` type error that meant the state-report path could never have compiled, and a test file that could not compile and was masking the whole suite). Both fixed; see `LOKIAI_REAL_DEVICE_VALIDATION_REPORT.md`.
 
 This is deliberately not a "production-ready" declaration. The controlling directive says not to claim that unless every applicable acceptance gate has passed with retained evidence. Two gates have not: **real-device verification** and **Flutter build/test**. Both are blocked by the absence of a Flutter SDK on this machine, not by anything unresolved in the code.
 
