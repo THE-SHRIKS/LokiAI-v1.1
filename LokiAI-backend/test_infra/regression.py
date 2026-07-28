@@ -439,25 +439,26 @@ def c_p0_8_upload_size_capped():
 
 
 def c_p1_2_search_rate_limited():
-    """P1-2 / Batch 5: /models/search must throttle sustained abuse.
+    """P1-2 / Batch 5: per-user rate limiting actually throttles.
+
+    Exercised against /pairing/generate, which carries the same 20/minute
+    per-user budget as /models/search but costs one cheap DB insert instead of
+    several live HuggingFace round trips.
+
+    This deliberately does NOT hammer /models/search: at a measured ~3.7s per
+    call, 26 calls take ~96s, which is longer than the 60s window, so the
+    window rolls over and no 429 can ever be observed. Testing the limiter
+    there measured HuggingFace's latency, not our throttling.
 
     Uses dedicated account C — the limit is per authenticated user, so burning
-    a budget here must not affect any other check.
+    a budget here must not starve any other check.
     """
-    if not Ctx.c_device_id:
-        return False, "no device paired to C during setup"
-    saw_429 = False
     codes = []
     for _ in range(26):
-        status, _ = _req("POST", "/models/search", {
-            "device_id": Ctx.c_device_id, "user_message": "chatbot",
-        }, token=Ctx.c_token)
+        status, _ = _req("POST", "/pairing/generate", token=Ctx.c_token)
         codes.append(status)
         if status == 429:
-            saw_429 = True
-            break
-    if saw_429:
-        return True, f"429 after {len(codes)} calls (limit 20/min)"
+            return True, f"429 after {len(codes)} calls (limit 20/min, per user)"
     return False, f"no 429 in {len(codes)} rapid calls; codes={sorted(set(codes))}"
 
 
@@ -525,6 +526,70 @@ def c_pair_returns_device_token():
     return False, "POST /devices/pair did not return a device_token"
 
 
+def c_typed_error_no_key():
+    """Step 5: a missing NIM key returns the typed code, not a raw provider string."""
+    if not Ctx.a_device_id:
+        return False, "no device paired to A during setup"
+    # Account A has no NIM key configured in this suite.
+    status, body = _req("POST", "/assistant/chat", {
+        "device_id": Ctx.a_device_id, "message": "hello",
+    }, token=Ctx.a_token)
+    if status != 428:
+        return False, f"expected HTTP 428, got {status}: {str(body)[:160]}"
+    if not isinstance(body, dict) or body.get("error_code") != "NIM_KEY_MISSING":
+        return False, f"expected error_code=NIM_KEY_MISSING, got {str(body)[:200]}"
+    return True, f"HTTP 428, error_code={body.get('error_code')}"
+
+
+def c_typed_error_no_device():
+    """Step 5: an unknown device yields NO_DEVICE_SELECTED, not a bare 404.
+
+    A NIM key must be configured first — the key gate is checked before the
+    device lookup, so without one this would (correctly) return
+    NIM_KEY_MISSING instead. The key is a syntactically valid placeholder; no
+    provider call is reached because the device lookup fails first.
+    """
+    saved, _ = _req("PUT", "/auth/nim-key",
+                    {"api_key": "nvapi-regressionplaceholder0000000000000"},
+                    token=Ctx.a_token)
+    if saved != 200:
+        return False, f"could not stage a NIM key: HTTP {saved}"
+    try:
+        status, body = _req("POST", "/assistant/chat", {
+            "device_id": str(uuid.uuid4()), "message": "hello",
+        }, token=Ctx.a_token)
+        if status != 404:
+            return False, f"expected HTTP 404, got {status}: {str(body)[:160]}"
+        if not isinstance(body, dict) or body.get("error_code") != "NO_DEVICE_SELECTED":
+            return False, f"expected error_code=NO_DEVICE_SELECTED, got {str(body)[:200]}"
+        return True, f"HTTP 404, error_code={body.get('error_code')}"
+    finally:
+        _req("DELETE", "/auth/nim-key", token=Ctx.a_token)
+
+
+def c_no_prompt_leakage_in_assistant():
+    """Step 5: internal instruction text must never reach a chat response.
+
+    Exercised against every assistant reply this suite can produce without a
+    real NIM key. The stripping filter itself is unit-tested separately; this
+    guards the response envelope.
+    """
+    leaks = ("Return ONLY valid JSON", "DO NOT include", "search_results",
+             "error_msg", "Explain this explicitly", "Tell this to the user",
+             "system prompt")
+    bodies = []
+    for msg in ("hello", "https://huggingface.co/does-not-exist/nope-xyz"):
+        _, body = _req("POST", "/assistant/chat", {
+            "device_id": Ctx.a_device_id or str(uuid.uuid4()), "message": msg,
+        }, token=Ctx.a_token)
+        text = body.get("response", "") if isinstance(body, dict) else str(body)
+        bodies.append(text)
+        for leak in leaks:
+            if leak.lower() in text.lower():
+                return False, f"response for {msg!r} contained {leak!r}: {text[:160]}"
+    return True, f"checked {len(bodies)} assistant replies, no internal prompt text"
+
+
 def c_no_secret_in_error_bodies():
     """Error responses must never carry secrets or stack traces."""
     status, body = _req("GET", "/devices/not-a-uuid", token=Ctx.a_token)
@@ -550,6 +615,9 @@ CHECKS = [
     ("P0-4b", "device WebSocket rejects a token for a different device", c_p0_4b_ws_rejects_foreign_token),
     ("WS-1", "correctly paired device can still connect", c_ws_valid_token_connects),
     ("WS-2", "/devices/pair issues a device credential", c_pair_returns_device_token),
+    ("NIM-1", "missing NIM key returns typed NIM_KEY_MISSING", c_typed_error_no_key),
+    ("NIM-2", "unknown device returns typed NO_DEVICE_SELECTED", c_typed_error_no_device),
+    ("LEAK-1", "no internal prompt text in assistant responses", c_no_prompt_leakage_in_assistant),
     ("CORS-1", "configured dashboard origin still allowed with credentials", c_cors_real_dashboard_still_allowed),
     ("ISO-1", "cross-tenant device read blocked", c_cross_tenant_device_read),
     ("ISO-2", "cross-tenant device delete blocked", c_cross_tenant_device_delete),

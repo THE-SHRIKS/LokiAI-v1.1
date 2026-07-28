@@ -295,11 +295,57 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 app.add_middleware(BodySizeLimitMiddleware)
 
 
+# ── Typed assistant outcome boundary ─────────────────────────────────────────
+# Every failure path in the assistant used to collapse into a 502 carrying the
+# raw provider exception string — internal detail the user cannot act on, and
+# a channel through which provider/SDK text reached the UI. These codes are the
+# contract: the frontend branches on `error_code`, the `message` is written for
+# a human, and the raw provider text is logged server-side only.
+#
+# Defined here (well above its first use) because FastAPI resolves
+# @app.exception_handler(...) at import time.
+class AssistantError(Exception):
+    """A failure with a stable machine-readable code and a user-safe message."""
+
+    def __init__(self, code: str, message: str, http_status: int = 200, detail: str = ""):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+        self.http_status = http_status
+        # Server-side only. Never serialized to a client.
+        self.detail = detail
+
+
+ASSISTANT_ERROR_CODES = (
+    "NIM_KEY_MISSING", "NIM_KEY_INVALID", "NIM_RATE_LIMITED", "NIM_TIMEOUT",
+    "NIM_EMPTY_RESPONSE", "NIM_SCHEMA_INVALID", "NIM_PROVIDER_UNAVAILABLE",
+    "HF_UNAVAILABLE", "MODEL_NOT_FOUND", "MODEL_INCOMPATIBLE",
+    "NO_DEVICE_SELECTED",
+)
+
+
 @app.exception_handler(asyncpg.exceptions.DataError)
 async def _pg_data_error_handler(request: Request, exc: asyncpg.exceptions.DataError):
     # Malformed UUIDs (or other bad literals) hitting a $1::uuid cast land
     # here instead of surfacing as a raw 500 with DB internals in the body.
     return JSONResponse(status_code=422, content={"error": "Invalid ID format"})
+
+
+@app.exception_handler(AssistantError)
+async def _assistant_error_handler(request: Request, exc: "AssistantError"):
+    """Typed assistant failures. The user-safe message and a stable code go to
+    the client; the raw provider text is logged and never serialized."""
+    if exc.detail:
+        print(f"[assistant] {exc.code} on {request.url.path}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={
+            "response": exc.message,
+            "action": None,
+            "search_results": [],
+            "error_code": exc.code,
+        },
+    )
 
 
 @app.exception_handler(Exception)
@@ -1532,6 +1578,35 @@ _STOP_WORDS = {
 }
 
 
+# A HuggingFace repo reference the user typed or pasted. Deliberately strict:
+# it must look like a real huggingface.co link or a bare `org/name` that is not
+# an ordinary sentence, so plain prose is never mistaken for a repo id.
+_HF_URL_RE = re.compile(
+    r"https?://(?:www\.)?huggingface\.co/([A-Za-z0-9][\w.-]*/[\w.-]+)", re.IGNORECASE)
+_BARE_REPO_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]{1,}/[A-Za-z0-9][\w.-]{2,})(?![\w/])")
+
+
+def _extract_direct_repo(message: str) -> Optional[str]:
+    """Return an explicit HF repo id when the user clearly named one.
+
+    Used to bypass the intent model entirely for direct-link requests, which
+    are unambiguous and should not depend on a provider round trip.
+    """
+    m = _HF_URL_RE.search(message)
+    if m:
+        # Trim trailing path segments (/tree/main, /blob/...) — keep org/name.
+        return "/".join(m.group(1).split("/")[:2]).rstrip("/.,)")
+    m = _BARE_REPO_RE.search(message.strip())
+    if m:
+        cand = m.group(1).rstrip(".,)")
+        org, _, name = cand.partition("/")
+        # Reject things that are obviously prose or paths rather than repo ids.
+        if len(org) >= 2 and len(name) >= 3 and not cand.lower().endswith(
+                (".com", ".org", ".net", ".io", ".py", ".md", ".json")):
+            return cand
+    return None
+
+
 def _extract_keywords(message: str) -> str:
     """User message → HF search keywords ('i want paper detection' → 'paper detection')."""
     words = [w for w in re.sub(r"[^a-z0-9 ]", " ", message.lower()).split()
@@ -1893,6 +1968,222 @@ A user pairs their Android phone by scanning a QR code — no cables, no ADB, no
 Talk like a smart, friendly person — warm but not cheesy. Keep it conversational, the way you'd text a friend who asked for help. Use natural language, contractions, casual phrasing. Vary your sentence length. Match the user's energy — if they're excited, be excited back; if they're chill, keep it easy. Never say "Great question", "Certainly", "I'd be happy to", or other robotic filler."""
 
 
+# ── HuggingFace repo metadata cache ──────────────────────────────────────────
+# A direct repo URL used to cost a fresh API call plus a HEAD on every message,
+# even when the same user pasted the same link twice. Entries are small and
+# short-lived; HF repo contents change rarely relative to a chat session.
+_HF_REPO_CACHE: dict = {}
+_HF_CACHE_TTL_SECONDS = 300
+_HF_CACHE_MAX = 256
+
+
+def _hf_cache_get(key: str):
+    entry = _HF_REPO_CACHE.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["at"] > _HF_CACHE_TTL_SECONDS:
+        _HF_REPO_CACHE.pop(key, None)
+        return None
+    return entry["value"]
+
+
+def _hf_cache_put(key: str, value) -> None:
+    if len(_HF_REPO_CACHE) >= _HF_CACHE_MAX:
+        # Cheap eviction: drop the oldest entry.
+        oldest = min(_HF_REPO_CACHE.items(), key=lambda kv: kv[1]["at"])[0]
+        _HF_REPO_CACHE.pop(oldest, None)
+    _HF_REPO_CACHE[key] = {"at": time.time(), "value": value}
+
+
+async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
+                                 max_size_mb: float) -> dict:
+    """Deterministically decide whether a named HF repo can run on this phone.
+
+    Returns either {"ok": True, "model": <candidate>} or
+    {"ok": False, "code": <taxonomy code>, "message": <user-safe text>}.
+
+    Every value in the returned candidate is real: the filename comes from the
+    repo's own file list, the size from a CDN HEAD. Nothing is assumed and
+    nothing is invented, because this feeds both the recommendation shown to
+    the user and the deploy action they can press.
+    """
+    cache_key = f"{repo_id}|{max_size_mb:.0f}"
+    cached = _hf_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = await _hf_get(client, f"https://huggingface.co/api/models/{repo_id}",
+                             params={"full": "True"})
+    except httpx.HTTPError as e:
+        # Not cached: a transport failure is transient and must not stick.
+        return {"ok": False, "code": "HF_UNAVAILABLE",
+                "message": "Could not reach HuggingFace to look that model up. "
+                           "Try again in a moment.",
+                "detail": str(e)}
+
+    if resp.status_code == 404:
+        result = {"ok": False, "code": "MODEL_NOT_FOUND",
+                  "message": f"I couldn't find “{repo_id}” on HuggingFace. "
+                             "It may be private, renamed, deleted, or a typo."}
+        _hf_cache_put(cache_key, result)
+        return result
+    if resp.status_code != 200:
+        return {"ok": False, "code": "HF_UNAVAILABLE",
+                "message": "HuggingFace returned an error looking that model up. "
+                           "Try again in a moment.",
+                "detail": f"HTTP {resp.status_code}"}
+
+    meta = resp.json()
+    siblings = meta.get("siblings", [])
+
+    # The phone runs TFLite (camera/audio) and GGUF (chat) only.
+    candidates = [s.get("rfilename", "") for s in siblings
+                  if s.get("rfilename", "").endswith((".tflite", ".gguf"))]
+    if not candidates:
+        present = sorted({os.path.splitext(s.get("rfilename", ""))[1]
+                          for s in siblings if os.path.splitext(s.get("rfilename", ""))[1]})
+        result = {
+            "ok": False, "code": "MODEL_INCOMPATIBLE",
+            "message": f"“{repo_id}” has no .tflite or .gguf file, so it can't run "
+                       f"on the phone. It ships {', '.join(present[:6]) or 'no recognisable model files'}. "
+                       "On-device inference needs TFLite (camera/audio) or GGUF (chat).",
+        }
+        _hf_cache_put(cache_key, result)
+        return result
+
+    # Prefer q4 GGUF — best size/quality tradeoff for phone-class RAM.
+    q4 = [f for f in candidates if f.endswith(".gguf") and "q4" in f.lower()]
+    ordered = q4 + [f for f in candidates if f not in q4]
+
+    # Real sizes, from the CDN, for the smallest few candidates.
+    sized = []
+    for fname in ordered[:6]:
+        try:
+            head = await _hf_head(
+                client, f"https://huggingface.co/{repo_id}/resolve/main/{fname}")
+            cl = head.headers.get("content-length")
+            if cl:
+                sized.append((fname, int(cl) / (1024 * 1024)))
+        except httpx.HTTPError:
+            continue
+
+    if not sized:
+        return {"ok": False, "code": "HF_UNAVAILABLE",
+                "message": f"I found “{repo_id}” but couldn't read its file sizes "
+                           "from the CDN just now. Try again in a moment."}
+
+    fitting = [(f, s) for f, s in sized if 0 < s <= max_size_mb]
+    if not fitting:
+        smallest_name, smallest_size = min(sized, key=lambda t: t[1])
+        result = {
+            "ok": False, "code": "MODEL_INCOMPATIBLE",
+            "message": f"“{repo_id}” is too large for this phone. Its smallest "
+                       f"runnable file ({smallest_name}) is {smallest_size:.0f} MB, "
+                       f"and this device's budget is {max_size_mb:.0f} MB.",
+        }
+        _hf_cache_put(cache_key, result)
+        return result
+
+    # Largest variant that still fits = most capable within budget.
+    fitting.sort(key=lambda t: t[1], reverse=True)
+    fname, size_mb = fitting[0]
+    result = {
+        "ok": True,
+        "model": {
+            "id": meta.get("id", repo_id),
+            "name": meta.get("id", repo_id).split("/")[-1],
+            "downloads": meta.get("downloads", 0),
+            "size_mb": round(size_mb, 2),
+            "task": meta.get("pipeline_tag") or "unknown",
+            "filename": fname,
+            "format": fname.rsplit(".", 1)[-1],
+            "reputable": repo_id.split("/")[0].lower() in REPUTABLE_ORGS,
+            "download_url": f"https://huggingface.co/{repo_id}/resolve/main/{fname}",
+        },
+    }
+    _hf_cache_put(cache_key, result)
+    return result
+
+
+def _classify_provider_error(exc: Exception) -> "AssistantError":
+    """Map a provider exception onto the typed taxonomy.
+
+    Classification is by exception type first (the SDK's own hierarchy), then
+    by status code, and only then by string matching — string matching alone is
+    brittle across SDK versions.
+    """
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None)
+    text = str(exc)
+    low = text.lower()
+
+    if status == 401 or "authenticationerror" in name.lower() or "invalid api key" in low or "unauthorized" in low:
+        return AssistantError(
+            "NIM_KEY_INVALID",
+            "Your NVIDIA NIM API key was rejected. Check it in Account Settings, "
+            "or generate a new one at build.nvidia.com.",
+            detail=text)
+    if status == 429 or "ratelimit" in name.lower() or "rate limit" in low or "too many requests" in low:
+        return AssistantError(
+            "NIM_RATE_LIMITED",
+            "NVIDIA NIM is rate-limiting this key right now. Wait a moment and try again.",
+            detail=text)
+    if "timeout" in name.lower() or "timeout" in low or "timed out" in low:
+        return AssistantError(
+            "NIM_TIMEOUT",
+            "The AI provider took too long to respond. Try again — this is usually temporary.",
+            detail=text)
+    if status is not None and 500 <= int(status) < 600:
+        return AssistantError(
+            "NIM_PROVIDER_UNAVAILABLE",
+            "NVIDIA NIM is having trouble right now. Try again shortly.",
+            detail=text)
+    return AssistantError(
+        "NIM_PROVIDER_UNAVAILABLE",
+        "Could not reach the AI provider. Try again shortly.",
+        detail=text)
+
+
+# Phrases that only ever appear in instructions written TO the model. If any
+# survives into a user-visible reply, the model has echoed its own prompt.
+_PROMPT_LEAK_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"\bexplain (?:the )?(?:this|exact)\b[^.]*\bto the user\b",
+        r"\btell this to the user\b",
+        r"\bdo not include\b",
+        r"\breturn only valid json\b",
+        r"\breturn only\b[^.]*\bjson\b",
+        r"\bsearch_results\b",
+        r"\berror_msg\b",
+        r"\bsystem prompt\b",
+        r"\byou must\b[^.]*\bin your response\b",
+        r"^\s*\{.*\"response\"\s*:.*\}\s*$",
+    )
+]
+
+
+def _strip_prompt_leakage(text: str) -> str:
+    """Remove any internal instruction text the model echoed back.
+
+    Defence in depth: the prompts were also rewritten so the model is no longer
+    *told* to repeat these strings, but a model can still parrot its
+    instructions, and that must never reach the UI.
+    """
+    if not text:
+        return text
+    cleaned_lines = []
+    for line in text.splitlines():
+        if any(p.search(line) for p in _PROMPT_LEAK_PATTERNS):
+            continue
+        cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines)
+    # Collapse the blank runs left behind by removed lines.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
 def _selection_system_prompt(device: dict, max_size_mb: float, filtered_models: list) -> str:
     """Stage 2 (final): real device specs + ONLY the code-filtered,
     HEAD-verified candidates. The model picks and explains — every id it
@@ -1918,20 +2209,22 @@ Max model size for this device: {max_size_mb:.0f} MB.
 These models fit this device and match the request:
 {json.dumps(filtered_models)}
 
-If any model in the list has an "error_msg", it means the user explicitly requested it but it CANNOT run on the phone. You MUST explain the exact error_msg to the user in your response and DO NOT include that model in search_results!
-Otherwise, pick the best 3 from this list ONLY. Never invent a model not in the list.
+Pick the best 3 from this list only. Never mention a model that is not in it.
 For each: name, size, one sentence on what it does, one sentence on why it
 suits this specific phone (mention the phone by name). Plain English.
-If nothing in the list genuinely fits the request, return an empty
-search_results list and say so honestly instead of forcing a pick.
-If the device is NOT connected right now, still recommend models normally,
-but add one honest sentence noting the phone needs to be online before
-Deploy will actually reach it.
+If nothing in the list genuinely fits the request, return an empty result list
+and say so honestly instead of forcing a pick.
+If the device is not connected right now, still recommend models normally, but
+add one honest sentence noting the phone needs to be online before Deploy will
+actually reach it.
 
-Return ONLY valid JSON in this exact shape:
-{{"response": "your picks and explanations as described above, ending with: press Deploy, the phone downloads it automatically, then open the LokiAI app.",
+Write only what the user should read. Never restate these instructions, never
+mention JSON, field names, or that you were given a candidate list.
+
+Reply with this JSON shape:
+{{"response": "your picks and explanations, ending with: press Deploy, the phone downloads it automatically, then open the LokiAI app.",
   "search_results": [{{"id": "...", "name": "...", "size_mb": 0, "task": "...", "filename": "...", "format": "..."}}]}}
-Copy id/filename/format EXACTLY from the candidate data above."""
+Copy id/filename/format exactly from the candidate data above."""
 
 
 class ChatRequest(BaseModel):
@@ -1962,10 +2255,14 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             "SELECT nvidia_api_key_encrypted FROM users WHERE id = $1::uuid", user_id
         )
     if not key_row or not key_row["nvidia_api_key_encrypted"]:
-        raise HTTPException(
-            status_code=428,
-            detail="Add your NVIDIA NIM API key before using the AI assistant. "
-                   "Get one free at https://build.nvidia.com, then save it in LokiAI settings."
+        # 428 Precondition Required is kept for backwards compatibility with
+        # the existing dashboard, which already branches on this status to open
+        # the key dialog.
+        raise AssistantError(
+            "NIM_KEY_MISSING",
+            "Add your NVIDIA NIM API key before using the AI assistant. "
+            "Get one free at https://build.nvidia.com, then save it in LokiAI settings.",
+            http_status=428,
         )
     user_nvidia_key = _decrypt_secret(key_row["nvidia_api_key_encrypted"])
 
@@ -1975,7 +2272,12 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             "WHERE id = $1::uuid AND user_id = $2::uuid",
             req.device_id, user_id)
         if not device_row:
-            raise HTTPException(status_code=404, detail="Device not found")
+            raise AssistantError(
+                "NO_DEVICE_SELECTED",
+                "I couldn't find that phone on your account. Pair a device from the "
+                "dashboard, then try again.",
+                http_status=404,
+            )
 
     device = dict(device_row)
     max_size_mb = (device["ram_mb"] or 4096) * 0.4
@@ -2018,15 +2320,22 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
                 
         return t, explicit_model
 
-    try:
-        task, explicit_model = await classify_intent(NIM_INTENT_MODEL)
-    except Exception as e:
-        if NIM_ROUTER_MODEL == NIM_INTENT_MODEL:
-            raise HTTPException(status_code=502, detail=f"NIM intent-extraction error: {e}")
+    # A pasted repo URL is unambiguous — resolving it needs no model call at
+    # all. Skipping the intent hop here removes a whole provider round trip
+    # (and its failure modes) from the most deterministic request we handle.
+    direct_repo = _extract_direct_repo(req.message)
+    if direct_repo:
+        task, explicit_model = None, direct_repo
+    else:
         try:
-            task, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
-        except Exception:
-            raise HTTPException(status_code=502, detail=f"NIM intent-extraction error: {e}")
+            task, explicit_model = await classify_intent(NIM_INTENT_MODEL)
+        except Exception as e:
+            if NIM_ROUTER_MODEL == NIM_INTENT_MODEL:
+                raise _classify_provider_error(e)
+            try:
+                task, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
+            except Exception as e2:
+                raise _classify_provider_error(e2)
 
     # If they gave a specific model link, we proceed even if task is None.
     if task is None and not explicit_model:
@@ -2042,9 +2351,9 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             )
             reply = (convo.choices[0].message.content or "").strip()
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"NIM conversation error: {e}")
-        return {"response": reply or "Hey! I'm Loki — your AI sidekick for getting models onto your phone. What are you looking to do?",
-                "action": None, "search_results": []}
+            raise _classify_provider_error(e)
+        return {"response": _strip_prompt_leakage(reply) or "Hey! I'm Loki — your AI sidekick for getting models onto your phone. What are you looking to do?",
+                "action": None, "search_results": [], "error_code": None}
 
     # ── Steps 3-4: real search + Python-only filtering ───────────────────
     tasks = [task] if task else []
@@ -2054,63 +2363,26 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         tasks = ["image-classification", "object-detection"]
 
     models_data = []
+    explicit_rejection = None
     async with httpx.AsyncClient(timeout=60.0) as client:
         if tasks:
             models_data = await search_deployable_models(
                 client, tasks, req.message, max_size_mb, limit=12)
                 
-        # Fetch the explicit model directly from HuggingFace to bypass keyword limits!
+        # A user naming a specific repo bypasses keyword search entirely. The
+        # outcome is decided deterministically here, from real HuggingFace
+        # metadata and a real CDN HEAD — never by the language model, and never
+        # from invented values. (This path previously fabricated a size of
+        # `max_size_mb * 0.5` "so it passes" and used the repo id as a
+        # filename, so a repo could be recommended and deployed on the strength
+        # of numbers nobody had checked.)
         if explicit_model:
-            exp_resp = await client.get(f"https://huggingface.co/api/models/{explicit_model}?full=True")
-            if exp_resp.status_code == 200:
-                m = exp_resp.json()
-                # Determine its format manually
-                fmts = []
-                for s in m.get("siblings", []):
-                    rfn = s.get("rfilename", "").lower()
-                    if rfn.endswith(".tflite") and "tflite" not in fmts: fmts.append("tflite")
-                    if rfn.endswith(".gguf") and "gguf" not in fmts: fmts.append("gguf")
-                
-                if not fmts:
-                    models_data.append({
-                        "id": explicit_model,
-                        "name": m.get("id", explicit_model).split("/")[-1],
-                        "downloads": m.get("downloads", 0),
-                        "size_mb": 0,
-                        "task": m.get("pipeline_tag") or "unknown",
-                        "filename": "Unsupported Format",
-                        "format": "unsupported",
-                        "reputable": False,
-                        "download_url": None,
-                        "error_msg": f"The model '{explicit_model}' does NOT have any .tflite or .gguf files, which are strictly required to run natively on Android hardware. Explain this explicitly to the user."
-                    })
-                else:
-                    fmt = fmts[0]
-                    # We just need to append it. It doesn't have an exact download URL resolved yet, but the selection system prompt handles it if size is missing (or we can just leave download_url None and let selection prompt explain it's available).
-                    models_data.append({
-                        "id": m.get("id", explicit_model),
-                        "name": m.get("id", explicit_model).split("/")[-1],
-                        "downloads": m.get("downloads", 0),
-                        "size_mb": max_size_mb * 0.5, # Dummy size so it passes
-                        "task": m.get("pipeline_tag") or "unknown",
-                        "filename": m.get("id", explicit_model),
-                        "format": fmt,
-                        "reputable": True,
-                        "download_url": f"https://huggingface.co/{explicit_model}",
-                    })
+            explicit_outcome = await _resolve_explicit_repo(
+                client, explicit_model, max_size_mb)
+            if explicit_outcome["ok"]:
+                models_data.append(explicit_outcome["model"])
             else:
-                models_data.append({
-                        "id": explicit_model,
-                        "name": explicit_model.split("/")[-1],
-                        "downloads": 0,
-                        "size_mb": 0,
-                        "task": "unknown",
-                        "filename": "Not Found",
-                        "format": "unknown",
-                        "reputable": False,
-                        "download_url": None,
-                        "error_msg": f"The model '{explicit_model}' could not be found on HuggingFace. It might be private, deleted, or a typo. Tell this to the user."
-                })
+                explicit_rejection = explicit_outcome
 
     # Fold in the user's own catalog (uploads + previously-deployed models)
     # that match the task and fit the budget — the assistant must be aware
@@ -2142,12 +2414,24 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             "download_url": row["download_url"],
         })
 
+    # A specifically-named repo that the backend proved unusable is answered
+    # directly, with no model call. The verdict and the wording are both the
+    # backend's — the provider is never asked to explain a decision it did not
+    # make, which is how internal instruction text used to reach the UI.
+    if explicit_rejection is not None and not models_data:
+        if explicit_rejection.get("detail"):
+            print(f"[assistant] {explicit_rejection['code']}: {explicit_rejection['detail']}")
+        return {"response": explicit_rejection["message"],
+                "action": "search_models",
+                "search_results": [],
+                "error_code": explicit_rejection["code"]}
+
     if not models_data:
         return {"response": "I searched the live model hubs and found nothing deployable "
                             "that fits your phone for that request. Try different wording "
                             "(e.g. 'recognize objects with my camera', 'offline chatbot', "
                             "'identify sounds').",
-                "action": "search_models", "search_results": []}
+                "action": "search_models", "search_results": [], "error_code": None}
 
     # ── Step 5: NIM ranks and explains, nothing more ─────────────────────
     try:
@@ -2159,24 +2443,46 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             max_tokens=700,
             response_format={"type": "json_object"},
         )
-        parsed = json.loads(sel.choices[0].message.content)
+        raw = sel.choices[0].message.content
+        if not (raw or "").strip():
+            raise AssistantError("NIM_EMPTY_RESPONSE", "empty completion")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise AssistantError("NIM_SCHEMA_INVALID", "completion was not a JSON object")
     except Exception as e:
-        # Selector failure: fall back to the ranked search results directly.
-        print(f"[assistant] selector failed ({e}); returning ranked search results")
-        parsed = {"response": "Here are the best deployable matches I found. "
-                              "Press Deploy on one — the phone downloads it "
-                              "automatically, then open the LokiAI app.",
-                  "search_results": models_data[:3]}
+        # The selector only ranks and phrases — the candidate list is already
+        # decided. Its failure therefore degrades to the backend's own ranking
+        # rather than failing the request, but the reason is still surfaced as
+        # a typed code so the UI knows the wording is a fallback.
+        fallback_code = e.code if isinstance(e, AssistantError) else _classify_provider_error(e).code
+        print(f"[assistant] selector failed ({fallback_code}: {type(e).__name__}); "
+              f"returning backend-ranked results")
+        return {"response": "Here are the best deployable matches I found. "
+                            "Press Deploy on one — the phone downloads it "
+                            "automatically, then open the LokiAI app.",
+                "action": "search_models",
+                "search_results": models_data[:3],
+                "error_code": fallback_code}
 
     # ── Step 6: every returned model must exist in the real candidates ───
+    # The model's free-form output can never introduce a repository id, a size,
+    # a compatibility verdict, or a deploy target — it may only reorder and
+    # describe entries the backend already verified.
     by_id = {m["id"]: m for m in models_data}
     validated = []
     for r in parsed.get("search_results") or []:
         if isinstance(r, dict) and r.get("id") in by_id:
             validated.append(by_id[r["id"]])
-    return {"response": str(parsed.get("response") or "").strip(),
+
+    prose = _strip_prompt_leakage(str(parsed.get("response") or "").strip())
+    if not prose:
+        prose = ("Here are the best deployable matches I found. Press Deploy on one — "
+                 "the phone downloads it automatically, then open the LokiAI app.")
+
+    return {"response": prose,
             "action": "search_models",
-            "search_results": validated}
+            "search_results": validated,
+            "error_code": None}
 
 
 # ------------------------------------------------------------------
