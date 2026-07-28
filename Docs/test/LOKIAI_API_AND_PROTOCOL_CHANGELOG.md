@@ -88,7 +88,19 @@ Close codes on rejection:
 | `4413` | inbound frame exceeded 64 KB |
 | `4000` | connection superseded by a newer one for the same device, or heartbeat expired |
 
-**Migration:** already-paired phones must re-pair once to obtain a token. Old APKs continue to work against an un-upgraded backend; a new APK works against either.
+**Migration — corrected 2026-07-28.** Earlier revisions of these reports were ambiguous about old APKs. The precise, verified matrix:
+
+| Client | Backend | Result |
+|---|---|---|
+| Old APK (no device token) | Old backend | Connects. Unchanged. |
+| **Old APK** | **New backend** | **Cannot connect.** Closed with `4401`. The user sees a phone that never comes online and, because the old app has no 4401 handling, it retries forever with no explanation. **Re-pairing does not help** — the old APK has no code to store or send `device_token`. **An APK update is mandatory.** |
+| New APK (pre-existing pairing, no token) | New backend | Cannot connect; closed `4401`. The app **detects** this, discards the dead credential, stops retrying, and shows the pairing screen with an explanation. One QR scan restores service. |
+| New APK (re-paired) | New backend | Connects normally. |
+| New APK | Old backend | Connects. The old handler ignores the extra `token` query parameter. |
+
+So: "old APKs keep working" is true **only against an un-upgraded backend**. Once the backend ships, every device needs the new APK *and* one re-pair. This is the deliberate migration choice — there is no unauthenticated fallback and no grace period, because retaining one would leave the impersonation path open for as long as it existed.
+
+The new APK's behaviour on `4401` (stop retrying, clear the credential, prompt to re-pair) is implemented in `backend_connection.dart` `_onCredentialRejected()` and surfaced by `PairingScreen(notice: …)`.
 
 ### Inbound messages (phone → server)
 
@@ -133,6 +145,43 @@ Close codes on rejection:
 `CORS_ALLOWED_ORIGINS` already existed but is now **required in production** — the `*.vercel.app` wildcard that previously made it optional is gone.
 
 ---
+
+## Assistant response envelope (added 2026-07-28)
+
+`POST /assistant/chat` gains one field. Purely additive — existing clients that ignore it are unaffected.
+
+| Field | Change |
+|---|---|
+| `error_code` | **ADDED.** `null` on a normal reply, otherwise one of the typed codes below. Lets the dashboard branch on the outcome instead of pattern-matching prose. |
+
+```
+NIM_KEY_MISSING     NIM_KEY_INVALID      NIM_RATE_LIMITED
+NIM_TIMEOUT         NIM_EMPTY_RESPONSE   NIM_SCHEMA_INVALID
+NIM_PROVIDER_UNAVAILABLE                 HF_UNAVAILABLE
+MODEL_NOT_FOUND     MODEL_INCOMPATIBLE   NO_DEVICE_SELECTED
+```
+
+HTTP status codes are unchanged (428 for a missing key, 404 for an unknown device), so existing dashboard branching keeps working.
+
+`response` is now guaranteed to be human-readable text safe to render as-is: raw provider/SDK exception text is logged server-side and never serialized, and known internal-instruction patterns are stripped from model output before it is returned.
+
+## Deterministic model resolution (changed 2026-07-28)
+
+Behavioural, no field change, but it alters what the values *mean*:
+
+- A named HuggingFace repo is now resolved by the backend — real file list from the HF API, real size from a CDN HEAD, compatibility decided in Python against the device's RAM budget. Previously this path set `size_mb` to `max_size_mb * 0.5` with the comment *"Dummy size so it passes"* and used the repo id as the `filename`, so `search_results` could carry values nobody had verified.
+- The language model can no longer introduce a repository id, size, compatibility verdict, or deploy target. It may only reorder and describe candidates the backend has already verified. Ids returned by the model are still re-validated against that list, as before.
+
+## New environment variables (2026-07-28)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HF_HEAD_CONCURRENCY` | `8` | Bounds simultaneous CDN HEAD requests when sizing candidates. |
+| `HF_CACHE_TTL_SECONDS` | `300` | TTL for cached repo metadata and file sizes. |
+
+## WebSocket — additional inbound field
+
+`state_report` now also carries `config_error` (string or null), distinguishing "nothing deployed" from "a deployment exists but its config is unreadable", so a broken install is not silently reconciled as a clean one.
 
 ## Database
 

@@ -2,7 +2,28 @@
 
 Companion to `LOKIAI_DEEP_AUDIT.md`. Ordered work packages ("batches") to fix the confirmed defects. Every batch lists exact files, the confirmed root cause it addresses, compatibility risk, rollback method, and the acceptance gate that must pass before moving to the next batch — per the controlling directive's change-control gates.
 
-**Status: none of these batches have been implemented yet.** This plan is presented for review before any code is touched, per the controlling directive's instruction to show findings and proposed batches before authentication changes, database changes, or protocol-affecting changes. Batches 1–4 all touch authentication/authorization surfaces and are gated on your sign-off; nothing here has been applied.
+> ## ✅ STATUS: IMPLEMENTED — SUPERSEDED
+>
+> **All batches below were implemented on branch `chore/batch0-test-baseline` between 2026-07-27 and 2026-07-28. The "not yet implemented" text immediately below is the original pre-implementation framing, retained for the record.**
+>
+> | Batch | Status | Commit |
+> |---|---|---|
+> | 0 — test baseline | IMPLEMENTED | `c3f6093` |
+> | 1 — `/auth/me` crash + key exposure | IMPLEMENTED | `e584bca` |
+> | 2 — cross-tenant exposure | IMPLEMENTED | `d87881b` |
+> | 3 — WebSocket identity | IMPLEMENTED | `0611669` |
+> | 4 — device hijack | IMPLEMENTED | `1680e38` |
+> | 5 — upload bounds + rate limits | IMPLEMENTED | `01e6df0` |
+> | 6 — CORS wildcard | IMPLEMENTED | `da14ee7` |
+> | 7 — presence TTL | IMPLEMENTED | `0611669` |
+> | 8 — mobile reconnect/lifecycle | IMPLEMENTED | `f7efca6`, `76c3fff`, `3c54d20` |
+> | 9 — indexes + dead code | **NOT IMPLEMENTED** | — (see risk register R-5, R-9) |
+>
+> Work beyond the original plan (typed NIM error taxonomy, prompt-leak removal, fabricated-data fix, HF caching, secure device-credential storage, Android backup policy) is recorded in `LOKIAI_FULL_IMPLEMENTATION_REPORT.md`.
+>
+> **The five "open decisions" at the foot of this document have all been resolved.** Decisions taken: local portable Postgres for Batch 0; directive-compliant option 1 for `/auth/me`; env-var `ADMIN_EMAILS` allowlist rather than a schema change; explicit one-time re-pair with no unauthenticated fallback; explicit CORS origin list with no PaaS wildcard.
+
+**Status (original, superseded): none of these batches have been implemented yet.** This plan is presented for review before any code is touched, per the controlling directive's instruction to show findings and proposed batches before authentication changes, database changes, or protocol-affecting changes. Batches 1–4 all touch authentication/authorization surfaces and are gated on your sign-off; nothing here has been applied.
 
 General rules for every batch below:
 - Work happens on a dedicated branch (e.g. `fix/p0-audit-batch-N`), not directly on `main`.

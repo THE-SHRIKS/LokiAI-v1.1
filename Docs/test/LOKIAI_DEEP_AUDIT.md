@@ -1,5 +1,16 @@
 # LokiAI — Deep Audit (Phase 0 + Phase 1)
 
+> ## ⚠ STATUS: PRE-REMEDIATION SNAPSHOT — HISTORICAL
+>
+> **This document describes the codebase as it stood at commit `168f79b`, before any fix was applied. It is retained unaltered as the evidence baseline. Do not read it as a description of current code.**
+>
+> - Every P0 defect described below is **fixed** on branch `chore/batch0-test-baseline`. See `LOKIAI_FULL_IMPLEMENTATION_REPORT.md`.
+> - Two further P0-class defects (P0-2b, P0-9) were found *during* remediation and are **not** in this document's register.
+> - **The vulnerabilities described here are still live in production**, because the remediation branch has not been deployed — `origin/main` remains at `168f79b`. Verified against the live backend on 2026-07-28; see `LOKIAI_PREPRODUCTION_DEPLOYMENT_REPORT.md`.
+> - Section 0's claim that "no Flutter SDK exists on this machine" was **wrong**. One is present at `./flutter` (3.44.2). Corrected 2026-07-28; the mobile code has since been compiled, analyzed, tested and built.
+>
+> Current state lives in `LOKIAI_FULL_IMPLEMENTATION_REPORT.md`, `LOKIAI_FINAL_TEST_REPORT.md`, and `LOKIAI_RELEASE_READINESS_REPORT.md`.
+
 **Date:** 2026-07-27
 **Auditor:** Claude (Sonnet 5), per `ANTIGRAVITY_LOKIAI_DEEP_AUDIT_AND_IMPLEMENTATION_PROMPT.md`
 **Scope:** Full repository at `L:\The Shriks\LokiAI` — backend, dashboard, mobile app, database, docs.

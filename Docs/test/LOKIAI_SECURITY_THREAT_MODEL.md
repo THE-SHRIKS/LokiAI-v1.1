@@ -4,6 +4,41 @@ Companion to `LOKIAI_DEEP_AUDIT.md`. Assumes a hostile internet-wide attacker an
 
 ---
 
+## ⚠ Three distinct states — do not conflate them
+
+This document was originally written against the pre-remediation code. It now tracks **three separate states**, because they genuinely differ, and the most important row is the one that is still exploitable.
+
+| | **A. Original** (`168f79b`) | **B. Remediation branch** (`chore/batch0-test-baseline`) | **C. Deployed production** |
+|---|---|---|---|
+| AP-1 anonymous PII via `/admin/stats` | OPEN | **CLOSED** | **OPEN — LIVE** |
+| AP-2 cross-account feedback / deployment status | OPEN | **CLOSED** | **OPEN — LIVE** |
+| AP-3 WebSocket device impersonation | OPEN | **CLOSED** | **OPEN — LIVE** |
+| AP-4 device ownership hijack | OPEN | **CLOSED** (route removed) | **OPEN — LIVE** |
+| AP-5 CORS session takeover via `*.vercel.app` | OPEN | **CLOSED** | **OPEN — LIVE** |
+| AP-6 disk exhaustion via unbounded upload | OPEN | **CLOSED** | **OPEN — LIVE** |
+| AP-7 provider quota abuse (search unthrottled) | OPEN | **CLOSED** | **OPEN — LIVE** |
+| Internal prompt text reaching the UI | OPEN | **CLOSED** | **OPEN — LIVE** |
+| Fabricated model size/filename on direct-repo path | OPEN | **CLOSED** | **OPEN — LIVE** |
+| Device credential in plaintext + backup-eligible | OPEN | **CLOSED** | **OPEN — LIVE** |
+
+**State C is state A.** `origin/main` is still `168f79b`; the remediation branch has been pushed but never deployed. Verified live 2026-07-28 by probing the production backend:
+
+```
+GET  /admin/stats     (no auth)  -> HTTP 200   [returns every user's PII]
+GET  /monitor/status  (no auth)  -> HTTP 200
+POST /devices/register           -> HTTP 401   [route still present]
+OPTIONS /auth/refresh  Origin: https://evil-poc-check.vercel.app
+   -> access-control-allow-origin: https://evil-poc-check.vercel.app
+```
+
+Response bodies were deliberately discarded rather than captured, to avoid collecting real user data while proving the exposure.
+
+**Nothing in this document should be read as "fixed in production" until a deployment is recorded in `LOKIAI_PREPRODUCTION_DEPLOYMENT_REPORT.md`.**
+
+---
+
+---
+
 ## Assets
 
 | Asset | Where it lives | Sensitivity |

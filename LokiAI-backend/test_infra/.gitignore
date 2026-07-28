@@ -4,3 +4,6 @@ pgdata/
 pg_log.txt
 venv_test/
 .env.test
+.env.secrets
+.env.test*
+perf_*.json
