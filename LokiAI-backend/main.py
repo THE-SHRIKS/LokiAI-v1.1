@@ -754,38 +754,37 @@ def health_check():
 # downloads the APK in its browser, and sideloads it — no USB install.
 # ------------------------------------------------------------------
 
-APK_PATH = os.path.normpath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "LokiAImobile UI", "build", "app", "outputs", "flutter-apk", "app-debug.apk"
-))
-
-# Production hosts the APK as a GitHub Release asset (Render's filesystem is
-# ephemeral and the repo never carries the ~140MB build artifact — see
-# LokiAI-backend/README.md). When set, /apk redirects there instead of
-# serving APK_PATH from local disk (the local-dev flutter-build path).
+# Optional external host for the APK (e.g. a GitHub Release asset). When set,
+# /apk/download redirects there instead of serving the file shipped in the
+# repo. Preferred for production: it keeps a ~141MB binary out of git.
 APK_DOWNLOAD_URL = os.getenv("APK_DOWNLOAD_URL")
 APK_SIZE_MB = os.getenv("APK_SIZE_MB")
 
-
-@app.api_route("/apk", methods=["GET", "HEAD"])
-async def download_apk():
-    if APK_DOWNLOAD_URL:
-        return RedirectResponse(APK_DOWNLOAD_URL, status_code=302)
-    if not os.path.isfile(APK_PATH):
-        raise HTTPException(status_code=404, detail="APK not built yet. Run flutter build first.")
-    return FileResponse(
-        APK_PATH,
-        media_type="application/vnd.android.package-archive",
-        filename="lokiai.apk"
-    )
+# There is exactly ONE APK delivery route: GET /apk/download (defined below).
+#
+# A second route lived here — GET /apk — serving
+# ../LokiAImobile UI/build/app/outputs/flutter-apk/app-debug.apk, a path that
+# only exists on a machine that has just run `flutter build`. It does not exist
+# on Render, so /apk returned 404 in production while /install linked straight
+# at it: the QR onboarding flow could not deliver the app to any phone at all.
+# Removed rather than repaired, so there is no second path to drift out of sync
+# again.
+#
+# /apk is deliberately NOT redirected to /apk/download. Nothing in the current
+# app or dashboard references it (verified), and a silent alias would hide the
+# same class of mistake next time.
 
 
 @app.get("/install", response_class=HTMLResponse)
 async def install_page():
+    # Size is read from the file this page actually links to. It previously
+    # measured a different file (the local flutter build output) than the one
+    # served, so the advertised size could not be trusted.
     if APK_DOWNLOAD_URL:
         size_mb = float(APK_SIZE_MB) if APK_SIZE_MB else None
     else:
-        size_mb = round(os.path.getsize(APK_PATH) / (1024 * 1024), 1) if os.path.isfile(APK_PATH) else None
+        size_mb = (round(os.path.getsize(_APK_PATH) / (1024 * 1024), 1)
+                   if os.path.isfile(_APK_PATH) else None)
     size_text = f" ({size_mb} MB)" if size_mb else ""
     return f"""<!DOCTYPE html>
 <html>
@@ -810,7 +809,7 @@ async def install_page():
 <body>
   <h1>LokiAI</h1>
   <p>On-device AI for your phone. Tap below to download the app{size_text}, then open the file and allow the install when prompted.</p>
-  <a class="btn" href="/apk">Download LokiAI</a>
+  <a class="btn" href="/apk/download">Download LokiAI</a>
 </body>
 </html>"""
 
@@ -1253,9 +1252,16 @@ def _public_base_url(request: Request) -> str:
 # ── APK distribution ──────────────────────────────────────────────────────────
 _APK_PATH = os.path.join(os.path.dirname(__file__), "apk", "lokiai.apk")
 
-@app.get("/apk/download")
+@app.api_route("/apk/download", methods=["GET", "HEAD"])
 async def download_apk():
-    """Serves the LokiAI Android APK directly — no GitHub login required."""
+    """The single canonical APK delivery route, linked from GET /install.
+
+    Redirects to APK_DOWNLOAD_URL when one is configured (preferred in
+    production — it keeps a ~141MB binary out of the repository); otherwise
+    serves the copy shipped alongside the backend.
+    """
+    if APK_DOWNLOAD_URL:
+        return RedirectResponse(APK_DOWNLOAD_URL, status_code=302)
     if not os.path.exists(_APK_PATH):
         raise HTTPException(status_code=404, detail="APK not found on server")
     return FileResponse(
