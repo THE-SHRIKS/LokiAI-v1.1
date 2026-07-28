@@ -17,7 +17,7 @@
       re-pairing on a new device is the intended (and only) path.
     -->
     <application
-        android:label="lokiai_app"
+        android:label="LokiAI"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
