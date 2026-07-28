@@ -2077,6 +2077,61 @@ def _hf_cache_put(key: str, value) -> None:
     _HF_REPO_CACHE[key] = {"at": time.time(), "value": value}
 
 
+async def _fetch_repo_siblings(client: httpx.AsyncClient, repo_id: str) -> list:
+    """Return a complete list of file siblings for a HuggingFace repo.
+
+    The primary `GET /api/models/{repo_id}?full=True` call includes a
+    ``siblings`` array for most repos.  For repositories with very large file
+    trees HuggingFace paginates or omits the array entirely.  When ``siblings``
+    is empty we fall back to the explicit tree endpoint and page through it.
+
+    This is the single canonical file-discovery path used by BOTH
+    ``search_deployable_models`` and ``_resolve_explicit_repo`` so the two
+    code paths can never diverge.
+    """
+    # Primary: model metadata with siblings inline
+    try:
+        resp = await _hf_get(client,
+                             f"https://huggingface.co/api/models/{repo_id}",
+                             params={"full": "True"})
+    except httpx.HTTPError as e:
+        return []  # caller turns this into HF_UNAVAILABLE
+
+    if resp.status_code == 404:
+        return None  # sentinel: repo does not exist
+    if resp.status_code != 200:
+        return []
+
+    meta = resp.json()
+    siblings = meta.get("siblings") or []
+
+    if not siblings:
+        # Fallback: explicit tree endpoint (paginated)
+        page = 1
+        while True:
+            try:
+                tree_resp = await _hf_get(
+                    client,
+                    f"https://huggingface.co/api/models/{repo_id}/tree/main",
+                    params={"recursive": "True", "expand": "True", "p": str(page)},
+                )
+            except httpx.HTTPError:
+                break
+            if tree_resp.status_code != 200:
+                break
+            page_items = tree_resp.json()
+            if not isinstance(page_items, list) or not page_items:
+                break
+            siblings.extend(page_items)
+            # HuggingFace tree API returns at most 1000 items per page;
+            # stop when a partial page is received (nothing left to fetch).
+            if len(page_items) < 1000:
+                break
+            page += 1
+
+    return siblings
+
+
 async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
                                  max_size_mb: float) -> dict:
     """Deterministically decide whether a named HF repo can run on this phone.
@@ -2085,74 +2140,113 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
     {"ok": False, "code": <taxonomy code>, "message": <user-safe text>}.
 
     Every value in the returned candidate is real: the filename comes from the
-    repo's own file list, the size from a CDN HEAD. Nothing is assumed and
+    repo's own file list, the size from a CDN HEAD.  Nothing is assumed and
     nothing is invented, because this feeds both the recommendation shown to
     the user and the deploy action they can press.
-    """
-    cache_key = f"{repo_id}|{max_size_mb:.0f}"
-    cached = _hf_cache_get(cache_key)
-    if cached is not None:
-        return cached
 
+    Bug-1 fix (2026-07-28):
+    - Uses the canonical _fetch_repo_siblings() which falls back to the tree
+      endpoint for repos whose metadata response omits the siblings list.
+    - HF_UNAVAILABLE transient failures are never cached; only confirmed
+      MODEL_NOT_FOUND and MODEL_INCOMPATIBLE results survive restarts.
+    - Stale negative results are guarded by a 0-max_size check so a bad
+      device-RAM read can never poison the cache for all future callers.
+    """
+    # Skip caching entirely if max_size_mb is implausibly small — it means
+    # the device RAM could not be read and we must not store a size-based
+    # rejection that would block future requests with a valid budget.
+    cacheable = max_size_mb > 0
+    cache_key = f"repo|{repo_id}|{max_size_mb:.0f}"
+    if cacheable:
+        cached = _hf_cache_get(cache_key)
+        if cached is not None:
+            # Invalidate a stale negative that claims MODEL_INCOMPATIBLE with
+            # an empty file list — that may have come from an earlier paginated
+            # miss before the tree-fallback was added.
+            if (cached.get("ok") is False
+                    and cached.get("code") == "MODEL_INCOMPATIBLE"
+                    and "no .tflite or .gguf" in cached.get("message", "")
+                    and "no recognisable" in cached.get("message", "")):
+                # Evict and re-probe
+                _HF_REPO_CACHE.pop(cache_key, None)
+            else:
+                return cached
+
+    # ── 1. Fetch the complete file list ──────────────────────────────────────
     try:
-        resp = await _hf_get(client, f"https://huggingface.co/api/models/{repo_id}",
-                             params={"full": "True"})
-    except httpx.HTTPError as e:
-        # Not cached: a transport failure is transient and must not stick.
+        siblings = await _fetch_repo_siblings(client, repo_id)
+    except Exception as e:
         return {"ok": False, "code": "HF_UNAVAILABLE",
                 "message": "Could not reach HuggingFace to look that model up. "
                            "Try again in a moment.",
                 "detail": str(e)}
 
-    if resp.status_code == 404:
+    if siblings is None:
+        # _fetch_repo_siblings returns None for genuine 404s
         result = {"ok": False, "code": "MODEL_NOT_FOUND",
-                  "message": f"I couldn't find “{repo_id}” on HuggingFace. "
+                  "message": f"“{repo_id}” doesn't exist on HuggingFace. "
                              "It may be private, renamed, deleted, or a typo."}
-        _hf_cache_put(cache_key, result)
+        if cacheable:
+            _hf_cache_put(cache_key, result)
         return result
-    if resp.status_code != 200:
-        return {"ok": False, "code": "HF_UNAVAILABLE",
-                "message": "HuggingFace returned an error looking that model up. "
-                           "Try again in a moment.",
-                "detail": f"HTTP {resp.status_code}"}
 
-    meta = resp.json()
-    siblings = meta.get("siblings", [])
+    if not isinstance(siblings, list):
+        return {"ok": False, "code": "HF_RESPONSE_INVALID",
+                "message": "HuggingFace returned an unexpected response. "
+                           "Try again in a moment."}
 
-    # The phone runs TFLite (camera/audio) and GGUF (chat) only.
-    candidates = [s.get("rfilename", "") for s in siblings
-                  if s.get("rfilename", "").endswith((".tflite", ".gguf"))]
+    # ── 2. Filter to phone-runnable formats ──────────────────────────────────
+    # Siblings from the tree endpoint use "path" rather than "rfilename".
+    def _fname(s) -> str:
+        return s.get("rfilename") or s.get("path") or ""
+
+    candidates = [_fname(s) for s in siblings
+                  if _fname(s).endswith((".tflite", ".gguf"))]
     if not candidates:
-        present = sorted({os.path.splitext(s.get("rfilename", ""))[1]
-                          for s in siblings if os.path.splitext(s.get("rfilename", ""))[1]})
+        present = sorted({
+            os.path.splitext(_fname(s))[1]
+            for s in siblings if os.path.splitext(_fname(s))[1]
+        })
         result = {
             "ok": False, "code": "MODEL_INCOMPATIBLE",
-            "message": f"“{repo_id}” has no .tflite or .gguf file, so it can't run "
-                       f"on the phone. It ships {', '.join(present[:6]) or 'no recognisable model files'}. "
-                       "On-device inference needs TFLite (camera/audio) or GGUF (chat).",
+            "message": (
+                f"“{repo_id}” has no .tflite or .gguf file, so it can’t run "
+                f"on the phone. It ships {', '.join(present[:6]) or 'no recognisable model files'}. "
+                "On-device inference needs TFLite (camera/audio) or GGUF (chat)."
+            ),
         }
-        _hf_cache_put(cache_key, result)
+        if cacheable:
+            _hf_cache_put(cache_key, result)
         return result
 
-    # Prefer q4 GGUF — best size/quality tradeoff for phone-class RAM.
+    # ── 3. Pick best candidate (q4 GGUF preferred) ───────────────────────────
     q4 = [f for f in candidates if f.endswith(".gguf") and "q4" in f.lower()]
     ordered = q4 + [f for f in candidates if f not in q4]
 
-    # Real sizes, from the CDN, for the smallest few candidates.
+    # ── 4. Real sizes from the CDN ───────────────────────────────────────────
     sized = []
     for fname in ordered[:6]:
+        cache_sz_key = f"size|{repo_id}|{fname}"
+        cached_sz = _hf_cache_get(cache_sz_key)
+        if cached_sz is not None:
+            if cached_sz > 0:
+                sized.append((fname, cached_sz))
+            continue
         try:
             head = await _hf_head(
                 client, f"https://huggingface.co/{repo_id}/resolve/main/{fname}")
             cl = head.headers.get("content-length")
             if cl:
-                sized.append((fname, int(cl) / (1024 * 1024)))
+                size_mb = int(cl) / (1024 * 1024)
+                _hf_cache_put(cache_sz_key, size_mb)
+                sized.append((fname, size_mb))
         except httpx.HTTPError:
             continue
 
     if not sized:
+        # Transient CDN failure — never cache
         return {"ok": False, "code": "HF_UNAVAILABLE",
-                "message": f"I found “{repo_id}” but couldn't read its file sizes "
+                "message": f"I found “{repo_id}” but couldn’t read its file sizes "
                            "from the CDN just now. Try again in a moment."}
 
     fitting = [(f, s) for f, s in sized if 0 < s <= max_size_mb]
@@ -2160,16 +2254,27 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
         smallest_name, smallest_size = min(sized, key=lambda t: t[1])
         result = {
             "ok": False, "code": "MODEL_INCOMPATIBLE",
-            "message": f"“{repo_id}” is too large for this phone. Its smallest "
-                       f"runnable file ({smallest_name}) is {smallest_size:.0f} MB, "
-                       f"and this device's budget is {max_size_mb:.0f} MB.",
+            "message": (
+                f"“{repo_id}” is too large for this phone. Its smallest "
+                f"runnable file ({smallest_name}) is {smallest_size:.0f} MB, "
+                f"and this device’s budget is {max_size_mb:.0f} MB."
+            ),
         }
-        _hf_cache_put(cache_key, result)
+        if cacheable:
+            _hf_cache_put(cache_key, result)
         return result
 
     # Largest variant that still fits = most capable within budget.
     fitting.sort(key=lambda t: t[1], reverse=True)
     fname, size_mb = fitting[0]
+    
+    # Re-fetch repo meta for pipeline_tag and downloads (not always in tree resp).
+    try:
+        meta_resp = await _hf_get(client, f"https://huggingface.co/api/models/{repo_id}")
+        meta = meta_resp.json() if meta_resp.status_code == 200 else {}
+    except httpx.HTTPError:
+        meta = {}
+
     result = {
         "ok": True,
         "model": {
