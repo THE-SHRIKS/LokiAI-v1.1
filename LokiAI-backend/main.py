@@ -2797,98 +2797,22 @@ async def device_websocket(websocket: WebSocket, device_id: str, token: str = ""
 # Phase 3 — Deployment
 # ============================================================
 
+# Deployment is wireless-only (v3). The backend resolves a CDN URL and pushes a
+# deploy instruction over the authenticated device WebSocket; the phone
+# downloads the model itself. The backend never touches the device directly.
+#
+# Removed here: the entire v2 ADB/USB cluster — _resolve_adb_path, ADB_PATH,
+# push_to_device, adb_shell, check_apk_installed, install_apk,
+# download_model_to_temp and run_deployment (~245 lines, with their
+# subprocess/threading/shutil imports). It had ZERO call sites: run_deployment
+# was the only caller of the adb helpers, and nothing called run_deployment.
+# It contradicted Docs/06_RULES.md Rule 12 ("No USB, No ADB") while sitting in
+# the same file as the live wireless path, and it invoked subprocess against a
+# path resolved from an env var. Dead code that shells out is worth deleting
+# rather than leaving for someone to re-wire by accident.
+
 import tempfile
 import hashlib
-import subprocess
-import threading
-
-import shutil
-
-def _resolve_adb_path() -> str:
-    """Locate adb without hardcoded drive letters.
-
-    Resolution order:
-      1. ADB_PATH env var (if it points at an existing file)
-      2. platform-tools/adb.exe bundled in the project root (one level above
-         this backend directory)
-      3. adb on the system PATH
-    Raises at call sites with a clear error if none resolve.
-    """
-    env_path = os.getenv("ADB_PATH")
-    if env_path and os.path.isfile(env_path):
-        return env_path
-
-    adb_name = "adb.exe" if os.name == "nt" else "adb"
-    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "platform-tools", adb_name)
-    bundled = os.path.normpath(bundled)
-    if os.path.isfile(bundled):
-        return bundled
-
-    on_path = shutil.which(adb_name)
-    if on_path:
-        return on_path
-
-    # Return the bare name; subprocess will fail with a clear FileNotFoundError
-    # that surfaces in the deployment error_message.
-    return adb_name
-
-ADB_PATH = _resolve_adb_path()
-
-# In-memory deployment status tracker (sufficient for local single-server use)
-deployment_status = {}
-
-async def download_model_to_temp(hf_model_id: str, filename: str):
-    """Download model from HuggingFace to a local temp folder. Returns (temp_path, sha256, size_bytes)."""
-    url = f"https://huggingface.co/{hf_model_id}/resolve/main/{filename}"
-    temp_dir = tempfile.mkdtemp(prefix="edgemind_")
-    # rfilename may contain repo subdirectories — store flat locally
-    temp_path = os.path.join(temp_dir, os.path.basename(filename))
-    sha256 = hashlib.sha256()
-    total_bytes = 0
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        async with client.stream("GET", url, follow_redirects=True) as response:
-            response.raise_for_status()
-            with open(temp_path, "wb") as f:
-                async for chunk in response.aiter_bytes():
-                    f.write(chunk)
-                    sha256.update(chunk)
-                    total_bytes += len(chunk)
-
-    return temp_path, sha256.hexdigest(), total_bytes
-
-def push_to_device(adb_serial: str, local_path: str, remote_path: str):
-    """Push a file to Android device via ADB."""
-    result = subprocess.run(
-        [ADB_PATH, "-s", adb_serial, "push", local_path, remote_path],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise Exception(f"ADB push failed: {result.stderr}")
-    return True
-
-def adb_shell(adb_serial: str, cmd: str):
-    """Run a shell command on the device via ADB."""
-    result = subprocess.run(
-        [ADB_PATH, "-s", adb_serial, "shell"] + cmd.split(),
-        capture_output=True, text=True
-    )
-    return result.stdout.strip(), result.returncode
-
-def check_apk_installed(adb_serial: str, package_name: str) -> bool:
-    """Check if a package is installed on the Android device."""
-    stdout, _ = adb_shell(adb_serial, f"pm list packages {package_name}")
-    return package_name in stdout
-
-def install_apk(adb_serial: str, apk_path: str):
-    """Install an APK on the device via ADB."""
-    result = subprocess.run(
-        [ADB_PATH, "-s", adb_serial, "install", "-r", apk_path],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise Exception(f"APK install failed: {result.stderr}")
-    return True
 
 
 class DeploymentConfig(BaseModel):
@@ -2962,85 +2886,6 @@ async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".
         return fitting[0][0]
 
 
-async def run_deployment(deployment_id: str, device_adb_serial: str, req: DeploymentRequest, user_id: str, pool):
-    """Full deployment flow: download -> push -> config -> status update."""
-    try:
-        # Step 1: Update status to downloading
-        deployment_status[deployment_id] = {"status": "downloading", "progress_percent": 10, "error_message": None}
-        async with pool.acquire() as conn:
-            await conn.execute("UPDATE deployments SET status = 'downloading' WHERE id = $1::uuid", deployment_id)
-
-        # Step 2: Download model from HuggingFace to temp folder
-        temp_path, sha256_hash, size_bytes = await download_model_to_temp(req.hf_model_id, req.filename)
-        deployment_status[deployment_id] = {"status": "pushing", "progress_percent": 50, "error_message": None}
-        async with pool.acquire() as conn:
-            await conn.execute("UPDATE deployments SET status = 'pushing' WHERE id = $1::uuid", deployment_id)
-
-        # Step 3: Create remote directory and push model file
-        model_basename = os.path.basename(req.filename)
-        adb_shell(device_adb_serial, "mkdir -p /sdcard/edgemind/models/")
-        push_to_device(device_adb_serial, temp_path, f"/sdcard/edgemind/models/{model_basename}")
-
-        # Step 4: Delete temp file
-        try:
-            os.unlink(temp_path)
-            os.rmdir(os.path.dirname(temp_path))
-        except OSError:
-            pass
-
-        # Step 5: Generate and push config.json
-        config = {
-            "model_name": model_basename,
-            "model_path": f"/sdcard/edgemind/models/{model_basename}",
-            "inference_mode": req.effective_mode,
-            "format": model_basename.rsplit(".", 1)[-1] if "." in model_basename else "unknown",
-            "confidence_threshold": req.effective_threshold,
-            "deployed_at": datetime.now(timezone.utc).isoformat(),
-            "deployment_id": deployment_id
-        }
-        config_temp = os.path.join(tempfile.mkdtemp(prefix="edgemind_cfg_"), "config.json")
-        with open(config_temp, "w") as f:
-            json.dump(config, f, indent=2)
-        push_to_device(device_adb_serial, config_temp, "/sdcard/edgemind/config.json")
-        try:
-            os.unlink(config_temp)
-            os.rmdir(os.path.dirname(config_temp))
-        except OSError:
-            pass
-
-        deployment_status[deployment_id] = {"status": "installing", "progress_percent": 80, "error_message": None}
-
-        # Step 6: Check/install APK (skip if no APK file available yet — Phase 4)
-        # APK install will be added when Flutter app is built
-
-        # Step 7: Insert model record and update deployment to complete
-        async with pool.acquire() as conn:
-            model_row = await conn.fetchrow("""
-                INSERT INTO models (user_id, name, hf_model_id, source, format, size_mb, task_type, sha256)
-                VALUES ($1::uuid, $2, $3, 'huggingface', $4, $5, $6, $7)
-                RETURNING id
-            """, user_id, model_basename, req.hf_model_id,
-               config["format"], round(size_bytes / (1024*1024), 2),
-               req.effective_mode, sha256_hash)
-
-            await conn.execute("""
-                UPDATE deployments SET status = 'complete', model_id = $2::uuid, completed_at = NOW()
-                WHERE id = $1::uuid
-            """, deployment_id, str(model_row["id"]))
-
-        deployment_status[deployment_id] = {"status": "complete", "progress_percent": 100, "error_message": None}
-
-    except Exception as e:
-        error_msg = str(e)
-        deployment_status[deployment_id] = {"status": "failed", "progress_percent": 0, "error_message": error_msg}
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE deployments SET status = 'failed', error_message = $2 WHERE id = $1::uuid",
-                    deployment_id, error_msg
-                )
-        except Exception:
-            pass
 
 
 async def lookup_model_sha256(hf_model_id: str, filename: str) -> Optional[str]:
