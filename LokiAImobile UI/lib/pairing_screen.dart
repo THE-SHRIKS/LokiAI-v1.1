@@ -94,16 +94,10 @@ class _PairingScreenState extends State<PairingScreen> {
       return;
     }
 
-    // Task 2.2 verification: decoded values must appear in logs.
-    // ignore: avoid_print
-    print('VERIFICATION: qr_scan -> backend_url=${data.backendUrl} '
-        'token=${data.token} user_id=${data.userId}');
-
     setState(() {
       _processing = true;
       _statusIsError = false;
-      _statusMessage =
-          'QR decoded.\nbackend_url: ${data.backendUrl}\ntoken: ${data.token}';
+      _statusMessage = 'QR detected — verifying connection…';
     });
     await _controller.stop();
 
@@ -113,9 +107,15 @@ class _PairingScreenState extends State<PairingScreen> {
       setState(() {
         _processing = false;
         _statusIsError = true;
-        _statusMessage = error;
+        // Replace the caller's error with a generic message — never echo
+        // the pairing token, backend URL, or raw API response.
+        _statusMessage = 'Pairing failed — scan a fresh QR.';
       });
       await _controller.start();
+    } else {
+      setState(() {
+        _statusMessage = 'Connected to LokiAI';
+      });
     }
   }
 
