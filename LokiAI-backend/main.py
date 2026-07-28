@@ -1713,13 +1713,34 @@ async def search_deployable_models(
             detail=f"HuggingFace search is currently unavailable: {last_error or 'unknown error'}"
         )
 
+    # Resolving candidate sizes dominates this endpoint's latency: it is one
+    # redirect-following CDN HEAD per candidate. Measured before this change at
+    # p50 4.8s / p95 13.3s for the whole request (see
+    # test_infra/perf_probe.py and Docs/test/LOKIAI_PERFORMANCE_REPORT.md).
+    #
+    # Two bounded fixes, no behaviour change:
+    #  - cache the size per (repo, file): the size of a file on `main` is
+    #    stable, and the same popular repos come back for most queries;
+    #  - bound concurrency, because firing 40 simultaneous HEADs at the public
+    #    (unauthenticated) CDN invites the 429s that produce the slow tail.
+    sem = asyncio.Semaphore(HF_HEAD_CONCURRENCY)
+
     async def sized(m, fname):
-        try:
-            head = await _hf_head(client, f"https://huggingface.co/{m['id']}/resolve/main/{fname}")
-            cl = head.headers.get("content-length")
-            return (m, fname, int(cl) / (1024 * 1024)) if cl else None
-        except httpx.HTTPError:
+        cache_key = f"size|{m['id']}|{fname}"
+        cached = _hf_cache_get(cache_key)
+        if cached is not None:
+            return (m, fname, cached) if cached > 0 else None
+        async with sem:
+            try:
+                head = await _hf_head(client, f"https://huggingface.co/{m['id']}/resolve/main/{fname}")
+                cl = head.headers.get("content-length")
+            except httpx.HTTPError:
+                return None
+        if not cl:
             return None
+        size_mb = int(cl) / (1024 * 1024)
+        _hf_cache_put(cache_key, size_mb)
+        return (m, fname, size_mb)
 
     checked = await asyncio.gather(*(sized(m, f) for m, f in candidates[:40]))
 
@@ -1973,8 +1994,14 @@ Talk like a smart, friendly person — warm but not cheesy. Keep it conversation
 # even when the same user pasted the same link twice. Entries are small and
 # short-lived; HF repo contents change rarely relative to a chat session.
 _HF_REPO_CACHE: dict = {}
-_HF_CACHE_TTL_SECONDS = 300
-_HF_CACHE_MAX = 256
+_HF_CACHE_TTL_SECONDS = int(os.getenv("HF_CACHE_TTL_SECONDS", "300"))
+_HF_CACHE_MAX = 512
+
+# Simultaneous CDN HEAD requests when sizing search candidates. The endpoint
+# previously fired one per candidate with no bound (up to 40), which is what
+# produced the long tail: the public HuggingFace CDN throttles bursts, and
+# _hf_head then sleeps on Retry-After.
+HF_HEAD_CONCURRENCY = int(os.getenv("HF_HEAD_CONCURRENCY", "8"))
 
 
 def _hf_cache_get(key: str):
