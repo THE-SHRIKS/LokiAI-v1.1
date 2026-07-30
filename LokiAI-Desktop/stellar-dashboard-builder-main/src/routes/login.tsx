@@ -5,8 +5,17 @@ import { cn } from "@/lib/utils";
 import { login, register, verifyOtp, resendOtp, getToken, ApiError } from "@/lib/lokiai-api";
 
 export const Route = createFileRoute("/login")({
-  validateSearch: (search: Record<string, unknown>): { reset?: string } =>
-    typeof search.reset === "string" ? { reset: search.reset } : {},
+  // `mode=signup` lets an external entry point (the marketing site's
+  // "Get Started") open this page on the Sign-up tab. Sign-up has no route of
+  // its own — it is a tab here — so without this it was unreachable by URL and
+  // a new user had to find the tab themselves. Anything other than the two
+  // known values is ignored and falls back to sign-in.
+  validateSearch: (search: Record<string, unknown>): { reset?: string; mode?: Mode } => ({
+    ...(typeof search.reset === "string" ? { reset: search.reset } : {}),
+    ...(search.mode === "signup" || search.mode === "signin"
+      ? { mode: search.mode as Mode }
+      : {}),
+  }),
   head: () => ({
     meta: [
       { title: "LokiAI — Sign in" },
@@ -21,8 +30,10 @@ type Step = "form" | "otp";
 
 function LoginPage() {
   const navigate = useNavigate();
-  const { reset } = Route.useSearch();
-  const [mode, setMode] = useState<Mode>("signin");
+  const { reset, mode: initialMode } = Route.useSearch();
+  // Initial value only — the tabs still control this afterwards, so deep-linking
+  // to sign-up does not trap the user there.
+  const [mode, setMode] = useState<Mode>(initialMode ?? "signin");
   const [step, setStep] = useState<Step>("form");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
