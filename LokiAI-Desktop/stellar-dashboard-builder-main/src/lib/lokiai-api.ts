@@ -139,11 +139,29 @@ async function request<T>(
     body = text;
   }
   if (!res.ok) {
-    const detail =
-      body && typeof body === "object" && "detail" in body
-        ? String((body as { detail: unknown }).detail)
-        : `HTTP ${res.status}`;
-    throw new ApiError(res.status, detail);
+    // The backend uses two shapes: FastAPI's HTTPException emits {detail},
+    // while the rate-limit and global handlers emit {error}. Reading only
+    // `detail` meant those surfaced as a bare "HTTP 429" / "HTTP 500" with the
+    // actual explanation thrown away — so a rate-limited sign-in told the user
+    // nothing at all. Both shapes are read now, plus a readable fallback for
+    // the statuses users actually hit.
+    const obj = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
+    const fromBody =
+      obj && typeof obj.detail === "string"
+        ? obj.detail
+        : obj && typeof obj.error === "string"
+          ? obj.error
+          : null;
+
+    const retryAfter = res.headers.get("retry-after");
+    const fallback =
+      res.status === 429
+        ? `Too many attempts. Please wait ${retryAfter ?? "60"} seconds and try again.`
+        : res.status === 502 || res.status === 503
+          ? "The server is temporarily unavailable. Please try again shortly."
+          : `Request failed (HTTP ${res.status}).`;
+
+    throw new ApiError(res.status, fromBody ?? fallback);
   }
   return body as T;
 }
