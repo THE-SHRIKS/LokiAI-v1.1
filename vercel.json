@@ -12,10 +12,10 @@
   },
   "rewrites": [
     {
-      "source": "/workspace/:path*",
+      "source": "/workspace/(.*)",
       "destination": {
         "service": "workspace",
-        "path": "/:path*"
+        "path": "/$1"
       }
     },
     {
