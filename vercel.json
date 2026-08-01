@@ -10,6 +10,38 @@
       "framework": "tanstack-start"
     }
   },
+  "redirects": [
+    {
+      "source": "/login",
+      "destination": "/workspace/login",
+      "permanent": false
+    },
+    {
+      "source": "/signup",
+      "destination": "/workspace/login?mode=signup",
+      "permanent": false
+    },
+    {
+      "source": "/forgot-password",
+      "destination": "/workspace/forgot-password",
+      "permanent": false
+    },
+    {
+      "source": "/reset-password",
+      "destination": "/workspace/reset-password",
+      "permanent": false
+    },
+    {
+      "source": "/dashboard",
+      "destination": "/workspace",
+      "permanent": false
+    },
+    {
+      "source": "/mobile-ui",
+      "destination": "/android-app",
+      "permanent": false
+    }
+  ],
   "rewrites": [
     {
       "source": "/workspace/(.*)",
