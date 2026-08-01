@@ -120,6 +120,34 @@ function RootShell({ children }: { children: ReactNode }) {
   );
 }
 
+function AuthBootScreen() {
+  const [takingLonger, setTakingLonger] = useState(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setTakingLonger(true), 5_000);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-background px-6 text-foreground">
+      <div className="flex w-full max-w-sm flex-col items-center text-center">
+        <div className="font-mono text-lg tracking-[0.22em] text-foreground">LokiAI</div>
+        <div className="mt-7 h-px w-32 overflow-hidden bg-border">
+          <div className="h-full w-1/2 animate-pulse bg-olive" />
+        </div>
+        <p className="mt-5 font-mono text-xs uppercase tracking-[0.18em] text-muted-foreground">
+          Restoring your secure session…
+        </p>
+        {takingLonger && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Waking up the LokiAI service. This can take a moment on the first visit.
+          </p>
+        )}
+      </div>
+    </main>
+  );
+}
+
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
   // The access token lives in memory only (not localStorage), so a full
@@ -132,7 +160,7 @@ function RootComponent() {
     ensureAuthReady().finally(() => setAuthReady(true));
   }, []);
 
-  if (!authReady) return null;
+  if (!authReady) return <AuthBootScreen />;
 
   return (
     <QueryClientProvider client={queryClient}>
