@@ -13,9 +13,9 @@ export default defineConfig({
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
     server: { entry: "server" },
-    // Vercel Services removes /workspace before invoking this service. The
-    // browser-facing router mount is selected from Vite's BASE_URL in router.tsx.
-    router: { basepath: "/" },
+    // The production service receives the public URL unchanged, so server and
+    // browser must use the same mount for hydration to remain deterministic.
+    router: { basepath: isVercelDeployment ? "/workspace" : "/" },
   },
   vite: {
     // The Vercel Services deployment mounts this application at /workspace.
