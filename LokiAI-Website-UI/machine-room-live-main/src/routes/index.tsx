@@ -20,7 +20,7 @@ import { WORKSPACE_URL } from "@/lib/workspace";
 
 const TITLE = "LokiAI - Edge AI made ridiculously simple!";
 const DESC =
-  "LokiAI discovers, validates and deploys AI models to real hardware — from phones to edge devices — without requiring users to understand model formats, runtimes or embedded systems.";
+  "LokiAI discovers, validates and deploys AI models across Edge AI and IoT environments without requiring users to understand model formats or runtimes.";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -39,7 +39,7 @@ export const Route = createFileRoute("/")({
 const STEPS = [
   {
     label: "Ask",
-    detail: "Describe the outcome in plain language: “detect people on this camera, offline.”",
+    detail: "Describe the outcome in plain language: “run a private AI assistant offline.”",
     note: "No model names required",
   },
   {
@@ -73,7 +73,7 @@ const AGENTS = [
   {
     name: "Linux ARM Agent",
     status: "beta" as const,
-    detail: "Headless daemon for ARM64 boards and gateways.",
+    detail: "A lightweight runtime for ARM64 environments.",
   },
   {
     name: "Raspberry Pi Agent",
@@ -86,14 +86,14 @@ const AGENTS = [
     detail: "CUDA and TensorRT runtime adapters under design.",
   },
   {
-    name: "Camera / Gateway Agent",
+    name: "IoT Agent",
     status: "planned" as const,
-    detail: "Stream-attached inference for fixed installations.",
+    detail: "Local inference support for connected IoT environments.",
   },
   {
-    name: "OEM & MCU Agents",
+    name: "Partner Agents",
     status: "planned" as const,
-    detail: "Embedded targets via partner integrations.",
+    detail: "Additional runtime support through partner integrations.",
   },
 ];
 
@@ -103,21 +103,21 @@ const VERIFY_ROWS = [
   { field: "Format", value: "GGUF v3", verdict: "Supported" },
   { field: "Size", value: "1.94 GB", verdict: "Fits headroom" },
   { field: "Runtime", value: "llama.cpp adapter", verdict: "Available on agent" },
-  { field: "Hardware fit", value: "arm64 · 8 GB RAM · 4 perf cores", verdict: "Compatible" },
+  { field: "Runtime fit", value: "arm64 · 8 GB RAM · 4 performance cores", verdict: "Compatible" },
   { field: "Download URL", value: "CDN direct, signed at request time", verdict: "Reachable" },
   { field: "Evidence", value: "Checks stored with the deployment record", verdict: "Recorded" },
 ];
 
 const APPLICATIONS = [
   ["Offline assistants", "On-device chat and summarisation where connectivity is unreliable."],
-  ["Object detection", "Counting, presence and zone logic on existing camera hardware."],
-  ["Face detection", "Local detection for access flows, without uploading frames."],
-  ["Audio classification", "Alarm, speech and machine-sound events on low-power boards."],
-  ["Industrial inspection", "Defect spotting close to the line, with no cloud round trip."],
-  ["Smart cameras", "Turning already-installed cameras into inference endpoints."],
-  ["Anomaly detection", "Baseline drift alerts on sensor and vibration streams."],
-  ["Robotics", "Perception loops that must keep running when the network drops."],
-  ["Edge automation", "Local triggers and actions derived from on-device model output."],
+  ["Private AI", "Local AI experiences that keep data in the environment where it is used."],
+  ["Local analysis", "Reliable on-device model execution without a cloud dependency."],
+  ["IoT intelligence", "AI capabilities designed for connected IoT environments."],
+  ["Edge AI", "Low-latency local inference for responsive experiences."],
+  ["Offline workflows", "Continuous operation when connectivity is intermittent."],
+  ["Secure deployment", "Verified model delivery with a clear operational record."],
+  ["AI assistants", "Private chat and summarisation that remain available offline."],
+  ["Local automation", "Useful actions derived from trusted, local model output."],
 ];
 
 const ROADMAP = [
@@ -145,7 +145,7 @@ const ROADMAP = [
     status: "planned" as const,
     items: [
       "Jetson runtime adapters (CUDA / TensorRT)",
-      "Camera and gateway agents",
+      "Expanded IoT agent support",
       "Public API and SDK for programmatic deployment",
     ],
   },
@@ -153,9 +153,9 @@ const ROADMAP = [
     title: "Long-term",
     status: "planned" as const,
     items: [
-      "OEM and MCU device agents",
+      "Partner-managed agent support",
       "Signed artifact supply-chain attestation",
-      "Partner-certified hardware profiles",
+      "Partner-certified runtime profiles",
     ],
   },
 ];
@@ -180,14 +180,14 @@ function Home() {
         />
         <div className="relative mx-auto grid max-w-7xl gap-14 px-8 pt-12 pb-24 md:px-12 lg:px-20 lg:pt-16 lg:pb-32 lg:grid-cols-[1.05fr_1fr] lg:items-center z-10">
           <div className="min-w-0">
-            <Eyebrow index="00">AI deployment for real hardware</Eyebrow>
+            <Eyebrow index="00">AI deployment for Edge AI and IoT</Eyebrow>
             <h1 className="mt-4 font-serif text-5xl leading-[1.02] text-foreground sm:text-6xl lg:text-7xl">
-              Give hardware the right
+              Give AI the right
               <br />
               <span className="text-gold">local intelligence</span>.
             </h1>
             <p className="mt-6 max-w-xl text-lg leading-relaxed text-muted-foreground sm:text-xl">
-              LokiAI discovers, validates, and deploys AI models to real hardware, then tracks what
+              LokiAI discovers, validates, and deploys AI models across Edge AI and IoT environments, then tracks what
               runs, where it runs, and why it fits.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-3">
@@ -292,7 +292,7 @@ function Home() {
                   ["HTTPS / WSS", "Transport is encrypted and authenticated in both directions."],
                   ["Device credential", "Scoped to one device, revocable, never shared."],
                   ["Direct CDN download", "The artifact goes straight to the device."],
-                  ["Local inference", "Execution stays on the hardware."],
+                  ["Local inference", "Execution stays in your environment."],
                 ].map(([t, d], i) => (
                   <li key={t} className="flex gap-4 bg-plane/40 backdrop-blur-md px-6 py-5">
                     <span className="font-mono text-[11px] text-muted-foreground">
@@ -342,7 +342,7 @@ function Home() {
             ],
             [
               "Lower recurring cost",
-              "You pay for hardware you own instead of per-token or per-frame API billing.",
+              "You use your existing environment instead of per-token or per-request API billing.",
             ],
             [
               "Resilience",
@@ -350,7 +350,7 @@ function Home() {
             ],
             [
               "Latency, where it applies",
-              "No network hop for small models on capable hardware. Large models on weak hardware will still be slow.",
+              "No network hop for compatible local models. Performance depends on the selected runtime and model.",
             ],
             [
               "Ownership",
@@ -372,7 +372,7 @@ function Home() {
         <SectionHeader
           index="06"
           eyebrow="Applications"
-          title="What people put on the hardware"
+          title="What people run locally"
           lede="These are the workload classes the current runtimes support. Availability depends on the device profile, not on the use case alone."
         />
         <ul className="mt-12 grid gap-px overflow-hidden rounded-sm border border-border bg-border sm:grid-cols-2 lg:grid-cols-3">
@@ -466,8 +466,8 @@ function Home() {
         <SectionHeader
           index="09"
           eyebrow="Roadmap"
-          title="Hardware trajectory"
-          lede="Android is the current agent proof. The wider objective spans IoT, edge compute, and industrial routing. We separate these deliberately."
+          title="Platform trajectory"
+          lede="Android is the current agent proof. The wider objective spans IoT and Edge AI support, introduced deliberately over time."
         />
         <div className="mt-12">
           <Reveal>
@@ -479,7 +479,7 @@ function Home() {
       <CTABlock
         title={
           <>
-            The hardware already exists.
+            Your environment already exists.
             <br />
             LokiAI gives it intelligence.
           </>

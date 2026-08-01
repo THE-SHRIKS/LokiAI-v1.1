@@ -184,7 +184,7 @@ export function Workspace() {
           {open.terminal && <div key="terminal"><LockedPanel><TerminalPanel onClose={() => close("terminal")} /></LockedPanel></div>}
           {open.files    && <div key="files"><LockedPanel><FilesPanel onClose={() => close("files")} /></LockedPanel></div>}
           {open.changes  && <div key="changes"><ChangesPanel onClose={() => close("changes")} /></div>}
-          {open.preview  && <div key="preview"><PreviewPanel onClose={() => close("preview")} /></div>}
+          {open.preview  && <div key="preview"><LockedPanel><PreviewPanel onClose={() => close("preview")} /></LockedPanel></div>}
           {open.tasks    && <div key="tasks"><TasksPanel onClose={() => close("tasks")} /></div>}
           {open.plan     && <div key="plan"><PlanPanel onClose={() => close("plan")} /></div>}
         </ResponsiveGrid>

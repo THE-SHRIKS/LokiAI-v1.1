@@ -6,7 +6,7 @@ import { Logo } from "./Logo";
 const NAV = [
   { label: "Product", to: "/product" },
   { label: "Platform", to: "/platform" },
-  { label: "Hardware", to: "/hardware" },
+  { label: "Edge AI", to: "/hardware" },
   { label: "Models", to: "/models" },
   { label: "Applications", to: "/applications" },
   { label: "Developers", to: "/developers" },

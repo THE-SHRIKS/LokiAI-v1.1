@@ -9,7 +9,7 @@ import { Link } from "@tanstack/react-router";
 export function ExecutionPath() {
   const nodes = [
     { label: "Intent", desc: "Target capability", x: 50, y: 50 },
-    { label: "Hardware Profile", desc: "Agent inspection", x: 180, y: 150 },
+    { label: "Runtime Profile", desc: "Agent inspection", x: 180, y: 150 },
     { label: "Model Evidence", desc: "Artifact resolution", x: 310, y: 50 },
     { label: "Compatibility Decision", desc: "Resource match", x: 440, y: 150 },
     { label: "Deployment Route", desc: "CDN to device", x: 570, y: 50 },
@@ -107,12 +107,12 @@ export function RoadmapPipeline() {
     {
       time: "Next",
       status: "planned",
-      items: ["IoT hardware", "Broader edge support", "Jetson runtimes"],
+      items: ["IoT support", "Broader Edge AI support", "Additional runtimes"],
     },
     {
       time: "Later",
       status: "planned",
-      items: ["OEM integrations", "Embedded systems", "Industrial routing"],
+      items: ["Partner integrations", "Expanded runtimes", "Platform operations"],
     },
   ];
 
@@ -151,14 +151,14 @@ export function RoadmapPipeline() {
   );
 }
 
-/** Original hero visual upgraded to look less SaaS-like and more industrial. */
+/** Hero visual for the LokiAI control plane. */
 export function TopologyVisual() {
   return (
     <svg
       viewBox="0 0 620 220"
       className="w-full h-auto"
       role="img"
-      aria-label="LokiAI control plane connecting strictly to hardware endpoints."
+      aria-label="LokiAI control plane connecting to Edge AI and IoT endpoints."
     >
       <defs>
         <linearGradient id="loki-beam" x1="0" x2="1">
@@ -279,7 +279,7 @@ export function PlatformLayers() {
     { name: "Evidence Layer", desc: "Resolves abstract models to hashed CDN artifacts." },
     {
       name: "Compatibility Layer",
-      desc: "Matches runtime memory and instruction sets to hardware.",
+      desc: "Matches runtime requirements and available resources.",
     },
     { name: "Deployment Layer", desc: "Direct CDN retrieval with device-scoped credentials." },
     { name: "Execution Layer", desc: "Runs local inference offline." },

@@ -22,7 +22,10 @@
  */
 
 /** Set VITE_WORKSPACE_URL to point at a different workspace deployment. */
-const PRODUCTION_WORKSPACE_URL = "https://lokiai-v11.vercel.app";
+// The public domain owns the canonical entry point. Vercel forwards this
+// path to the dashboard deployment, which keeps the existing auth and device
+// workflow intact while the dashboard is being hosted under this domain.
+const PRODUCTION_WORKSPACE_URL = "https://lokiai.theshriks.space/workspace";
 
 /** Local workspace dev server (see LokiAI-Desktop/stellar-dashboard-builder-main). */
 const LOCAL_WORKSPACE_URL = "http://localhost:8080";

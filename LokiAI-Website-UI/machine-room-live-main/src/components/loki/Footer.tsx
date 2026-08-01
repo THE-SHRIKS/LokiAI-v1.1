@@ -7,7 +7,7 @@ const COLUMNS = [
     links: [
       { label: "Product", to: "/product" as const },
       { label: "Platform", to: "/platform" as const },
-      { label: "Hardware", to: "/hardware" as const },
+      { label: "Edge AI", to: "/hardware" as const },
       { label: "Models", to: "/models" as const },
     ],
   },
@@ -41,7 +41,7 @@ export function Footer() {
               <Logo className="h-12 w-auto" />
             </div>
             <p className="mt-4 max-w-xs text-sm text-muted-foreground">
-              An AI-native deployment and operations layer for heterogeneous hardware. Built by THE
+              An AI-native deployment and operations layer for Edge AI and IoT environments. Built by THE
               SHRIKS.
             </p>
             <p className="mt-6 font-mono text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
