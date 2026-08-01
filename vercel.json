@@ -1,12 +1,31 @@
 {
-  "experimentalServices": {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
     "marketing": {
-      "entrypoint": "LokiAI-Website-UI/machine-room-live-main",
-      "routePrefix": "/"
+      "root": "LokiAI-Website-UI/machine-room-live-main"
     },
     "workspace": {
-      "entrypoint": "LokiAI-Desktop/stellar-dashboard-builder-main",
-      "routePrefix": "/workspace"
+      "root": "LokiAI-Desktop/stellar-dashboard-builder-main"
     }
-  }
+  },
+  "rewrites": [
+    {
+      "source": "/workspace/:path*",
+      "destination": {
+        "service": "workspace"
+      }
+    },
+    {
+      "source": "/workspace",
+      "destination": {
+        "service": "workspace"
+      }
+    },
+    {
+      "source": "/:path*",
+      "destination": {
+        "service": "marketing"
+      }
+    }
+  ]
 }
