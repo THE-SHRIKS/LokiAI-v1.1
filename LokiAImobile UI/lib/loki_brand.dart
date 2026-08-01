@@ -14,8 +14,8 @@ class LokiBrand extends StatelessWidget {
         Image.asset(
           'assets/lokiai-logo.png',
           height: imageHeight,
-          width: imageHeight * 2.4,
-          fit: BoxFit.contain,
+          width: imageHeight * 3.4,
+          fit: BoxFit.cover,
           semanticLabel: 'LokiAI logo',
         ),
         if (showName) ...[
