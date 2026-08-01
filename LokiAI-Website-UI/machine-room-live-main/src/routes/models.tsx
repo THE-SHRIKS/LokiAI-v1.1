@@ -65,7 +65,7 @@ function Models() {
               "Detection, classification and audio models. CPU everywhere, NNAPI where the device exposes it.",
             ],
             [
-              "ONNX / TensorRT",
+              "More formats",
               "Under evaluation. Not deployable yet — listed so the direction is clear.",
             ],
           ].map(([t, d]) => (

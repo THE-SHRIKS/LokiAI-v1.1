@@ -81,9 +81,9 @@ const AGENTS = [
     detail: "Pi 4 / Pi 5 profiles with quantised CPU runtimes.",
   },
   {
-    name: "NVIDIA Jetson Agent",
+    name: "Edge AI Agent",
     status: "planned" as const,
-    detail: "CUDA and TensorRT runtime adapters under design.",
+    detail: "Local runtime support under design.",
   },
   {
     name: "IoT Agent",
@@ -144,7 +144,7 @@ const ROADMAP = [
     title: "Next",
     status: "planned" as const,
     items: [
-      "Jetson runtime adapters (CUDA / TensorRT)",
+      "Expanded local runtime support",
       "Expanded IoT agent support",
       "Public API and SDK for programmatic deployment",
     ],
@@ -439,7 +439,7 @@ function Home() {
               "Control plane, agent protocol, artifact resolver, deployment engine.",
             ],
             ["APIs", "Account, device, model and deployment resources. Public API in development."],
-            ["Model formats", "GGUF and TFLite today; ONNX and TensorRT under evaluation."],
+            ["Model formats", "GGUF and TFLite today; additional formats under evaluation."],
             ["Runtime adapters", "A thin interface per runtime: load, warm, infer, release."],
             [
               "Deployment events",

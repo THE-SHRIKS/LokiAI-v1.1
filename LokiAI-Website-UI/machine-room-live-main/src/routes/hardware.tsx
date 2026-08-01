@@ -11,7 +11,7 @@ import {
 
 const TITLE = "Hardware — supported and planned device classes | LokiAI";
 const DESC =
-  "Honest status for every LokiAI hardware class: Mobile hardware available today. IoT, edge, industrial and embedded systems are our broader direction.";
+  "Honest status for every LokiAI device class: Android is available today, with broader IoT and Edge AI support planned.";
 
 export const Route = createFileRoute("/hardware")({
   head: () => ({
@@ -51,28 +51,28 @@ const HARDWARE_CLASSES: HardwareClass[] = [
     notes: "Headless daemons for connected endpoints. Protocol is stable, packaging is iterating.",
   },
   {
-    name: "Edge Systems",
+    name: "Edge AI Devices",
     status: "planned",
-    profile: "Orin / Xavier class, JetPack",
-    runtimes: "CUDA and TensorRT",
-    notes: "High-performance inference for computer vision. Currently in architecture phase.",
+    profile: "Connected devices with local AI capability",
+    runtimes: "Runtime support under evaluation",
+    notes: "Local AI support for compatible Edge AI environments. Currently in the architecture phase.",
   },
   {
-    name: "Industrial Hardware",
+    name: "IoT Hardware",
     status: "planned",
-    profile: "Fixed gateways with attached streams",
-    runtimes: "TFLite detection models",
-    notes: "Stream-attached inference nodes for factory and inspection lines.",
+    profile: "Connected IoT devices and gateways",
+    runtimes: "Compatible local model formats",
+    notes: "Private, local AI for connected environments.",
   },
   {
-    name: "Embedded Compute",
+    name: "Lightweight IoT Devices",
     status: "planned",
-    profile: "Constrained MCU targets",
-    runtimes: "Micro-runtimes",
-    notes: "Offline models running close to sensors.",
+    profile: "Resource-conscious IoT endpoints",
+    runtimes: "Lightweight local runtimes",
+    notes: "Offline AI designed for practical, connected devices.",
   },
   {
-    name: "OEM Devices",
+    name: "Partner Devices",
     status: "planned",
     profile: "Vendor-specific architectures",
     runtimes: "TBD per platform",
@@ -94,7 +94,7 @@ function Hardware() {
         <SectionHeader
           index="01"
           eyebrow="Device classes"
-          title="From mobile to industrial"
+          title="From mobile to IoT"
           lede="Compatibility is decided from the device-reported profile at deployment time, not manually guessed."
         />
         <div className="mt-12 space-y-4">
@@ -164,4 +164,3 @@ function Hardware() {
     </>
   );
 }
-

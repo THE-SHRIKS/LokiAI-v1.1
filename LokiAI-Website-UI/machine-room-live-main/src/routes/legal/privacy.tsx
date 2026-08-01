@@ -34,7 +34,7 @@ const CLAUSES = [
   ],
   [
     "Device telemetry",
-    "Agents report hardware profile and deployment state. This is operational metadata, not payload content.",
+    "Agents report capability profile and deployment state. This is operational metadata, not payload content.",
   ],
   [
     "Retention and deletion",

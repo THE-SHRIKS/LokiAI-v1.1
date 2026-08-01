@@ -34,7 +34,7 @@ function Company() {
         <SectionHeader
           index="01"
           eyebrow="Mission"
-          title="Make capable hardware useful without an embedded ML team"
+          title="Make capable devices useful without specialist AI teams"
         />
         <div className="mt-10 grid gap-6 md:grid-cols-2 lg:grid-cols-3">
           <Panel key="The problem" className="h-full">
@@ -99,7 +99,7 @@ function Company() {
           <Panel key="Careers" className="h-full">
             <h3 className="font-serif text-2xl text-gold">Careers</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              We are small. If you work on runtimes, embedded systems or device fleets, introduce
+              We are small. If you work on local AI, IoT or device fleets, introduce
               yourself.
             </p>
           </Panel>

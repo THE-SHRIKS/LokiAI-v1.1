@@ -72,19 +72,19 @@ const AGENTS = [
     detail: "Pi-specific profiles and thermal reporting.",
   },
   {
-    name: "Jetson Agent",
+    name: "Edge AI Agent",
     status: "planned" as const,
-    detail: "CUDA / TensorRT adapters in design.",
+    detail: "Local runtime support in design.",
   },
   {
-    name: "Camera / Gateway Agent",
+    name: "IoT Agent",
     status: "planned" as const,
-    detail: "Stream-attached inference.",
+    detail: "Local AI support for connected IoT environments.",
   },
   {
-    name: "OEM & MCU Agents",
+    name: "Partner Agents",
     status: "planned" as const,
-    detail: "Partner-integrated embedded targets.",
+    detail: "Additional support through partner integrations.",
   },
 ];
 

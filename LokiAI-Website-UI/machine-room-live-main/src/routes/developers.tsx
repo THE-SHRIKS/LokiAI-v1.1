@@ -69,7 +69,7 @@ function Developers() {
         <div className="mt-10 max-w-3xl">
           <BulletList
             items={[
-              "Agent authenticates over WSS with its device credential and publishes its hardware profile.",
+              "Agent authenticates over WSS with its device credential and publishes its capability profile.",
               "Control plane resolves the requested outcome to a candidate artifact and runs compatibility checks.",
               "On pass, a short-lived download instruction is issued to that device only.",
               "Agent downloads directly from the CDN, verifies integrity, then loads through the matching runtime adapter.",
@@ -85,7 +85,7 @@ function Developers() {
           <Panel key="Model formats" className="h-full">
             <h3 className="font-serif text-2xl text-gold">Model formats</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              GGUF and TFLite are deployable today. ONNX and TensorRT are under evaluation.
+              GGUF and TFLite are deployable today. Additional formats are under evaluation.
             </p>
           </Panel>
           <Panel key="Public API" className="h-full">

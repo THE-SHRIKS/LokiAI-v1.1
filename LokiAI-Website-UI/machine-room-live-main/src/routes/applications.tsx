@@ -4,7 +4,7 @@ import { BulletList } from "@/components/loki/diagrams";
 
 const TITLE = "Applications — on-device AI by use case and industry | LokiAI";
 const DESC =
-  "Where LokiAI deployments are used: offline assistants, detection, audio classification, industrial inspection, smart cameras, anomaly detection, robotics and edge automation.";
+  "Where LokiAI deployments are used: offline assistants, local analysis, audio classification, anomaly detection, IoT intelligence and Edge AI workflows.";
 
 export const Route = createFileRoute("/applications")({
   head: () => ({
@@ -40,17 +40,16 @@ function Applications() {
               unreliable or prohibited.
             </p>
           </Panel>
-          <Panel key="Object detection" className="h-full">
-            <h3 className="font-serif text-2xl text-gold">Object detection</h3>
+          <Panel key="Local analysis" className="h-full">
+            <h3 className="font-serif text-2xl text-gold">Local analysis</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Presence, counting and zone logic running on cameras and phones already installed on
-              site.
+              Useful local understanding that remains in the environment where it is needed.
             </p>
           </Panel>
-          <Panel key="Face detection" className="h-full">
-            <h3 className="font-serif text-2xl text-gold">Face detection</h3>
+          <Panel key="Private workflows" className="h-full">
+            <h3 className="font-serif text-2xl text-gold">Private workflows</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Local detection for access and safety flows, with frames never leaving the device.
+              On-device AI workflows that keep sensitive inputs private by default.
             </p>
           </Panel>
           <Panel key="Audio classification" className="h-full">
@@ -65,8 +64,8 @@ function Applications() {
               Baseline drift on sensor, vibration and current streams, evaluated locally.
             </p>
           </Panel>
-          <Panel key="Edge automation" className="h-full">
-            <h3 className="font-serif text-2xl text-gold">Edge automation</h3>
+          <Panel key="Local automation" className="h-full">
+            <h3 className="font-serif text-2xl text-gold">Local automation</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
               Local triggers and actions derived directly from on-device model output.
             </p>
@@ -75,18 +74,18 @@ function Applications() {
       </Section>
 
       <Section>
-        <SectionHeader index="02" eyebrow="By industry" title="Who asks for these deployments" />
+        <SectionHeader index="02" eyebrow="By environment" title="Where local AI is useful" />
         <div className="mt-10 grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-          <Panel key="Manufacturing" className="h-full">
-            <h3 className="font-serif text-2xl text-gold">Manufacturing</h3>
+          <Panel key="IoT environments" className="h-full">
+            <h3 className="font-serif text-2xl text-gold">IoT environments</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Inspection and anomaly detection close to the line, with no cloud round trip per part.
+              Connected devices that benefit from private, responsive local intelligence.
             </p>
           </Panel>
-          <Panel key="Physical security" className="h-full">
-            <h3 className="font-serif text-2xl text-gold">Physical security</h3>
+          <Panel key="Private operations" className="h-full">
+            <h3 className="font-serif text-2xl text-gold">Private operations</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Smart cameras that classify locally and forward events instead of video.
+              Local workflows that avoid sending sensitive inputs to external services.
             </p>
           </Panel>
           <Panel key="Field operations" className="h-full">
@@ -95,10 +94,10 @@ function Applications() {
               Offline assistants on phones carried into sites without reliable networks.
             </p>
           </Panel>
-          <Panel key="Robotics" className="h-full">
-            <h3 className="font-serif text-2xl text-gold">Robotics</h3>
+          <Panel key="Edge AI" className="h-full">
+            <h3 className="font-serif text-2xl text-gold">Edge AI</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Perception loops that must keep running when the uplink drops.
+              Reliable local model execution when connectivity is limited or unavailable.
             </p>
           </Panel>
           <Panel key="Retail & logistics" className="h-full">

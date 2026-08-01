@@ -60,7 +60,7 @@ function Product() {
             {[
               [
                 "Product teams",
-                "You have devices in the field and want on-device intelligence without hiring an embedded ML team.",
+                "You have devices in the field and want on-device intelligence without hiring a specialist AI team.",
               ],
               [
                 "Solo builders",
