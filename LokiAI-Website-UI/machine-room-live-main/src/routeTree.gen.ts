@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AndroidAppRouteImport } from './routes/android-app'
 import { Route as ApplicationsRouteImport } from './routes/applications'
 import { Route as CompanyRouteImport } from './routes/company'
 import { Route as ContactRouteImport } from './routes/contact'
@@ -26,6 +27,11 @@ import { Route as LegalTermsRouteImport } from './routes/legal/terms'
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AndroidAppRoute = AndroidAppRouteImport.update({
+  id: '/android-app',
+  path: '/android-app',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApplicationsRoute = ApplicationsRouteImport.update({
@@ -91,6 +97,7 @@ const LegalTermsRoute = LegalTermsRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/android-app': typeof AndroidAppRoute
   '/applications': typeof ApplicationsRoute
   '/company': typeof CompanyRoute
   '/contact': typeof ContactRoute
@@ -106,6 +113,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/android-app': typeof AndroidAppRoute
   '/applications': typeof ApplicationsRoute
   '/company': typeof CompanyRoute
   '/contact': typeof ContactRoute
@@ -122,6 +130,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/android-app': typeof AndroidAppRoute
   '/applications': typeof ApplicationsRoute
   '/company': typeof CompanyRoute
   '/contact': typeof ContactRoute
@@ -139,6 +148,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/android-app'
     | '/applications'
     | '/company'
     | '/contact'
@@ -154,6 +164,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/android-app'
     | '/applications'
     | '/company'
     | '/contact'
@@ -169,6 +180,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/android-app'
     | '/applications'
     | '/company'
     | '/contact'
@@ -185,6 +197,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AndroidAppRoute: typeof AndroidAppRoute
   ApplicationsRoute: typeof ApplicationsRoute
   CompanyRoute: typeof CompanyRoute
   ContactRoute: typeof ContactRoute
@@ -206,6 +219,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/android-app': {
+      id: '/android-app'
+      path: '/android-app'
+      fullPath: '/android-app'
+      preLoaderRoute: typeof AndroidAppRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/applications': {
@@ -297,6 +317,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AndroidAppRoute: AndroidAppRoute,
   ApplicationsRoute: ApplicationsRoute,
   CompanyRoute: CompanyRoute,
   ContactRoute: ContactRoute,

@@ -1,0 +1,12 @@
+{
+  "experimentalServices": {
+    "marketing": {
+      "entrypoint": "LokiAI-Website-UI/machine-room-live-main",
+      "routePrefix": "/"
+    },
+    "workspace": {
+      "entrypoint": "LokiAI-Desktop/stellar-dashboard-builder-main",
+      "routePrefix": "/workspace"
+    }
+  }
+}

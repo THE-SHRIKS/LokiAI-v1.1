@@ -126,7 +126,7 @@ async function request<T>(
       res = await doFetch(path, headers, init);
     } else {
       clearToken();
-      if (typeof window !== "undefined") window.location.href = "/login";
+      if (typeof window !== "undefined") window.location.href = `${import.meta.env.BASE_URL}login`;
       throw new ApiError(401, "Session expired");
     }
   }

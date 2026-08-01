@@ -6,15 +6,18 @@
 // You can pass additional config via defineConfig({ vite: { ... }, etc... }) if needed.
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
     server: { entry: "server" },
   },
   vite: {
+    // The Vercel Services deployment mounts this application at /workspace.
+    // Keep the local developer server at / so existing local workflows work.
+    base: mode === "production" ? "/workspace/" : "/",
     // No source maps in the shipped production bundle — don't hand out an
     // unminified map of the app's real source to anyone who opens DevTools.
     build: { sourcemap: false },
   },
-});
+}));
