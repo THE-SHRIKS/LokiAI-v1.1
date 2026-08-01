@@ -30,6 +30,11 @@ jobs:
           flutter-version: "3.44.8"
           channel: stable
           cache: true
+      - name: Install pinned Android NDK
+        shell: bash
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.0.12433566"
       - run: flutter pub get
       - run: flutter test
       - run: flutter build apk --release
