@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import RGL, { WidthProvider } from "react-grid-layout/legacy";
-import { Plus, RotateCcw, Terminal as TerminalIcon, FolderTree, GitCompare, Globe, ListChecks, ClipboardList } from "lucide-react";
+import { Plus, RotateCcw, Terminal as TerminalIcon, FolderTree, GitCompare, Globe, ListChecks, ClipboardList, LockKeyhole } from "lucide-react";
 import {
   TerminalPanel,
   FilesPanel,
@@ -70,6 +70,20 @@ const META: Record<PanelId, { label: string; icon: React.ComponentType<{ classNa
   tasks:    { label: "Tasks",    icon: ListChecks },
   plan:     { label: "Plan",     icon: ClipboardList },
 };
+
+function LockedPanel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="relative h-full overflow-hidden rounded border border-border">
+      <div className="pointer-events-none select-none blur-[3px] opacity-55">{children}</div>
+      <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/30 backdrop-blur-[1px]">
+        <div className="flex items-center gap-2 rounded-sm border border-olive/40 bg-background/90 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.16em] text-olive-glow shadow-[0_0_22px_-8px_var(--olive-glow)]">
+          <LockKeyhole className="h-3.5 w-3.5" />
+          Unlocks at v1.2
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export function Workspace() {
   const [layout, setLayout] = useState<Item[]>(loadLayout);
@@ -167,8 +181,8 @@ export function Workspace() {
             return Array.from(map.values());
           })}
         >
-          {open.terminal && <div key="terminal"><TerminalPanel onClose={() => close("terminal")} /></div>}
-          {open.files    && <div key="files"><FilesPanel onClose={() => close("files")} /></div>}
+          {open.terminal && <div key="terminal"><LockedPanel><TerminalPanel onClose={() => close("terminal")} /></LockedPanel></div>}
+          {open.files    && <div key="files"><LockedPanel><FilesPanel onClose={() => close("files")} /></LockedPanel></div>}
           {open.changes  && <div key="changes"><ChangesPanel onClose={() => close("changes")} /></div>}
           {open.preview  && <div key="preview"><PreviewPanel onClose={() => close("preview")} /></div>}
           {open.tasks    && <div key="tasks"><TasksPanel onClose={() => close("tasks")} /></div>}

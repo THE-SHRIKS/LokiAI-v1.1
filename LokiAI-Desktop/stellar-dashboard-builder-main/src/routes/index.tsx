@@ -1,10 +1,9 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Navigate, useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { Sidebar } from "@/components/workspace/Sidebar";
 import { ChatPanel, type ChatMessage, type DeployState } from "@/components/workspace/ChatPanel";
 import { Workspace } from "@/components/workspace/Workspace";
 import { NimKeyModal } from "@/components/workspace/NimKeyModal";
-import { LandingPage } from "@/components/landing/LandingPage";
 import {
   getToken,
   getDevices,
@@ -390,7 +389,7 @@ function Index() {
     .map((s) => ({ id: s.id, title: s.title }));
 
   if (!isAuthenticated) {
-    return <LandingPage />;
+    return <Navigate to="/login" replace />;
   }
 
   return (

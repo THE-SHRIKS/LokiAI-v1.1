@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
-import { Send, Plus, Mic, ChevronDown, FolderOpen, Asterisk, Rocket, Loader2, CheckCircle2, XCircle } from "lucide-react";
+import { Send, FolderOpen, Asterisk, Rocket, Loader2, CheckCircle2, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Device, ModelRecommendation, DeploymentRecord } from "@/lib/lokiai-api";
 
@@ -117,13 +117,7 @@ export function ChatPanel({ messages, onSend, variant = "docked", projectTitle, 
             className="w-full resize-none rounded border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-olive focus:outline-none"
           />
         </div>
-        <div className="flex items-center justify-between px-3 pb-2 text-xs text-muted-foreground">
-          <div className="flex items-center gap-2">
-            <span className="rounded border border-olive/40 bg-olive/10 px-1.5 py-0.5 text-olive-glow">Auto</span>
-            <button type="button" className="grid h-5 w-5 place-items-center rounded hover:bg-accent"><Plus className="h-3 w-3" /></button>
-            <button type="button" className="grid h-5 w-5 place-items-center rounded hover:bg-accent"><Mic className="h-3 w-3" /></button>
-            <ChevronDown className="h-3 w-3" />
-          </div>
+        <div className="flex items-center justify-end px-3 pb-2 text-xs text-muted-foreground">
           <div className="flex items-center gap-2">
             <span>LokiAI Active</span>
             <button type="submit" className="grid h-6 w-6 place-items-center rounded bg-olive text-background hover:bg-olive-bright">
