@@ -5,7 +5,8 @@ import { routeTree } from "./routeTree.gen";
 export const getRouter = () => {
   const queryClient = new QueryClient();
   const browserBasepath =
-    typeof window !== "undefined" && import.meta.env.BASE_URL === "/workspace/"
+    typeof window !== "undefined" &&
+    import.meta.env.VITE_WORKSPACE_MOUNTED === "true"
       ? "/workspace"
       : "/";
 

@@ -7,22 +7,42 @@
     },
     "workspace": {
       "root": "LokiAI-Desktop/stellar-dashboard-builder-main",
-      "framework": "tanstack-start"
+      "framework": "tanstack-start",
+      "routes": [
+        {
+          "src": "/workspace/(.*)",
+          "transforms": [
+            {
+              "type": "request.path",
+              "op": "set",
+              "args": "/$1"
+            }
+          ]
+        },
+        {
+          "src": "/workspace",
+          "transforms": [
+            {
+              "type": "request.path",
+              "op": "set",
+              "args": "/"
+            }
+          ]
+        }
+      ]
     }
   },
   "rewrites": [
     {
       "source": "/workspace/(.*)",
       "destination": {
-        "service": "workspace",
-        "path": "/$1"
+        "service": "workspace"
       }
     },
     {
       "source": "/workspace",
       "destination": {
-        "service": "workspace",
-        "path": "/"
+        "service": "workspace"
       }
     },
     {

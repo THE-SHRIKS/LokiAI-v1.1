@@ -19,10 +19,19 @@ export default defineConfig({
   },
   vite: {
     // The Vercel Services deployment mounts this application at /workspace.
-    // Keep the local developer server at / so existing local workflows work.
-    base: isVercelDeployment ? "/workspace/" : "/",
+    // Keep local development at /. In production, emit the workspace assets
+    // into the same public namespace that Vercel routes to this service.
+    base: "/",
+    define: {
+      "import.meta.env.VITE_WORKSPACE_MOUNTED": JSON.stringify(
+        isVercelDeployment ? "true" : "false",
+      ),
+    },
     // No source maps in the shipped production bundle — don't hand out an
     // unminified map of the app's real source to anyone who opens DevTools.
-    build: { sourcemap: false },
+    build: {
+      sourcemap: false,
+      assetsDir: isVercelDeployment ? "workspace/assets" : "assets",
+    },
   },
 });
