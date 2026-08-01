@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { Download, CheckCircle } from "lucide-react";
 import { backendUrl } from "@/lib/lokiai-api";
+import lokiaiLogoUrl from "@/assets/lokiai-logo.png";
 
 function apkUrl(): string {
   return `${backendUrl()}/apk/download`;
@@ -43,7 +44,7 @@ function MobileUIPage() {
     <div className="mobile-ui-root">
       {/* Top bar */}
       <header className="mobile-ui-header">
-        <img src="/lokiai-logo.png" alt="LokiAI" style={{ height: 20, width: "auto", opacity: 0.9 }} />
+        <img src={lokiaiLogoUrl} alt="LokiAI" style={{ height: 20, width: "auto", opacity: 0.9 }} />
         <span className="mobile-ui-version">v1.0 · Android</span>
       </header>
 

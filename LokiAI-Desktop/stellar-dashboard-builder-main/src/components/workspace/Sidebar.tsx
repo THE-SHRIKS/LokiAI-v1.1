@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getMe, logout, type Me } from "@/lib/lokiai-api";
+import lokiaiLogoUrl from "@/assets/lokiai-logo.png";
 
 type Tab = "chat" | "cowork" | "code";
 
@@ -78,7 +79,7 @@ export function Sidebar({ collapsed, onToggle, recents, activeRecentId, onSelect
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-panel">
       <div className="flex items-center justify-between pl-3 pr-2 py-2.5">
-        <img src="/lokiai-logo.png" alt="LokiAI" style={{ height: 26, width: "auto", opacity: 1 }} />
+        <img src={lokiaiLogoUrl} alt="LokiAI" className="h-7 w-auto object-contain" />
         <button onClick={onToggle} className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground" title="Collapse sidebar (Ctrl+B)">
           <PanelLeft className="h-4 w-4" />
         </button>

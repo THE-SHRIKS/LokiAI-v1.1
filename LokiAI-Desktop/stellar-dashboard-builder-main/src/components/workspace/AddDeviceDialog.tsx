@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { Download, RefreshCw, ScanLine, X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { generatePairingToken, backendUrl, getToken } from "@/lib/lokiai-api";
+import { generatePairingToken } from "@/lib/lokiai-api";
 
 interface AddDeviceDialogProps {
   open: boolean;
@@ -12,8 +12,8 @@ interface AddDeviceDialogProps {
 type Step = "install" | "pair";
 
 /// "Add Device" flow: real one-time pairing token from POST /pairing/generate.
-/// Step 1 QR: this dashboard's own /mobile-ui page — URL built from the real
-/// LAN IP returned by GET /system/info so phones on the same network can reach it.
+/// Step 1 QR: the canonical Android download page in production, with the
+/// local dashboard origin retained for LAN development.
 /// Step 2 QR: the pairing payload (scanned from inside the LokiAI app).
 export function AddDeviceDialog({ open, onClose }: AddDeviceDialogProps) {
   const [step, setStep] = useState<Step>("install");
@@ -28,23 +28,14 @@ export function AddDeviceDialog({ open, onClose }: AddDeviceDialogProps) {
     setBusy(true);
     setError(null);
     try {
-      // Fetch LAN-reachable dashboard URL from backend so QR works on phone
-      let dashboardBase = window.location.origin;
-      try {
-        const infoRes = await fetch(`${backendUrl()}/system/info`, {
-          headers: { Authorization: `Bearer ${getToken()!}` },
-        });
-        if (infoRes.ok) {
-          const info = await infoRes.json() as { dashboard_url: string };
-          if (info.dashboard_url) dashboardBase = info.dashboard_url;
-        }
-      } catch {
-        // silently fall back to window.location.origin
-      }
+      const installPageUrl =
+        window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+          ? `${window.location.origin}/android-app`
+          : "https://lokiai.theshriks.space/android-app";
 
       const res = await generatePairingToken();
       setQrData(res.qr_data);
-      setInstallUrl(`${dashboardBase}/mobile-ui`);
+      setInstallUrl(installPageUrl);
       setExpiresAt(new Date(res.expires_at));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

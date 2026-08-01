@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
+import 'loki_brand.dart';
+
 /// Decoded payload of the dashboard pairing QR:
 /// { "backend_url": "...", "token": "...", "user_id": "..." }
 class PairingQrData {
@@ -22,8 +24,10 @@ class PairingQrData {
       if (json is! Map<String, dynamic>) return null;
       final backendUrl = json['backend_url'] as String?;
       final token = json['token'] as String?;
-      if (backendUrl == null || backendUrl.isEmpty ||
-          token == null || token.isEmpty) {
+      if (backendUrl == null ||
+          backendUrl.isEmpty ||
+          token == null ||
+          token.isEmpty) {
         return null;
       }
       return PairingQrData(
@@ -130,19 +134,12 @@ class _PairingScreenState extends State<PairingScreen> {
               height: 56,
               decoration: const BoxDecoration(
                 border: Border(
-                    bottom: BorderSide(color: _dividerGray, width: 1)),
+                  bottom: BorderSide(color: _dividerGray, width: 1),
+                ),
               ),
               padding: const EdgeInsets.symmetric(horizontal: 16),
               alignment: Alignment.centerLeft,
-              child: const Text(
-                'LokiAI',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600,
-                  color: _textPrimary,
-                  letterSpacing: -0.5,
-                ),
-              ),
+              child: const LokiBrand(),
             ),
             const SizedBox(height: 24),
             if (widget.notice != null) ...[
@@ -190,7 +187,8 @@ class _PairingScreenState extends State<PairingScreen> {
                     child: _processing
                         ? const Center(
                             child: CircularProgressIndicator(
-                                color: _textSecondary),
+                              color: _textSecondary,
+                            ),
                           )
                         : MobileScanner(
                             controller: _controller,
@@ -203,7 +201,9 @@ class _PairingScreenState extends State<PairingScreen> {
                                   'Grant camera permission in device settings.',
                                   textAlign: TextAlign.center,
                                   style: const TextStyle(
-                                      color: _accent, fontSize: 14),
+                                    color: _accent,
+                                    fontSize: 14,
+                                  ),
                                 ),
                               ),
                             ),

@@ -6,17 +6,20 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'backend_connection.dart';
 import 'config_reader.dart';
 import 'device_registration.dart';
+import 'loki_brand.dart';
 import 'pairing_screen.dart';
 import 'ml/camera_inference.dart';
 import 'ml/chat_inference.dart';
 import 'ml/voice_inference.dart';
 
 void main() {
-  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarColor: Colors.transparent,
-    statusBarIconBrightness: Brightness.light,
-    systemNavigationBarColor: LokiColors.baseBlack,
-  ));
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarColor: LokiColors.baseBlack,
+    ),
+  );
   runApp(const LokiApp());
 }
 
@@ -48,12 +51,26 @@ class LokiApp extends StatelessWidget {
           surface: LokiColors.baseBlack,
         ),
         textTheme: const TextTheme(
-          titleLarge: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: LokiColors.textPrimary),
-          bodyLarge: TextStyle(fontSize: 15, fontWeight: FontWeight.w400, color: LokiColors.textPrimary, height: 1.4),
-          bodyMedium: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: LokiColors.textSecondary),
+          titleLarge: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+            color: LokiColors.textPrimary,
+          ),
+          bodyLarge: TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w400,
+            color: LokiColors.textPrimary,
+            height: 1.4,
+          ),
+          bodyMedium: TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+            color: LokiColors.textSecondary,
+          ),
         ),
       ),
-      home: const PairingGate(), // Checks pairing and shows QR scanner if disconnected
+      home:
+          const PairingGate(), // Checks pairing and shows QR scanner if disconnected
     );
   }
 }
@@ -105,11 +122,16 @@ class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
       final prefs = await SharedPreferences.getInstance();
       final deviceId = prefs.getString(DeviceRegistration.prefsDeviceId);
       final backendUrl = prefs.getString(DeviceRegistration.prefsBackendUrl);
-      final paired = deviceId != null && deviceId.isNotEmpty &&
-          backendUrl != null && backendUrl.isNotEmpty;
+      final paired =
+          deviceId != null &&
+          deviceId.isNotEmpty &&
+          backendUrl != null &&
+          backendUrl.isNotEmpty;
       // ignore: avoid_print
-      print('VERIFICATION: pairing_gate -> paired=$paired '
-          'device_id=${deviceId ?? "none"}');
+      print(
+        'VERIFICATION: pairing_gate -> paired=$paired '
+        'device_id=${deviceId ?? "none"}',
+      );
       if (paired) BackendConnection.instance.start();
       if (mounted) setState(() => _paired = paired);
     } catch (e) {
@@ -158,7 +180,8 @@ class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
         if (needsRePair) {
           return PairingScreen(
             onScanned: _onScanned,
-            notice: 'This phone needs to be paired again. '
+            notice:
+                'This phone needs to be paired again. '
                 'Scan a new QR code from the LokiAI dashboard to reconnect.',
           );
         }
@@ -177,8 +200,11 @@ class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const Icon(Icons.check_circle,
-                    color: Color(0xFF43A047), size: 56),
+                const Icon(
+                  Icons.check_circle,
+                  color: Color(0xFF43A047),
+                  size: 56,
+                ),
                 const SizedBox(height: 16),
                 const Text(
                   'Connected! Your device is paired.',
@@ -187,8 +213,10 @@ class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
                 const SizedBox(height: 8),
                 const Text(
                   'It now appears in your dashboard.',
-                  style:
-                      TextStyle(color: LokiColors.textSecondary, fontSize: 13),
+                  style: TextStyle(
+                    color: LokiColors.textSecondary,
+                    fontSize: 13,
+                  ),
                 ),
                 const SizedBox(height: 32),
                 TextButton(
@@ -196,17 +224,23 @@ class _PairingGateState extends State<PairingGate> with WidgetsBindingObserver {
                   style: TextButton.styleFrom(
                     backgroundColor: LokiColors.surface1,
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 32, vertical: 12),
+                      horizontal: 32,
+                      vertical: 12,
+                    ),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(20),
                       side: const BorderSide(
-                          color: LokiColors.dividerGray, width: 1),
+                        color: LokiColors.dividerGray,
+                        width: 1,
+                      ),
                     ),
                   ),
                   child: const Text(
                     'Continue',
-                    style:
-                        TextStyle(color: LokiColors.textPrimary, fontSize: 14),
+                    style: TextStyle(
+                      color: LokiColors.textPrimary,
+                      fontSize: 14,
+                    ),
                   ),
                 ),
               ],
@@ -227,7 +261,11 @@ class ChatMessage {
   final MessageRole role;
   final bool isStreaming;
 
-  ChatMessage({required this.text, required this.role, this.isStreaming = false});
+  ChatMessage({
+    required this.text,
+    required this.role,
+    this.isStreaming = false,
+  });
 }
 
 // --- Main Screen ---
@@ -241,20 +279,20 @@ class LokiHomeScreen extends StatefulWidget {
 class _LokiHomeScreenState extends State<LokiHomeScreen> {
   bool _isCameraActive = false;
   bool _isMicLive = false; // Top bar mic state
-  
+
   bool _cameraGranted = false;
   bool _micGranted = false;
-  
+
   ConfigResult? _configResult;
   String _appStatus = 'loading'; // 'loading', 'no_model', 'error', 'ready'
 
   final TextEditingController _textController = TextEditingController();
   final List<ChatMessage> _messages = [];
   bool _isRecordingVoiceMessage = false;
-  
+
   CameraInference? _cameraInference;
   String _cameraInferenceResult = "Initializing ML...";
-  
+
   ChatInference? _chatInference;
   VoiceInference? _voiceInference;
 
@@ -284,19 +322,24 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
       _cameraGranted = camStatus.isGranted;
       _micGranted = micStatus.isGranted;
       _configResult = configResult;
-      
+
       if (configResult.error == 'no_model') {
         _appStatus = 'no_model';
       } else if (configResult.error != null) {
         _appStatus = 'error';
       } else {
         _appStatus = 'ready';
-        _isCameraActive = configResult.config?.inferenceMode == 'camera' || configResult.config?.modelPath != null;
-        
+        _isCameraActive =
+            configResult.config?.inferenceMode == 'camera' ||
+            configResult.config?.modelPath != null;
+
         // Initialize camera inference if we have a TFLite model
-        if (configResult.config?.modelPath != null && configResult.config!.modelPath!.endsWith('.tflite')) {
+        if (configResult.config?.modelPath != null &&
+            configResult.config!.modelPath!.endsWith('.tflite')) {
           _cameraInference = CameraInference();
-          _cameraInference!.initialize(configResult.config!.modelPath!, (result) {
+          _cameraInference!.initialize(configResult.config!.modelPath!, (
+            result,
+          ) {
             if (mounted) {
               setState(() {
                 _cameraInferenceResult = result;
@@ -304,18 +347,24 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
             }
           });
         }
-        
+
         // Initialize chat inference if we have an LLM path or inference mode is chat
-        final chatModelPath = configResult.config?.llmPath ?? 
-            (configResult.config?.inferenceMode == 'chat' ? configResult.config?.modelPath : null);
-            
-        if (chatModelPath != null && (chatModelPath.endsWith('.gguf') || chatModelPath.endsWith('.bin'))) {
+        final chatModelPath =
+            configResult.config?.llmPath ??
+            (configResult.config?.inferenceMode == 'chat'
+                ? configResult.config?.modelPath
+                : null);
+
+        if (chatModelPath != null &&
+            (chatModelPath.endsWith('.gguf') ||
+                chatModelPath.endsWith('.bin'))) {
           _chatInference = ChatInference();
           _chatInference!.initialize(chatModelPath);
         }
-        
+
         // Initialize voice inference
-        if (configResult.config?.inferenceMode == 'voice' && configResult.config?.modelPath != null) {
+        if (configResult.config?.inferenceMode == 'voice' &&
+            configResult.config?.modelPath != null) {
           _voiceInference = VoiceInference();
           _voiceInference!.initialize(configResult.config!.modelPath!);
         }
@@ -342,7 +391,12 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
         _voiceInference!.startListening((result) {
           if (mounted) {
             setState(() {
-              _messages.add(ChatMessage(text: 'Voice result: $result', role: MessageRole.ai));
+              _messages.add(
+                ChatMessage(
+                  text: 'Voice result: $result',
+                  role: MessageRole.ai,
+                ),
+              );
             });
           }
         });
@@ -356,42 +410,49 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
   void _sendMessage() {
     if (_textController.text.trim().isEmpty) return;
     HapticFeedback.lightImpact();
-    
+
     final prompt = _textController.text.trim();
 
     setState(() {
       _messages.add(ChatMessage(text: prompt, role: MessageRole.user));
       _textController.clear();
-      
-      _messages.add(ChatMessage(text: "", role: MessageRole.ai, isStreaming: true));
+
+      _messages.add(
+        ChatMessage(text: "", role: MessageRole.ai, isStreaming: true),
+      );
     });
 
     if (_chatInference != null) {
-      _chatInference!.generateText(prompt).listen((token) {
-        if (mounted) {
-          setState(() {
-            final lastIdx = _messages.length - 1;
-            final currentMsg = _messages[lastIdx];
-            _messages[lastIdx] = ChatMessage(
-              text: currentMsg.text + token,
-              role: MessageRole.ai,
-              isStreaming: true,
-            );
-          });
-        }
-      }, onDone: () {
-        if (mounted) {
-          setState(() {
-            final lastIdx = _messages.length - 1;
-            final currentMsg = _messages[lastIdx];
-            _messages[lastIdx] = ChatMessage(
-              text: currentMsg.text,
-              role: MessageRole.ai,
-              isStreaming: false,
-            );
-          });
-        }
-      });
+      _chatInference!
+          .generateText(prompt)
+          .listen(
+            (token) {
+              if (mounted) {
+                setState(() {
+                  final lastIdx = _messages.length - 1;
+                  final currentMsg = _messages[lastIdx];
+                  _messages[lastIdx] = ChatMessage(
+                    text: currentMsg.text + token,
+                    role: MessageRole.ai,
+                    isStreaming: true,
+                  );
+                });
+              }
+            },
+            onDone: () {
+              if (mounted) {
+                setState(() {
+                  final lastIdx = _messages.length - 1;
+                  final currentMsg = _messages[lastIdx];
+                  _messages[lastIdx] = ChatMessage(
+                    text: currentMsg.text,
+                    role: MessageRole.ai,
+                    isStreaming: false,
+                  );
+                });
+              }
+            },
+          );
     } else {
       // Mock stream finish after a delay
       Future.delayed(const Duration(seconds: 2), () {
@@ -418,12 +479,10 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
           children: [
             // Zone 1: Top Bar
             _buildTopBar(),
-            
+
             // Zone 2: Center Chat Interface
-            Expanded(
-              child: _buildChatInterface(),
-            ),
-            
+            Expanded(child: _buildChatInterface()),
+
             // Zone 3: Bottom Input Bar
             _buildBottomInputBar(),
           ],
@@ -436,21 +495,15 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     return Container(
       height: 56,
       decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: LokiColors.dividerGray, width: 1)),
+        border: Border(
+          bottom: BorderSide(color: LokiColors.dividerGray, width: 1),
+        ),
       ),
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          const Text(
-            'LokiAI',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: LokiColors.textPrimary,
-              letterSpacing: -0.5,
-            ),
-          ),
+          const LokiBrand(),
           Row(
             children: [
               _ControlIconButton(
@@ -471,7 +524,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                 semanticLabel: 'Toggle Live Mic',
               ),
             ],
-          )
+          ),
         ],
       ),
     );
@@ -479,15 +532,21 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
 
   Widget _buildChatInterface() {
     if (_appStatus == 'loading') {
-      return const Center(child: CircularProgressIndicator(color: LokiColors.textSecondary));
+      return const Center(
+        child: CircularProgressIndicator(color: LokiColors.textSecondary),
+      );
     }
-    
+
     if (_appStatus == 'no_model') {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.auto_awesome, color: LokiColors.textPrimary.withOpacity(0.8), size: 32),
+            Icon(
+              Icons.auto_awesome,
+              color: LokiColors.textPrimary.withOpacity(0.8),
+              size: 32,
+            ),
             const SizedBox(height: 16),
             const Text(
               'No model deployed yet.',
@@ -502,9 +561,14 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
         ),
       );
     }
-    
+
     if (_appStatus == 'error') {
-      return Center(child: Text('Error: ${_configResult?.error}', style: const TextStyle(color: LokiColors.accent)));
+      return Center(
+        child: Text(
+          'Error: ${_configResult?.error}',
+          style: const TextStyle(color: LokiColors.accent),
+        ),
+      );
     }
 
     if (_messages.isEmpty && !_isCameraActive) {
@@ -512,7 +576,11 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.auto_awesome, color: LokiColors.textPrimary.withOpacity(0.8), size: 32),
+            Icon(
+              Icons.auto_awesome,
+              color: LokiColors.textPrimary.withOpacity(0.8),
+              size: 32,
+            ),
             const SizedBox(height: 16),
             const Text(
               'How can I help?',
@@ -559,7 +627,11 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
               SizedBox(height: 12),
               Text(
                 'Camera permission required',
-                style: TextStyle(color: LokiColors.accent, fontSize: 14, fontWeight: FontWeight.w600),
+                style: TextStyle(
+                  color: LokiColors.accent,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
               SizedBox(height: 4),
               Text(
@@ -574,7 +646,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
 
     // Real camera preview with ValueNotifier fire detection
     return ValueListenableBuilder<bool>(
-      valueListenable: _cameraInference?.isFireDetected ?? ValueNotifier<bool>(false),
+      valueListenable:
+          _cameraInference?.isFireDetected ?? ValueNotifier<bool>(false),
       builder: (context, fireDetected, _) {
         return Container(
           margin: const EdgeInsets.only(bottom: 24),
@@ -592,7 +665,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
             child: Stack(
               fit: StackFit.expand,
               children: [
-                if (_cameraInference?.cameraController?.value.isInitialized == true)
+                if (_cameraInference?.cameraController?.value.isInitialized ==
+                    true)
                   CameraPreview(_cameraInference!.cameraController!)
                 else
                   const Center(
@@ -601,7 +675,13 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                       children: [
                         Icon(Icons.camera_alt, color: LokiColors.textSecondary),
                         SizedBox(height: 8),
-                        Text('Camera Initializing...', style: TextStyle(color: LokiColors.textSecondary, fontSize: 13)),
+                        Text(
+                          'Camera Initializing...',
+                          style: TextStyle(
+                            color: LokiColors.textSecondary,
+                            fontSize: 13,
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -613,12 +693,20 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                   child: Container(
                     padding: const EdgeInsets.all(8),
                     decoration: BoxDecoration(
-                      color: fireDetected ? LokiColors.accent.withOpacity(0.85) : Colors.black54,
+                      color: fireDetected
+                          ? LokiColors.accent.withOpacity(0.85)
+                          : Colors.black54,
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
-                      fireDetected ? '\uD83D\uDD25 FIRE DETECTED' : _cameraInferenceResult,
-                      style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                      fireDetected
+                          ? '\uD83D\uDD25 FIRE DETECTED'
+                          : _cameraInferenceResult,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                      ),
                       textAlign: TextAlign.center,
                     ),
                   ),
@@ -637,32 +725,51 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 24),
       child: Row(
-        mainAxisAlignment: isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+        mainAxisAlignment: isUser
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           if (!isUser) ...[
-            const Icon(Icons.auto_awesome, size: 16, color: LokiColors.textSecondary),
+            const Icon(
+              Icons.auto_awesome,
+              size: 16,
+              color: LokiColors.textSecondary,
+            ),
             const SizedBox(width: 12),
           ],
           Flexible(
             child: isUser
                 ? Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
                     decoration: BoxDecoration(
                       color: LokiColors.surface2,
-                      borderRadius: BorderRadius.circular(16).copyWith(bottomRight: const Radius.circular(4)),
+                      borderRadius: BorderRadius.circular(
+                        16,
+                      ).copyWith(bottomRight: const Radius.circular(4)),
                     ),
                     child: Text(
                       message.text,
-                      style: const TextStyle(color: LokiColors.textPrimary, fontSize: 15, height: 1.4),
+                      style: const TextStyle(
+                        color: LokiColors.textPrimary,
+                        fontSize: 15,
+                        height: 1.4,
+                      ),
                     ),
                   )
                 : message.isStreaming
-                    ? _buildThinkingIndicator()
-                    : Text(
-                        message.text,
-                        style: const TextStyle(color: LokiColors.textPrimary, fontSize: 15, height: 1.4),
-                      ),
+                ? _buildThinkingIndicator()
+                : Text(
+                    message.text,
+                    style: const TextStyle(
+                      color: LokiColors.textPrimary,
+                      fontSize: 15,
+                      height: 1.4,
+                    ),
+                  ),
           ),
         ],
       ),
@@ -677,7 +784,10 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
         children: [
           Icon(Icons.circle, size: 8, color: LokiColors.accent),
           SizedBox(width: 6),
-          Text('Generating...', style: TextStyle(color: LokiColors.textSecondary, fontSize: 13)),
+          Text(
+            'Generating...',
+            style: TextStyle(color: LokiColors.textSecondary, fontSize: 13),
+          ),
         ],
       ),
     );
@@ -687,7 +797,9 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     return Container(
       decoration: const BoxDecoration(
         color: LokiColors.baseBlack,
-        border: Border(top: BorderSide(color: LokiColors.dividerGray, width: 1)),
+        border: Border(
+          top: BorderSide(color: LokiColors.dividerGray, width: 1),
+        ),
       ),
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
       child: Column(
@@ -713,15 +825,30 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(_configResult?.config?.displayLabel ?? 'No model', style: const TextStyle(color: LokiColors.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
+                      Text(
+                        _configResult?.config?.displayLabel ?? 'No model',
+                        style: const TextStyle(
+                          color: LokiColors.textPrimary,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
                       const SizedBox(width: 4),
-                      Icon(Icons.keyboard_arrow_down, size: 16, color: LokiColors.textSecondary),
+                      Icon(
+                        Icons.keyboard_arrow_down,
+                        size: 16,
+                        color: LokiColors.textSecondary,
+                      ),
                     ],
                   ),
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.attach_file, color: LokiColors.textSecondary, size: 20),
+                icon: const Icon(
+                  Icons.attach_file,
+                  color: LokiColors.textSecondary,
+                  size: 20,
+                ),
                 onPressed: () {},
                 tooltip: 'Attach File',
                 padding: EdgeInsets.zero,
@@ -730,7 +857,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
             ],
           ),
           const SizedBox(height: 12),
-          
+
           // Row 2: Input Row
           Row(
             crossAxisAlignment: CrossAxisAlignment.end,
@@ -744,7 +871,12 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                     _voiceInference!.startListening((result) {
                       if (mounted) {
                         setState(() {
-                          _messages.add(ChatMessage(text: "Voice ML Output: $result", role: MessageRole.ai));
+                          _messages.add(
+                            ChatMessage(
+                              text: "Voice ML Output: $result",
+                              role: MessageRole.ai,
+                            ),
+                          );
                         });
                       }
                     });
@@ -763,18 +895,22 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     border: Border.all(
-                      color: _isRecordingVoiceMessage ? LokiColors.accent : LokiColors.dividerGray,
+                      color: _isRecordingVoiceMessage
+                          ? LokiColors.accent
+                          : LokiColors.dividerGray,
                       width: _isRecordingVoiceMessage ? 2 : 1,
                     ),
                   ),
                   child: Icon(
                     Icons.mic,
-                    color: _isRecordingVoiceMessage ? LokiColors.accent : LokiColors.textSecondary,
+                    color: _isRecordingVoiceMessage
+                        ? LokiColors.accent
+                        : LokiColors.textSecondary,
                     size: 20,
                   ),
                 ),
               ),
-              
+
               // Text Field
               Expanded(
                 child: Container(
@@ -787,19 +923,29 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                     controller: _textController,
                     maxLines: 5,
                     minLines: 1,
-                    style: const TextStyle(color: LokiColors.textPrimary, fontSize: 15),
+                    style: const TextStyle(
+                      color: LokiColors.textPrimary,
+                      fontSize: 15,
+                    ),
                     decoration: const InputDecoration(
                       hintText: 'Message Loki...',
-                      hintStyle: TextStyle(color: LokiColors.textSecondary, fontSize: 15),
+                      hintStyle: TextStyle(
+                        color: LokiColors.textSecondary,
+                        fontSize: 15,
+                      ),
                       border: InputBorder.none,
-                      contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 12,
+                      ),
                     ),
-                    onChanged: (text) => setState(() {}), // rebuilds to update send button state
+                    onChanged: (text) =>
+                        setState(() {}), // rebuilds to update send button state
                   ),
                 ),
               ),
               const SizedBox(width: 8),
-              
+
               // Send Button
               ValueListenableBuilder<TextEditingValue>(
                 valueListenable: _textController,
@@ -811,16 +957,22 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                       padding: const EdgeInsets.all(10),
                       margin: const EdgeInsets.only(bottom: 4),
                       decoration: BoxDecoration(
-                        color: hasText ? LokiColors.textPrimary : Colors.transparent,
+                        color: hasText
+                            ? LokiColors.textPrimary
+                            : Colors.transparent,
                         shape: BoxShape.circle,
                         border: Border.all(
-                          color: hasText ? LokiColors.textPrimary : LokiColors.dividerGray,
+                          color: hasText
+                              ? LokiColors.textPrimary
+                              : LokiColors.dividerGray,
                           width: 1,
                         ),
                       ),
                       child: Icon(
                         Icons.arrow_upward,
-                        color: hasText ? LokiColors.baseBlack : LokiColors.textSecondary,
+                        color: hasText
+                            ? LokiColors.baseBlack
+                            : LokiColors.textSecondary,
                         size: 20,
                       ),
                     ),
@@ -866,7 +1018,9 @@ class _ControlIconButton extends StatelessWidget {
             color: isActive ? LokiColors.textPrimary : Colors.transparent,
             shape: BoxShape.circle,
             border: Border.all(
-              color: isGranted ? (isActive ? LokiColors.textPrimary : LokiColors.textPrimary) : LokiColors.dividerGray,
+              color: isGranted
+                  ? (isActive ? LokiColors.textPrimary : LokiColors.textPrimary)
+                  : LokiColors.dividerGray,
               width: 1,
             ),
           ),
@@ -875,7 +1029,9 @@ class _ControlIconButton extends StatelessWidget {
             children: [
               Icon(
                 isActive ? activeIcon : icon,
-                color: isGranted ? (isActive ? LokiColors.baseBlack : LokiColors.textPrimary) : LokiColors.dividerGray,
+                color: isGranted
+                    ? (isActive ? LokiColors.baseBlack : LokiColors.textPrimary)
+                    : LokiColors.dividerGray,
                 size: 20,
               ),
               if (isActive)

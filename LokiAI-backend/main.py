@@ -1318,7 +1318,7 @@ async def system_info(request: Request):
         dashboard_base = DASHBOARD_URL.rstrip("/")
     elif os.getenv("RENDER") or "onrender.com" in str(request.base_url):
         # If backend is on Render, dashboard is on Vercel
-        dashboard_base = "https://lokiai-v11.vercel.app"
+        dashboard_base = CUSTOM_DOMAIN_ORIGIN
     elif lan_ip:
         dashboard_base = f"http://{lan_ip}:{dashboard_port}"
     else:

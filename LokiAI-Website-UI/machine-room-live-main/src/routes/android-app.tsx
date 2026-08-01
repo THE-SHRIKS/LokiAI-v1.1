@@ -1,7 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 
-const APK_DOWNLOAD_URL =
-  "https://github.com/The-Shriks/LokiAI/releases/download/v1.0-android/app-release.apk";
+const APK_DOWNLOAD_URL = "https://lokiai.onrender.com/apk/download";
 
 export const Route = createFileRoute("/android-app")({
   head: () => ({
