@@ -6,18 +6,23 @@
 // You can pass additional config via defineConfig({ vite: { ... }, etc... }) if needed.
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
-export default defineConfig(({ mode }) => ({
+const isVercelDeployment = process.env.VERCEL === "1";
+
+export default defineConfig({
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
     server: { entry: "server" },
+    // Vercel Services removes /workspace before invoking this service. The
+    // browser-facing router mount is selected from Vite's BASE_URL in router.tsx.
+    router: { basepath: "/" },
   },
   vite: {
     // The Vercel Services deployment mounts this application at /workspace.
     // Keep the local developer server at / so existing local workflows work.
-    base: mode === "production" ? "/workspace/" : "/",
+    base: isVercelDeployment ? "/workspace/" : "/",
     // No source maps in the shipped production bundle — don't hand out an
     // unminified map of the app's real source to anyone who opens DevTools.
     build: { sourcemap: false },
   },
-}));
+});

@@ -4,11 +4,15 @@ import { routeTree } from "./routeTree.gen";
 
 export const getRouter = () => {
   const queryClient = new QueryClient();
+  const browserBasepath =
+    typeof window !== "undefined" && import.meta.env.BASE_URL === "/workspace/"
+      ? "/workspace"
+      : "/";
 
   const router = createRouter({
     routeTree,
     context: { queryClient },
-    basepath: import.meta.env.PROD ? "/workspace" : "/",
+    basepath: browserBasepath,
     scrollRestoration: true,
     defaultPreloadStaleTime: 0,
   });
