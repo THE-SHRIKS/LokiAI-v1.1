@@ -2,10 +2,12 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "marketing": {
-      "root": "LokiAI-Website-UI/machine-room-live-main"
+      "root": "LokiAI-Website-UI/machine-room-live-main",
+      "framework": "tanstack-start"
     },
     "workspace": {
-      "root": "LokiAI-Desktop/stellar-dashboard-builder-main"
+      "root": "LokiAI-Desktop/stellar-dashboard-builder-main",
+      "framework": "tanstack-start"
     }
   },
   "rewrites": [
