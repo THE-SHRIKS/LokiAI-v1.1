@@ -42,26 +42,22 @@ export function Footer() {
               <Logo className="h-12 w-auto" />
             </div>
             <p className="mt-4 max-w-xs text-sm text-muted-foreground">
-              An AI-native deployment and operations layer for Edge AI and IoT environments. Built by THE
-              SHRIKS.
-            </p>
-            <p className="hidden">
-              Android agent available · more device classes in development
+              An AI-native deployment and operations layer for Edge AI and IoT environments. Built by THE SHRIKS.
             </p>
           </div>
-          {COLUMNS.map((col) => (
-            <nav key={col.title} aria-label={col.title}>
+          {COLUMNS.map((column) => (
+            <nav key={column.title} aria-label={column.title}>
               <h2 className="font-mono text-[11px] uppercase tracking-[0.24em] text-gold-dim">
-                {col.title}
+                {column.title}
               </h2>
               <ul className="mt-4 space-y-3">
-                {col.links.map((l) => (
-                  <li key={l.to}>
+                {column.links.map((link) => (
+                  <li key={link.to}>
                     <Link
-                      to={l.to}
+                      to={link.to}
                       className="text-sm text-muted-foreground transition-colors hover:text-foreground"
                     >
-                      {l.label}
+                      {link.label}
                     </Link>
                   </li>
                 ))}
@@ -69,12 +65,9 @@ export function Footer() {
             </nav>
           ))}
         </div>
-        <div className="mt-16 flex flex-col gap-3 border-t border-border pt-8 sm:flex-row sm:items-center sm:justify-between">
+        <div className="mt-16 border-t border-border pt-8">
           <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-            © {new Date().getFullYear()} THE SHRIKS · LokiAI
-          </p>
-          <p className="hidden">
-            Local inference · Verified artifacts · Device-scoped credentials
+            &copy; {new Date().getFullYear()} THE SHRIKS · LokiAI
           </p>
         </div>
       </div>
