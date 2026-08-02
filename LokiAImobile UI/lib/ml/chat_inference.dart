@@ -33,8 +33,9 @@ class ChatInference {
       print('CHAT: initializing GGUF model: $modelPath');
       final result = await Fllama.instance()?.initContext(
         modelPath,
-        nCtx: 512,
-        nThreads: 6,
+        // Conservative Android defaults reduce native startup memory pressure.
+        nCtx: 256,
+        nThreads: 2,
       );
       final rawId = result?['contextId'];
       if (rawId is num) {

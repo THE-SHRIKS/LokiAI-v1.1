@@ -408,40 +408,10 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     final config = configResult.config;
     if (configResult.error != null || config == null) return;
 
-    // Initialize outside setState and await every native setup. This turns a
-    // bad/unsupported model into a visible app error instead of an unhandled
-    // asynchronous exception that can terminate the Android process.
-    try {
-      if (config.inferenceMode == 'camera' &&
-          config.modelPath.endsWith('.tflite')) {
-        final camera = CameraInference();
-        _cameraInference = camera;
-        await camera.initialize(config.modelPath, (result) {
-          if (mounted) setState(() => _cameraInferenceResult = result);
-        });
-      }
-
-      final chatModelPath =
-          config.llmPath ??
-          (config.inferenceMode == 'chat' ? config.modelPath : null);
-      if (chatModelPath != null &&
-          (chatModelPath.endsWith('.gguf') || chatModelPath.endsWith('.bin'))) {
-        final chat = ChatInference();
-        _chatInference = chat;
-        await chat.initialize(chatModelPath);
-      }
-
-      if (config.inferenceMode == 'voice' &&
-          config.modelPath.endsWith('.tflite')) {
-        final voice = VoiceInference();
-        _voiceInference = voice;
-        await voice.initialize(config.modelPath);
-      }
-    } catch (e) {
-      debugPrint('MODEL: failed to initialise ${config.modelName}: $e');
-      await _disposeInferenceRuntimes();
-      if (mounted) setState(() => _appStatus = 'error');
-    }
+    // Do not load a native TFLite/GGUF runtime during app boot. A malformed or
+    // incompatible model can fail below the Dart exception boundary and kill
+    // Android before the user can even reopen the app. Runtimes are loaded
+    // only when the user starts the matching feature (send, camera, or mic).
   }
 
   void _toggleCamera() {
@@ -486,7 +456,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     }
   }
 
-  void _sendMessage() {
+  Future<void> _sendMessage() async {
     if (_textController.text.trim().isEmpty) return;
     HapticFeedback.lightImpact();
 
@@ -500,6 +470,21 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
         ChatMessage(text: "", role: MessageRole.ai, isStreaming: true),
       );
     });
+
+    if (_chatInference == null) {
+      final config = _configResult?.config;
+      final chatPath = config?.llmPath ??
+          (config?.inferenceMode == 'chat' ? config?.modelPath : null);
+      if (chatPath != null &&
+          (chatPath.endsWith('.gguf') || chatPath.endsWith('.bin'))) {
+        // Native loading is explicit and only happens after the app is fully
+        // interactive. ChatInference converts ordinary load errors into a
+        // visible reply instead of terminating the UI.
+        final chat = ChatInference();
+        _chatInference = chat;
+        await chat.initialize(chatPath);
+      }
+    }
 
     if (_chatInference != null) {
       _chatInference!
