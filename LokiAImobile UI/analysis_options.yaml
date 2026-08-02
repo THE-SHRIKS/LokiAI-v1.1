@@ -9,6 +9,16 @@
 # packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  # packages/fllama is a vendored third-party plugin. Its bundled `example/`
+  # app is not built, not shipped, and does not resolve here (it needs get,
+  # isar and other packages this project does not depend on) — it contributed
+  # ~2000 of the 2030 issues `flutter analyze` reported, which made the static
+  # analysis gate useless for the code we actually ship. The plugin's own
+  # `lib/`, which IS compiled into the app, is still analyzed.
+  exclude:
+    - packages/fllama/example/**
+
 linter:
   # The lint rules applied to this project can be customized in the
   # section below to disable rules from the `package:flutter_lints/flutter.yaml`

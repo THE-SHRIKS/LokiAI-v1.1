@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:fllama/fllama.dart';
-import 'package:fllama/fllama_type.dart';
 
 /// GGUF chat inference via fllama (llama.cpp FFI).
 ///
@@ -44,7 +43,7 @@ class ChatInference {
         print('CHAT: fllama initialized, contextId=$_contextId');
       } else {
         _initError = 'Model failed to load (no context returned). '
-            'It may be incompatible with this device — try a different '
+            'It may be incompatible with this device -- try a different '
             'model from the dashboard.';
         // ignore: avoid_print
         print('CHAT: init returned no contextId: $result');
@@ -75,7 +74,7 @@ class ChatInference {
       return;
     }
     if (_generating) {
-      controller.add('Still generating the previous answer — try again in a moment.');
+      controller.add('Still generating the previous answer -- try again in a moment.');
       await controller.close();
       return;
     }
@@ -128,7 +127,7 @@ class ChatInference {
           print('CHAT: no token within ${_firstTokenTimeout.inSeconds}s');
           if (!controller.isClosed) {
             controller.add('The model did not respond in time. '
-                'It may be too large for this phone — try a smaller model.');
+                'It may be too large for this phone -- try a smaller model.');
           }
           Fllama.instance()?.stopCompletion(contextId: _contextId!);
           finish();

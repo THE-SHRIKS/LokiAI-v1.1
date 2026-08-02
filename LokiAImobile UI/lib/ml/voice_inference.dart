@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:record/record.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
@@ -10,101 +11,125 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 /// TFLite audio classification on live microphone input.
 ///
 /// Model-generic: input/output tensor shapes are introspected at load time.
-/// Class names come from the bundled AudioSet label map when the model's
-/// class count matches (YAMNet-style, 521 classes); any other class count
-/// falls back to numeric class ids. Real inference output only.
+/// Class names come from the bundled AudioSet label map when the model's class
+/// count matches (YAMNet-style, 521 classes); any other class count falls back
+/// to numeric class ids. Real inference output only.
+///
+/// Every entry point returns a user-readable error string instead of throwing
+/// or silently swallowing, so `MicFeatureController` can always reach a
+/// terminal state. Permission is NOT requested here — the controller owns it.
 class VoiceInference {
-  final AudioRecorder _audioRecorder = AudioRecorder();
+  AudioRecorder? _audioRecorder;
   Interpreter? _interpreter;
-  String? _loadError;
   bool _isRecording = false;
+  bool _disposed = false;
   Map<int, String> _labels = const {};
-  StreamSubscription? _audioSubscription;
+  StreamSubscription<List<int>>? _audioSubscription;
 
-  Future<void> initialize(String modelPath) async {
+  AudioRecorder get _recorder => _audioRecorder ??= AudioRecorder();
+
+  /// Loads [modelPath]. Returns null on success, or a user-readable reason.
+  Future<String?> loadModel(String modelPath) async {
+    if (_disposed) return 'The microphone was closed before the model loaded.';
     try {
-      _interpreter = await Interpreter.fromFile(File(modelPath));
-      _interpreter!.allocateTensors();
-      // ignore: avoid_print
-      print(
+      final file = File(modelPath);
+      if (!await file.exists()) {
+        return 'The deployed audio model file is missing. '
+            'Re-deploy it from the dashboard.';
+      }
+      final interpreter = Interpreter.fromFile(file);
+      interpreter.allocateTensors();
+      _interpreter = interpreter;
+      debugPrint(
         'VOICE: model loaded: $modelPath '
-        'in=${_interpreter!.getInputTensor(0).shape} '
-        'out=${_interpreter!.getOutputTensor(0).shape}',
+        'in=${interpreter.getInputTensor(0).shape} '
+        'out=${interpreter.getOutputTensor(0).shape}',
       );
     } catch (e) {
-      _loadError =
-          'This audio model could not load: $e. '
+      debugPrint('VOICE: failed to load audio model: $e');
+      return 'This audio model could not load: $e. '
           'Try a different one from the dashboard.';
-      // ignore: avoid_print
-      print('VOICE: failed to load audio model: $e');
-      return;
     }
 
     try {
       final raw = await rootBundle.loadString('assets/audioset_labels.txt');
       final decoded = jsonDecode(raw) as Map<String, dynamic>;
       _labels = decoded.map((k, v) => MapEntry(int.parse(k), v.toString()));
-      // ignore: avoid_print
-      print('VOICE: ${_labels.length} AudioSet labels loaded');
+      debugPrint('VOICE: ${_labels.length} AudioSet labels loaded');
     } catch (e) {
-      // ignore: avoid_print
-      print('VOICE: labels unavailable ($e) — numeric class ids will be used');
+      debugPrint('VOICE: labels unavailable ($e) — numeric class ids used');
       _labels = const {};
+    }
+    return null;
+  }
+
+  /// Whether the platform reports a usable input device. `record` surfaces this
+  /// through hasPermission()/available encoders; a throw here means no
+  /// microphone rather than a denied permission (which the controller checks
+  /// before ever calling this).
+  Future<bool> hasMicrophone() async {
+    if (_disposed) return false;
+    try {
+      return await _recorder.isEncoderSupported(AudioEncoder.pcm16bits);
+    } catch (e) {
+      debugPrint('VOICE: microphone capability check failed: $e');
+      return false;
     }
   }
 
-  Future<void> startListening(Function(String) onResult) async {
-    if (_interpreter == null) {
-      onResult(_loadError ?? 'Audio model is not loaded yet.');
-      return;
-    }
-    if (!await _audioRecorder.hasPermission()) {
-      onResult('Permission denied for microphone');
-      return;
-    }
-    if (_isRecording) return;
-    _isRecording = true;
+  /// Starts streaming and inference. Returns null on success, or a
+  /// user-readable reason. Never throws.
+  Future<String?> startListening(void Function(String) onResult) async {
+    if (_disposed) return 'The microphone was already closed.';
+    final interpreter = _interpreter;
+    if (interpreter == null) return 'The audio model is not loaded.';
+    // A second session on the same recorder is what produced overlapping
+    // streams on rapid taps.
+    if (_isRecording) return null;
 
     try {
-      final stream = await _audioRecorder.startStream(
+      final stream = await _recorder.startStream(
         const RecordConfig(
           encoder: AudioEncoder.pcm16bits,
           sampleRate: 16000,
           numChannels: 1,
         ),
       );
+      _isRecording = true;
 
       // Samples needed by the model (e.g. YAMNet: 15600 = 0.975s @ 16kHz).
-      final wanted = _interpreter!
-          .getInputTensor(0)
-          .shape
-          .reduce((a, b) => a * b);
+      final wanted =
+          interpreter.getInputTensor(0).shape.reduce((a, b) => a * b);
       final bytesNeeded = wanted * 2; // PCM16 = 2 bytes/sample
       final audioBuffer = <int>[];
 
       _audioSubscription = stream.listen(
         (data) {
-          if (!_isRecording) return;
+          if (!_isRecording || _disposed) return;
           audioBuffer.addAll(data);
-          if (audioBuffer.length >= bytesNeeded) {
+          while (audioBuffer.length >= bytesNeeded) {
             final chunk = audioBuffer.sublist(0, bytesNeeded);
             audioBuffer.removeRange(0, bytesNeeded);
             _runInference(chunk, onResult);
           }
         },
         onError: (Object e) {
-          onResult('Microphone stream error: $e');
+          debugPrint('VOICE: stream error: $e');
+          if (!_disposed) onResult('Microphone stream error: $e');
         },
+        cancelOnError: false,
       );
+      return null;
     } catch (e) {
       _isRecording = false;
-      onResult('Could not start recording: $e');
+      debugPrint('VOICE: could not start recording: $e');
+      return 'Could not start recording: $e';
     }
   }
 
-  void _runInference(List<int> pcmBytes, Function(String) onResult) {
+  void _runInference(List<int> pcmBytes, void Function(String) onResult) {
     final interp = _interpreter;
-    if (interp == null) return;
+    if (interp == null || _disposed) return;
     try {
       final inShape = interp.getInputTensor(0).shape;
       final wanted = inShape.reduce((a, b) => a * b);
@@ -125,7 +150,6 @@ class VoiceInference {
 
       interp.run(input, output);
 
-      // Flatten scores regardless of output rank.
       final scores = <double>[];
       void flatten(dynamic v) {
         if (v is num) {
@@ -152,31 +176,53 @@ class VoiceInference {
       final text = top
           .map((i) => '${nameOf(i)} ${(scores[i] * 100).toStringAsFixed(0)}%')
           .join(' · ');
-      // ignore: avoid_print
-      print('VOICE: result -> $text');
+      debugPrint('VOICE: result -> $text');
       onResult(text);
     } catch (e) {
-      // ignore: avoid_print
-      print('VOICE: inference error: $e');
+      debugPrint('VOICE: inference error: $e');
       onResult('Voice inference error: $e');
     }
   }
 
   Future<void> stopListening() async {
     _isRecording = false;
-    await _audioSubscription?.cancel();
+    final subscription = _audioSubscription;
     _audioSubscription = null;
     try {
-      await _audioRecorder.stop();
-    } catch (_) {}
+      await subscription?.cancel();
+    } catch (e) {
+      debugPrint('VOICE: cancelling audio stream failed: $e');
+    }
+    final recorder = _audioRecorder;
+    if (recorder == null) return;
+    try {
+      if (await recorder.isRecording()) {
+        await recorder.stop();
+      }
+    } catch (e) {
+      debugPrint('VOICE: stopping recorder failed: $e');
+    }
   }
 
   Future<void> dispose() async {
-    _isRecording = false;
-    await _audioSubscription?.cancel();
-    _audioSubscription = null;
-    await _audioRecorder.dispose();
-    _interpreter?.close();
+    if (_disposed) return;
+    _disposed = true;
+    // Active recording must be stopped before the recorder is torn down.
+    await stopListening();
+    final recorder = _audioRecorder;
+    _audioRecorder = null;
+    if (recorder != null) {
+      try {
+        await recorder.dispose();
+      } catch (e) {
+        debugPrint('VOICE: recorder dispose failed: $e');
+      }
+    }
+    try {
+      _interpreter?.close();
+    } catch (e) {
+      debugPrint('VOICE: interpreter close failed: $e');
+    }
     _interpreter = null;
   }
 }
