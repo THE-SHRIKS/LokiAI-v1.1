@@ -1181,9 +1181,15 @@ async def _issue_otp(conn, user_id, email: str, name: str, purpose: str = "verif
 
 @app.get("/health")
 def health_check():
+    # The deployed commit is reported so a release can be verified from
+    # outside, rather than assumed from a green deploy page. Render injects
+    # RENDER_GIT_COMMIT; anywhere else this is "unknown" and says so.
     return {
         "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
+        "branch": os.getenv("RENDER_GIT_BRANCH", "unknown"),
+        "service": os.getenv("RENDER_SERVICE_NAME", "local"),
     }
 
 

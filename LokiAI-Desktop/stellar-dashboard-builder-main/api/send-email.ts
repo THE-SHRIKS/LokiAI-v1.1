@@ -25,7 +25,10 @@ export default async function handler(req: any, res: any) {
     return;
   }
 
-  const { to, subject, text, html } = req.body ?? {};
+  // replyTo carries the submitting account's address for feedback mail. The
+  // From header stays the verified application sender; forging From is what
+  // gets a domain's mail rejected or spam-filed.
+  const { to, subject, text, html, replyTo } = req.body ?? {};
   if (!to || !subject || !text) {
     res.status(422).json({ error: "to, subject, and text are required" });
     return;
@@ -50,14 +53,24 @@ export default async function handler(req: any, res: any) {
       secure: false, // STARTTLS on 587, not implicit TLS
       auth: { user, pass },
     });
-    await transporter.sendMail({
+    const info = await transporter.sendMail({
       from: `${fromName} <${fromEmail}>`,
       to,
       subject,
       text,
       html,
+      ...(typeof replyTo === "string" && replyTo ? { replyTo } : {}),
     });
-    res.status(200).json({ sent: true });
+    // messageId and the SMTP server's own response line are returned so the
+    // caller can record what the transport actually said, rather than
+    // inferring delivery from a bare 200.
+    res.status(200).json({
+      sent: true,
+      messageId: info?.messageId ?? null,
+      accepted: info?.accepted ?? [],
+      rejected: info?.rejected ?? [],
+      response: info?.response ?? null,
+    });
   } catch (err: any) {
     res.status(502).json({ error: `Email relay send failed: ${err?.message ?? String(err)}` });
   }
