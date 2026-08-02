@@ -10,7 +10,8 @@
       "framework": "tanstack-start"
     },
     "relay": {
-      "root": "LokiAI-relay"
+      "root": "LokiAI-relay",
+      "entrypoint": "api/send-email.ts"
     }
   },
   "redirects": [
