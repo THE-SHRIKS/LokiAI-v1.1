@@ -9,6 +9,7 @@ import {
   getDevices,
   getMe,
   assistantChat,
+  waitForRun,
   createDeployment,
   getDeployment,
   inferenceModeForTask,
@@ -244,10 +245,16 @@ function Index() {
 
     try {
       const reply = await assistantChat(target.id, text, history);
+      // A turn that came back queued is already persisted server-side; it is
+      // finished by polling its run rather than by holding this request open.
+      const resolved =
+        reply.run_status === "queued" && reply.run_id
+          ? await waitForRun(reply.run_id)
+          : reply;
       updateSessionMsg(sessionId, replyId, {
         pending: false,
-        content: reply.response,
-        recommendations: reply.search_results ?? [],
+        content: resolved.response,
+        recommendations: resolved.search_results ?? [],
       });
     } catch (e) {
       updateSessionMsg(sessionId, replyId, {

@@ -300,6 +300,38 @@ export interface ModelRecommendation {
   // (an upload or a previously-deployed model) rather than a fresh
   // HuggingFace search result — deploy via this direct URL instead of id.
   download_url?: string;
+
+  // Sourced explanation, guaranteed non-empty by the backend. Optional here
+  // only so a response from an older backend still type-checks during a
+  // rolling deploy.
+  model_id?: string;
+  display_name?: string;
+  capability?: string;
+  description?: string;
+  why_recommended?: string;
+  estimated_device_fit?: "comfortable" | "good" | "tight" | "over budget" | "unknown";
+  /** Which metadata source the description came from, e.g. huggingface_model_card. */
+  source?: string;
+  source_url?: string;
+  /** The planned capability this model was selected to satisfy. */
+  requested_capability?: string;
+}
+
+/** Recommendations grouped by the capability the user asked for, so a request
+ *  for "a vision model and a chat model" is answered as two labelled sets
+ *  rather than one undifferentiated list. */
+export interface GroupedRecommendation {
+  capability: string;
+  requested_quantity: number;
+  models: ModelRecommendation[];
+}
+
+/** A capability in the plan that could not be fulfilled. The other tasks in
+ *  the same request still complete. */
+export interface TaskFailure {
+  capability: string;
+  error_code: string;
+  message: string;
 }
 
 /** Stable, machine-readable outcome codes from the assistant. `null` on a
@@ -324,6 +356,14 @@ export interface AssistantReply {
   action: string | null;
   search_results: ModelRecommendation[];
   error_code?: AssistantErrorCode | null;
+  grouped_results?: GroupedRecommendation[];
+  task_failures?: TaskFailure[];
+  /** Durable run identity. Poll GET /assistant/runs/{run_id} when
+   *  run_status is "queued" — the turn is persisted and will finish. */
+  run_id?: string;
+  conversation_id?: string;
+  run_status?: "queued" | "routing" | "generating" | "completed" | "failed" | "cancelled";
+  correlation_id?: string;
 }
 
 export interface ConversationTurn {
@@ -335,6 +375,7 @@ export async function assistantChat(
   deviceId: string,
   message: string,
   conversationHistory?: ConversationTurn[],
+  options?: { conversationId?: string; idempotencyKey?: string },
 ) {
   return request<AssistantReply>("/assistant/chat", {
     method: "POST",
@@ -342,8 +383,49 @@ export async function assistantChat(
       device_id: deviceId,
       message,
       ...(conversationHistory?.length ? { conversation_history: conversationHistory } : {}),
+      ...(options?.conversationId ? { conversation_id: options.conversationId } : {}),
+      // A stable key per submission means a network retry returns the original
+      // run instead of sending the message twice.
+      idempotency_key: options?.idempotencyKey ?? crypto.randomUUID(),
     }),
   });
+}
+
+export async function getRun(runId: string) {
+  return request<AssistantReply & { run_status: string }>(
+    `/assistant/runs/${runId}`,
+  );
+}
+
+/**
+ * Polls a queued run to a terminal state.
+ *
+ * The backend serialises runs per conversation, so a message sent while an
+ * earlier one is still generating comes back as "queued" with a run id rather
+ * than blocking a socket. This is the durable-polling half of that contract:
+ * the message is never lost, and the UI always reaches a terminal state.
+ */
+export async function waitForRun(
+  runId: string,
+  { timeoutMs = 120_000, intervalMs = 1_500 } = {},
+): Promise<AssistantReply> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const run = await getRun(runId);
+    if (run.run_status !== "queued" && run.run_status !== "routing" &&
+        run.run_status !== "generating") {
+      return run;
+    }
+    if (Date.now() >= deadline) {
+      return {
+        ...run,
+        response:
+          "That message is taking unusually long. It is saved — reopen this " +
+          "conversation shortly to see the answer.",
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 // ── Deployments ──────────────────────────────────────────────────────────────

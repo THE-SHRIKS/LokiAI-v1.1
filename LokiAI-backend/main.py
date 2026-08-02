@@ -158,6 +158,90 @@ async def _run_migrations(pool: asyncpg.Pool):
         await conn.execute("CREATE INDEX IF NOT EXISTS feedback_correlation_idx ON feedback (correlation_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS feedback_outbox_due_idx ON feedback_email_outbox (status, next_attempt_at)")
 
+        # Normalised model descriptions. Downloading the same model card on
+        # every request is the reason descriptions were dropped rather than
+        # computed; caching them makes the section 11 contract affordable.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS model_descriptions (
+                model_id    TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                source_url  TEXT,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        # Conversation / message / run lifecycle.
+        #
+        # Nothing about a chat turn was persisted before this: history lived in
+        # the browser's localStorage and a request that died mid-flight took the
+        # user's message with it. These tables make a submitted message durable
+        # before inference starts, give every turn an explicit terminal status,
+        # and let a restarted process recover runs that were still in flight.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id   UUID,
+                title       TEXT,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS conversations_user_idx "
+            "ON conversations (user_id, updated_at DESC)"
+        )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                role            TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                run_id          UUID,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS chat_messages_conversation_idx "
+            "ON chat_messages (conversation_id, created_at)"
+        )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_runs (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id       UUID,
+                status          TEXT NOT NULL DEFAULT 'queued',
+                idempotency_key TEXT NOT NULL,
+                correlation_id  TEXT NOT NULL,
+                user_message    TEXT NOT NULL,
+                response        JSONB,
+                error_code      TEXT,
+                error_message   TEXT,
+                claimed_by      TEXT,
+                claimed_at      TIMESTAMPTZ,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at     TIMESTAMPTZ
+            )
+        """)
+        # Idempotency is per account, so a network retry of the same submission
+        # returns the original run instead of creating a duplicate message.
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS chat_runs_idempotency_idx "
+            "ON chat_runs (user_id, idempotency_key)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS chat_runs_conversation_idx "
+            "ON chat_runs (conversation_id, created_at)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS chat_runs_active_idx "
+            "ON chat_runs (status, created_at) "
+            "WHERE status IN ('queued', 'routing', 'generating')"
+        )
+
 
 async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> asyncpg.Pool:
     """Neon's serverless compute auto-suspends after inactivity and takes a
@@ -230,22 +314,39 @@ async def lifespan(app: FastAPI):
         reset = await conn.execute("UPDATE devices SET status = 'offline' WHERE status = 'connected'")
     print(f"[presence] startup reconciliation: {reset}")
 
+    # Chat runs that a previous process left mid-flight can never finish; they
+    # are exactly the "stuck on Thinking" case and must reach a terminal state.
+    try:
+        await _recover_interrupted_runs(app.state.pool)
+    except Exception as e:
+        print(f"[chat] run recovery failed: {type(e).__name__}: {e}")
+
     sweep_task = asyncio.create_task(_presence_sweep(app.state.pool))
     feedback_task = asyncio.create_task(_feedback_outbox_worker(app.state.pool))
+    run_recovery_task = asyncio.create_task(_run_recovery_sweep(app.state.pool))
     try:
         yield
     finally:
-        sweep_task.cancel()
-        feedback_task.cancel()
-        try:
-            await sweep_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await feedback_task
-        except asyncio.CancelledError:
-            pass
+        for task in (sweep_task, feedback_task, run_recovery_task):
+            task.cancel()
+        for task in (sweep_task, feedback_task, run_recovery_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await app.state.pool.close()
+
+
+async def _run_recovery_sweep(pool):
+    """Periodic safety net for runs abandoned by a worker that died mid-turn."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await _recover_interrupted_runs(pool)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[chat] recovery sweep error: {type(e).__name__}: {e}")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -650,14 +751,23 @@ async def _deliver_claimed_feedback(pool: asyncpg.Pool, row: asyncpg.Record) -> 
                      f"Platform: {row['platform'] or 'unknown'}\nCorrelation ID: {correlation_id}\n\n{row['message']}")
         html_body = f"<h2>New LokiAI feedback</h2><p><b>Feedback:</b> {feedback_id}<br><b>Account:</b> {html.escape(account)}<br><b>Category:</b> {html.escape(row['category'])}<br><b>Correlation:</b> {correlation_id}</p><pre>{html.escape(row['message'])}</pre>"
         try:
-            await send_email(FEEDBACK_TO_EMAIL, subject, text_body, html_body)
+            # Reply-To is the submitting account, so the team can answer the
+            # user directly; From stays the verified application sender.
+            provider_response = await send_email(
+                FEEDBACK_TO_EMAIL, subject, text_body, html_body,
+                reply_to=row["user_email"],
+            )
         except Exception as exc:
             error = exc
         else:
             async with pool.acquire() as conn:
-                await conn.execute("UPDATE feedback_email_outbox SET status='delivered', attempt_count=$2, delivered_at=NOW(), updated_at=NOW(), locked_at=NULL, locked_by=NULL WHERE id=$1", outbox_id, attempt)
+                await conn.execute("UPDATE feedback_email_outbox SET status='delivered', attempt_count=$2, delivered_at=NOW(), updated_at=NOW(), locked_at=NULL, locked_by=NULL, last_error_code=NULL, last_error_message=$3 WHERE id=$1", outbox_id, attempt, str(provider_response)[:500])
                 await conn.execute("UPDATE feedback SET email_status='delivered', delivery_attempt_count=$2, delivered_at=NOW(), email_error=NULL, last_error_code=NULL, last_error_message=NULL, updated_at=NOW(), correlation_id=$3 WHERE id=$1", feedback_id, attempt, correlation_id)
-            print(f"[feedback] delivered feedback_id={feedback_id} correlation_id={correlation_id}")
+            # Accepted by the transport. Inbox delivery is a separate fact and
+            # is deliberately not claimed here.
+            print(f"[feedback] accepted by {email_delivery_path()} "
+                  f"feedback_id={feedback_id} correlation_id={correlation_id} "
+                  f"provider={provider_response}")
             return
 
     code = _feedback_error_code(error)
@@ -738,15 +848,122 @@ async def get_feedback(request: Request, user_id: str = Depends(get_current_user
 
 @app.get("/admin/feedback")
 async def get_all_feedback(request: Request, _admin: str = Depends(require_admin)):
-    """Cross-tenant feedback view, operator-only — replaces the unrestricted
-    listing that GET /feedback used to provide."""
+    """Cross-tenant feedback view with delivery state, operator-only.
+
+    This is the retrieval path that makes the team independent of email: every
+    submission and its full delivery history is readable here even when no
+    message ever reaches the inbox.
+    """
     async with request.app.state.pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT id, user_id, user_email, user_name, category, message,
-                      email_status, email_error, created_at
-               FROM feedback ORDER BY created_at DESC"""
+            """SELECT f.id, f.user_id, f.user_email, f.user_name, f.category,
+                      f.subject, f.message, f.source, f.application_version,
+                      f.platform, f.correlation_id, f.email_status,
+                      f.email_error, f.last_error_code, f.last_error_message,
+                      f.delivery_attempt_count, f.last_delivery_attempt_at,
+                      f.delivered_at, f.created_at,
+                      o.status AS outbox_status, o.attempt_count,
+                      o.next_attempt_at
+                 FROM feedback f
+                 LEFT JOIN feedback_email_outbox o ON o.feedback_id = f.id
+                ORDER BY f.created_at DESC"""
         )
     return [dict(row) for row in rows]
+
+
+@app.get("/admin/email/status")
+async def email_delivery_status(request: Request, _admin: str = Depends(require_admin)):
+    """Which delivery path the running process will actually use.
+
+    Reports only whether each variable is present, never its value, so it is
+    safe to call in production while diagnosing why mail is not arriving.
+    """
+    async with request.app.state.pool.acquire() as conn:
+        counts = await conn.fetch(
+            "SELECT status, COUNT(*) AS n FROM feedback_email_outbox GROUP BY status"
+        )
+        oldest_pending = await conn.fetchval(
+            "SELECT MIN(created_at) FROM feedback_email_outbox "
+            "WHERE status IN ('pending','retrying','sending')"
+        )
+        last_error = await conn.fetchrow(
+            "SELECT last_error_code, last_error_message, updated_at "
+            "FROM feedback_email_outbox WHERE last_error_code IS NOT NULL "
+            "ORDER BY updated_at DESC LIMIT 1"
+        )
+    return {
+        "delivery_path": email_delivery_path(),
+        "configured": {
+            "SMTP_HOST": bool(SMTP_HOST),
+            "SMTP_PORT": SMTP_PORT,
+            "SMTP_USER": bool(SMTP_USER),
+            "SMTP_PASSWORD": bool(SMTP_PASSWORD),
+            "SMTP_FROM_EMAIL": bool(SMTP_FROM_EMAIL),
+            "SMTP_FROM_NAME": bool(SMTP_FROM_NAME),
+            "FEEDBACK_TO_EMAIL": bool(FEEDBACK_TO_EMAIL),
+            "EMAIL_RELAY_URL": bool(EMAIL_RELAY_URL),
+            "EMAIL_RELAY_SECRET": bool(EMAIL_RELAY_SECRET),
+        },
+        "outbox": {row["status"]: row["n"] for row in counts},
+        "oldest_unsent_at": oldest_pending,
+        "last_error": dict(last_error) if last_error else None,
+    }
+
+
+class TestDeliveryRequest(BaseModel):
+    to_email: Optional[EmailStr] = None
+
+
+@app.post("/admin/email/test")
+@limiter.limit("6/minute", key_func=_user_or_ip_key)
+async def send_test_email(payload: TestDeliveryRequest, request: Request,
+                          _admin: str = Depends(require_admin)):
+    """Send one message through the real configured delivery path.
+
+    Returns the provider's own response and a correlation id. A 200 here means
+    the transport accepted the message; it is NOT proof of inbox delivery, and
+    the response says so explicitly.
+    """
+    correlation_id = _uuid.uuid4().hex
+    to_email = payload.to_email or FEEDBACK_TO_EMAIL
+    if not to_email:
+        raise HTTPException(
+            status_code=422,
+            detail="No recipient: FEEDBACK_TO_EMAIL is unset and none was given.",
+        )
+    subject = f"[LokiAI] delivery test {correlation_id}"
+    text_body = (
+        f"LokiAI delivery test\nCorrelation ID: {correlation_id}\n"
+        f"Delivery path: {email_delivery_path()}\n"
+        f"Sent at: {datetime.now(timezone.utc).isoformat()}\n"
+    )
+    html_body = (
+        f"<h2>LokiAI delivery test</h2><p>Correlation ID: <code>{correlation_id}</code><br>"
+        f"Delivery path: {email_delivery_path()}</p>"
+    )
+    started = time.time()
+    try:
+        provider_response = await send_email(to_email, subject, text_body, html_body)
+    except Exception as exc:
+        # The exception text can name a host but never a credential.
+        return {
+            "ok": False,
+            "correlation_id": correlation_id,
+            "delivery_path": email_delivery_path(),
+            "error_code": _feedback_error_code(exc),
+            "provider_response": str(exc)[:500],
+            "elapsed_seconds": round(time.time() - started, 2),
+            "note": "The configured transport rejected the message.",
+        }
+    return {
+        "ok": True,
+        "correlation_id": correlation_id,
+        "delivery_path": email_delivery_path(),
+        "provider_response": str(provider_response)[:500],
+        "elapsed_seconds": round(time.time() - started, 2),
+        "note": "Accepted by the transport. This is not proof of inbox "
+                "delivery - confirm receipt in the destination mailbox.",
+    }
 
 
 class AuthUser(BaseModel):
@@ -835,38 +1052,72 @@ class _IPv4SMTP(smtplib.SMTP):
         return super().connect(ip, port, source_address)
 
 
-def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: str) -> None:
+def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: str,
+                     reply_to: Optional[str] = None) -> str:
     if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
         raise RuntimeError("SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASSWORD missing in .env)")
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
+    # From is always the verified application sender; the account's own address
+    # goes in Reply-To so replying reaches the user without forging the sender
+    # (which is what gets a domain's mail rejected or spam-filed).
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
     msg["To"] = to_email
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg.attach(MIMEText(text_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
     with _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
+        response = server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
+    # An empty dict from sendmail means every recipient was accepted. This is
+    # SMTP acceptance, not inbox delivery, and is reported as such.
+    return f"smtp:accepted refused={response or 'none'}"
 
 
-async def _send_email_via_relay(to_email: str, subject: str, text_body: str, html_body: str) -> None:
+async def _send_email_via_relay(to_email: str, subject: str, text_body: str,
+                                html_body: str,
+                                reply_to: Optional[str] = None) -> str:
+    payload = {"to": to_email, "subject": subject, "text": text_body,
+               "html": html_body}
+    if reply_to:
+        payload["replyTo"] = reply_to
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             EMAIL_RELAY_URL,
-            json={"to": to_email, "subject": subject, "text": text_body, "html": html_body},
+            json=payload,
             headers={"X-Relay-Secret": EMAIL_RELAY_SECRET},
         )
     if resp.status_code != 200:
         raise RuntimeError(f"Email relay returned {resp.status_code}: {resp.text}")
+    return f"relay:{resp.status_code} {resp.text[:200]}"
 
 
-async def send_email(to_email: str, subject: str, text_body: str, html_body: str) -> None:
+def email_delivery_path() -> str:
+    """Which transport send_email will actually use. No secrets."""
     if EMAIL_RELAY_URL and EMAIL_RELAY_SECRET:
-        await _send_email_via_relay(to_email, subject, text_body, html_body)
-        return
+        return "relay"
+    if SMTP_HOST and SMTP_USER and SMTP_PASSWORD:
+        return "smtp"
+    return "unconfigured"
+
+
+async def send_email(to_email: str, subject: str, text_body: str, html_body: str,
+                     reply_to: Optional[str] = None) -> str:
+    """Returns the provider's own response string for the delivery record.
+
+    Render's free tier blocks outbound SMTP, so the relay is preferred whenever
+    it is configured; direct SMTP remains the local-dev path.
+    """
+    if EMAIL_RELAY_URL and EMAIL_RELAY_SECRET:
+        return await _send_email_via_relay(
+            to_email, subject, text_body, html_body, reply_to
+        )
     # Local dev fallback: direct SMTP (smtplib is synchronous — run off the event loop).
-    await asyncio.to_thread(_send_email_sync, to_email, subject, text_body, html_body)
+    return await asyncio.to_thread(
+        _send_email_sync, to_email, subject, text_body, html_body, reply_to
+    )
 
 
 def _otp_email_body(name: str, otp: str) -> tuple[str, str]:
@@ -1915,26 +2166,107 @@ def _extract_keywords(message: str) -> str:
     return " ".join(words[:4])
 
 
-def classify_tasks(message: str) -> list:
-    """User message → HuggingFace task tags (SPEC keyword table, extended).
+# Quantity words the planner fallback understands, so "two image models"
+# preserves the requested count rather than silently collapsing to one.
+_NUMBER_WORDS = {
+    "one": 1, "a": 1, "an": 1, "single": 1, "two": 2, "couple": 2, "both": 2,
+    "three": 3, "four": 4, "five": 5,
+}
 
-    Camera-type asks search BOTH object-detection and image-classification:
-    the app's camera mode handles either output geometry, and the proven
-    mobile vision families (MobileNet, EfficientNet) are tagged
-    image-classification on HuggingFace.
+# Keyword table per capability. Every capability whose keywords appear is
+# returned, in the order it appears in the message. The previous
+# implementation was a chain of early returns, so "find a vision model and a
+# chat model" matched the vision branch and dropped the chat requirement
+# entirely — this is failure 10 in the repair plan.
+_CAPABILITY_KEYWORDS = [
+    ("audio-classification",
+     ("sound", "audio", "noise", "hear", "listen", "classify sounds")),
+    ("automatic-speech-recognition",
+     ("transcribe", "transcription", "speech", "dictat", "voice input",
+      "voice note", "voice command")),
+    ("object-detection",
+     ("detect", "detection", "object", "ocr", "bounding box", "spot")),
+    ("image-classification",
+     ("camera", "vision", "image", "photo", "picture", "recognize",
+      "recognise", "identify", "classify", "see", "watch", "visual")),
+    ("text-generation",
+     ("chat", "chatbot", "conversation", "assistant", "talk", "llm",
+      "language model", "text generation", "converse")),
+]
+
+
+def _extract_quantity(message: str, capability: str) -> int:
+    """Best-effort count for one capability from the raw message.
+
+    Deliberately conservative: an unparsed count is 1, never 0, so a
+    requirement can never be dropped for want of a number.
     """
     msg = message.lower()
-    if any(w in msg for w in ("sound", "audio", "noise", "hear", "listen")):
-        return ["audio-classification"]
-    if any(w in msg for w in ("transcribe", "speech to text", "speech-to-text", "dictat")):
-        return ["automatic-speech-recognition"]
-    if any(w in msg for w in ("voice",)):
-        return ["automatic-speech-recognition", "audio-classification"]
-    if any(w in msg for w in ("detect", "camera", "object", "see", "vision", "watch")):
-        return ["object-detection", "image-classification"]
-    if any(w in msg for w in ("classify", "recognize", "identify", "image", "photo", "picture")):
-        return ["image-classification", "object-detection"]
-    return ["text-generation"]
+    for match in re.finditer(r"\b(\d+|" + "|".join(_NUMBER_WORDS) + r")\b\s+(\w+\s+){0,3}?models?\b", msg):
+        token = match.group(1)
+        quantity = int(token) if token.isdigit() else _NUMBER_WORDS.get(token, 1)
+        # Only claim the count when the phrase names this capability.
+        phrase = msg[match.start():match.end()]
+        for keyword in dict(_CAPABILITY_KEYWORDS)[capability]:
+            if keyword in phrase:
+                return max(1, min(quantity, 5))
+    return 1
+
+
+def classify_task_plan(message: str) -> list:
+    """User message -> ordered plan of {capability, quantity, constraints}.
+
+    This is the deterministic planner used by /models/search and as the
+    fallback when the intent model is unavailable. It is multi-intent: every
+    capability the message asks for is preserved, with its requested count.
+    """
+    msg = message.lower()
+    plan = []
+    for capability, keywords in _CAPABILITY_KEYWORDS:
+        position = min(
+            (msg.find(k) for k in keywords if k in msg),
+            default=-1,
+        )
+        if position < 0:
+            continue
+        plan.append({
+            "capability": capability,
+            "quantity": _extract_quantity(message, capability),
+            "constraints": {},
+            "_position": position,
+        })
+    plan.sort(key=lambda t: t["_position"])
+    for task in plan:
+        task.pop("_position")
+    if not plan:
+        # An unrecognised request is a chat request, matching prior behaviour.
+        plan = [{"capability": "text-generation", "quantity": 1, "constraints": {}}]
+    return plan
+
+
+def classify_tasks(message: str) -> list:
+    """Backward-compatible wrapper returning bare capability tags.
+
+    Retained because callers (and existing tests) depend on the flat list
+    shape; new code should use classify_task_plan.
+    """
+    return [task["capability"] for task in classify_task_plan(message)]
+
+
+def expand_vision_siblings(capabilities: list) -> list:
+    """Vision tasks share candidate pools on HuggingFace.
+
+    The proven mobile vision families (MobileNet, EfficientNet) are tagged
+    image-classification even when the user asked for detection, so searching
+    one without the other loses real candidates. Adding the sibling must never
+    drop a simultaneously requested chat or audio capability.
+    """
+    tasks = list(capabilities)
+    if "object-detection" in capabilities and "image-classification" not in tasks:
+        tasks.append("image-classification")
+    elif "image-classification" in capabilities and "object-detection" not in tasks:
+        tasks.append("object-detection")
+    return tasks
 
 
 async def search_deployable_models(
@@ -2091,18 +2423,69 @@ class ModelSearchRequest(BaseModel):
 async def search_models(req: ModelSearchRequest, request: Request, user_id: str = Depends(get_current_user)):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
-        device = await conn.fetchrow("SELECT ram_mb FROM devices WHERE id = $1::uuid AND user_id = $2::uuid", req.device_id, user_id)
+        # phone_model/ram_mb feed the "why this fits your device" sentence in
+        # every description, so they are read here rather than guessed.
+        device = await conn.fetchrow(
+            "SELECT phone_model, ram_mb FROM devices "
+            "WHERE id = $1::uuid AND user_id = $2::uuid",
+            req.device_id, user_id)
         if not device:
             raise HTTPException(status_code=404, detail="Device not found")
             
     max_size_mb = (device["ram_mb"] or 4096) * 0.4
-    
-    tasks = classify_tasks(req.user_message)
 
+    # The keyword planner is multi-intent too: this endpoint is the fallback
+    # recommendation path, and fixing only the model-driven path would leave it
+    # returning one capability and no descriptions.
+    plan = classify_task_plan(req.user_message)
+    device_specs = dict(device)
+
+    recommendations: list = []
+    grouped: list = []
+    task_failures: list = []
+    seen: set = set()
     async with httpx.AsyncClient(timeout=60.0) as client:
-        models_data = await search_deployable_models(
-            client, tasks, req.user_message, max_size_mb, limit=5)
-    return {"recommendations": models_data}
+        outcomes = await asyncio.gather(
+            *(
+                search_deployable_models(
+                    client, expand_vision_siblings([task["capability"]]),
+                    req.user_message, max_size_mb,
+                    limit=max(5, task["quantity"] * 4),
+                )
+                for task in plan
+            ),
+            return_exceptions=True,
+        )
+        for task, outcome in zip(plan, outcomes):
+            if isinstance(outcome, Exception):
+                task_failures.append({
+                    "capability": task["capability"],
+                    "error_code": "TASK_SEARCH_FAILED",
+                    "message": str(outcome),
+                })
+                continue
+            picked = [
+                m for m in _apply_task_constraints(outcome, task["constraints"])
+                if m["id"] not in seen
+            ][:task["quantity"]]
+            for m in picked:
+                seen.add(m["id"])
+                m["requested_capability"] = task["capability"]
+            recommendations.extend(picked)
+            if picked:
+                grouped.append({
+                    "capability": task["capability"],
+                    "requested_quantity": task["quantity"],
+                    "models": picked,
+                })
+
+        await _describe_models(
+            pool, client, recommendations, device_specs, max_size_mb
+        )
+
+    return {"recommendations": recommendations,
+            "grouped_results": grouped,
+            "task_failures": task_failures}
 
 
 # ------------------------------------------------------------------
@@ -2259,6 +2642,22 @@ import json
 NIM_ROUTER_MODEL = os.getenv("NIM_ROUTER_MODEL", "meta/llama-3.1-70b-instruct")
 NIM_SELECTOR_MODEL = os.getenv("NIM_SELECTOR_MODEL", "meta/llama-3.1-8b-instruct")
 NIM_INTENT_MODEL = os.getenv("NIM_INTENT_MODEL", "meta/llama-3.1-8b-instruct")
+# Greetings are answered by the small, warm model rather than the 70b router.
+# The 70b's cold start was the dominant term in "hi" latency.
+NIM_GREETING_MODEL = os.getenv("NIM_GREETING_MODEL", NIM_INTENT_MODEL)
+
+# Hard ceiling on one chat turn, end to end. Individual provider calls already
+# have their own timeouts, but nothing previously bounded a turn as a whole, so
+# a slow classify plus a slow select plus SDK retries could exceed a minute with
+# the UI still on "Thinking".
+CHAT_TURN_DEADLINE_SECONDS = float(os.getenv("CHAT_TURN_DEADLINE_SECONDS", "75"))
+GREETING_DEADLINE_SECONDS = float(os.getenv("GREETING_DEADLINE_SECONDS", "8"))
+
+_DETERMINISTIC_GREETING = (
+    "Hey! I'm Loki. Tell me what you want your phone to do - recognise things "
+    "through the camera, chat offline, or identify sounds - and I'll find a "
+    "model that actually fits it."
+)
 
 VALID_TASKS = ["object-detection", "image-classification", "text-generation",
                "audio-classification", "automatic-speech-recognition"]
@@ -2292,7 +2691,113 @@ Map the message to every applicable task type from this fixed list:
 If the user explicitly asks about a specific HuggingFace model by its repository ID (e.g., "prithivMLmods/Fire-Detection-Siglip2" or a huggingface.co link), extract that ID as `explicit_model`.
 If the message is a greeting, thanks, small talk, or a question about LokiAI itself — anything that is NOT a request for a device capability — tasks is an empty array.
 
-Reply with ONLY this JSON, nothing else: {"tasks": ["<zero or more values from the list above>"], "explicit_model": "<extracted_id_or_null>"}. Include every capability the user requests; for example vision plus chat returns ["image-classification", "text-generation"]."""
+Preserve the COUNT the user asked for ("two image models and one speech model" is quantity 2 then quantity 1) and any constraints they state (max size in MB, quantization such as q4, file format, offline-only, device memory).
+
+Reply with ONLY this JSON, nothing else:
+{"tasks": [{"capability": "<one value from the list above>", "quantity": <integer 1-5>, "constraints": {}}], "explicit_model": "<extracted_id_or_null>"}
+
+Return one entry per capability the user requests, in the order they request them. Example: "find a vision model and a chat model" returns
+{"tasks": [{"capability": "image-classification", "quantity": 1, "constraints": {}}, {"capability": "text-generation", "quantity": 1, "constraints": {}}], "explicit_model": null}"""
+
+
+# Constraint keys the backend understands. Anything else the planner invents is
+# discarded rather than passed downstream, so a hallucinated field can never
+# influence filtering.
+_ALLOWED_CONSTRAINT_KEYS = {
+    "max_size_mb", "min_size_mb", "quantization", "format", "offline_only",
+    "max_memory_mb",
+}
+
+
+def _validate_task_plan(parsed: dict) -> list:
+    """Strict validation of planner output into an ordered task list.
+
+    Accepts, in order of preference:
+      * the current schema: {"tasks": [{"capability", "quantity", "constraints"}]}
+      * the legacy array schema: {"tasks": ["image-classification", ...]}
+      * the original single-task schema: {"task": "image-classification"}
+
+    Anything that is not a recognised capability is dropped. Duplicated
+    capabilities are merged by summing their quantities, so "two chat models
+    and another chat model" does not become two separate plan entries that
+    each search the same pool.
+    """
+    if not isinstance(parsed, dict):
+        return []
+
+    raw = parsed.get("tasks")
+    if not isinstance(raw, list):
+        # Legacy single-task shape.
+        raw = [parsed.get("task")] if parsed.get("task") else []
+
+    plan: list = []
+    by_capability: dict = {}
+    for entry in raw:
+        if isinstance(entry, str):
+            capability, quantity, constraints = entry, 1, {}
+        elif isinstance(entry, dict):
+            capability = entry.get("capability") or entry.get("task")
+            raw_quantity = entry.get("quantity", 1)
+            try:
+                quantity = int(raw_quantity)
+            except (TypeError, ValueError):
+                quantity = 1
+            raw_constraints = entry.get("constraints")
+            constraints = {
+                k: v for k, v in raw_constraints.items()
+                if k in _ALLOWED_CONSTRAINT_KEYS
+            } if isinstance(raw_constraints, dict) else {}
+        else:
+            continue
+
+        if capability not in VALID_TASKS:
+            continue
+        quantity = max(1, min(quantity, 5))
+
+        if capability in by_capability:
+            existing = by_capability[capability]
+            existing["quantity"] = min(5, existing["quantity"] + quantity)
+            existing["constraints"].update(constraints)
+            continue
+        task = {
+            "capability": capability,
+            "quantity": quantity,
+            "constraints": constraints,
+        }
+        by_capability[capability] = task
+        plan.append(task)
+    return plan
+
+
+def _apply_task_constraints(models: list, constraints: dict) -> list:
+    """Filter already-verified candidates by the user's stated constraints.
+
+    Only real, measured fields are used (size from a CDN HEAD, format from the
+    filename). Nothing here can introduce a value the backend has not checked.
+    """
+    if not constraints:
+        return models
+    result = models
+    max_size = constraints.get("max_size_mb")
+    if isinstance(max_size, (int, float)) and max_size > 0:
+        result = [m for m in result if (m.get("size_mb") or 0) <= max_size]
+    min_size = constraints.get("min_size_mb")
+    if isinstance(min_size, (int, float)) and min_size > 0:
+        result = [m for m in result if (m.get("size_mb") or 0) >= min_size]
+    fmt = constraints.get("format")
+    if isinstance(fmt, str) and fmt.strip():
+        wanted = fmt.strip().lower().lstrip(".")
+        result = [m for m in result if (m.get("format") or "").lower() == wanted]
+    quantization = constraints.get("quantization")
+    if isinstance(quantization, str) and quantization.strip():
+        wanted = quantization.strip().lower()
+        narrowed = [
+            m for m in result
+            if wanted in (m.get("filename") or "").lower()
+        ]
+        # A quantization nobody publishes must not empty the list silently.
+        result = narrowed or result
+    return result
 
 
 def _assistant_system_prompt() -> str:
@@ -2562,6 +3067,304 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
     return result
 
 
+# ── Model descriptions ───────────────────────────────────────────────────────
+# Section 11 of the repair plan: every recommended model must carry a concise,
+# sourced explanation. Metadata is preferred in this order:
+#   1. verified metadata already in the LokiAI database
+#   2. HuggingFace model-card metadata (cardData)
+#   3. the repository README / model card prose
+#   4. task and pipeline tags
+#   5. a clearly marked conservative fallback
+# Normalised results are cached in `model_descriptions` so the same card is not
+# downloaded on every request.
+
+_TASK_DESCRIPTIONS = {
+    "image-classification": (
+        "Image classification model. It takes a single camera frame or photo "
+        "and returns the most likely labels for what the whole image shows, "
+        "with a confidence score for each.",
+        "labels whole images",
+    ),
+    "object-detection": (
+        "Object detection model. It takes a camera frame or photo and returns "
+        "the objects it finds together with their locations in the frame and a "
+        "confidence score for each.",
+        "locates objects in a frame",
+    ),
+    "text-generation": (
+        "Text generation model for on-device chat. It takes a conversation as "
+        "text and continues it, producing a written reply token by token.",
+        "answers in written text",
+    ),
+    "audio-classification": (
+        "Audio classification model. It takes a short window of microphone "
+        "audio and returns the sounds it recognises in it, with a confidence "
+        "score for each.",
+        "identifies sounds",
+    ),
+    "automatic-speech-recognition": (
+        "Speech recognition model. It takes recorded speech audio and returns "
+        "the spoken words as text.",
+        "turns speech into text",
+    ),
+}
+
+_FORMAT_RUNTIME = {
+    "tflite": "runs on the phone's TensorFlow Lite runtime",
+    "gguf": "runs on the phone's llama.cpp runtime",
+}
+
+# Boilerplate that leads many model cards and says nothing about the model.
+_CARD_NOISE = re.compile(
+    r"^\s*(?:#+\s*|<!--.*?-->|\[!\[.*?\]\(.*?\)\]\(.*?\)|!\[.*?\]\(.*?\)|"
+    r"---\s*$|license:.*$|tags:.*$|library_name:.*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _first_card_paragraph(readme: str, limit: int = 400) -> Optional[str]:
+    """First substantive prose paragraph of a model card, or None."""
+    if not readme:
+        return None
+    # Drop the YAML front matter, which is metadata rather than prose.
+    body = re.sub(r"\A---\n.*?\n---\n", "", readme, flags=re.DOTALL)
+    for block in re.split(r"\n\s*\n", body):
+        cleaned = _CARD_NOISE.sub("", block).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        # Skip badge rows, tables, and code fences.
+        if len(cleaned) < 40 or cleaned.startswith(("|", "```", ">")):
+            continue
+        return cleaned[:limit].rstrip() + ("..." if len(cleaned) > limit else "")
+    return None
+
+
+async def _fetch_model_card(client: httpx.AsyncClient, repo_id: str) -> Optional[str]:
+    try:
+        resp = await client.get(
+            f"https://huggingface.co/{repo_id}/raw/main/README.md",
+            timeout=10.0,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError:
+        return None
+    return resp.text if resp.status_code == 200 else None
+
+
+def _device_fit(size_mb: Optional[float], max_size_mb: float) -> str:
+    """A measured statement about headroom, never a guess."""
+    if not size_mb or max_size_mb <= 0:
+        return "unknown"
+    ratio = size_mb / max_size_mb
+    if ratio <= 0.4:
+        return "comfortable"
+    if ratio <= 0.75:
+        return "good"
+    if ratio <= 1.0:
+        return "tight"
+    return "over budget"
+
+
+def _compose_description(
+    model: dict,
+    capability: str,
+    card_summary: Optional[str],
+    card_data: Optional[dict],
+    source: str,
+) -> str:
+    """Answers: what it does, what it takes, what it returns, what it is for."""
+    base, _ = _TASK_DESCRIPTIONS.get(
+        capability,
+        (
+            "On-device model. Its published metadata does not state a task "
+            "type, so LokiAI cannot describe its inputs or outputs precisely.",
+            "capability not stated by the publisher",
+        ),
+    )
+    parts = [base]
+    if card_summary:
+        parts.append(card_summary)
+    elif card_data and isinstance(card_data.get("base_model"), str):
+        parts.append(
+            f"Published as a conversion of {card_data['base_model']}."
+        )
+    elif source == "fallback":
+        parts.append(
+            "This summary is derived from the model's task tag only - the "
+            "publisher supplied no model card text."
+        )
+    return " ".join(parts)
+
+
+def _compose_why_recommended(
+    model: dict, device: dict, max_size_mb: float, fit: str
+) -> str:
+    size_mb = model.get("size_mb")
+    fmt = (model.get("format") or "").lower()
+    runtime = _FORMAT_RUNTIME.get(fmt, "runs on the phone's on-device runtime")
+    phone = device.get("phone_model") or "the paired phone"
+    ram_mb = device.get("ram_mb")
+
+    reasons = []
+    if size_mb and max_size_mb > 0:
+        headroom = "well inside" if fit == "comfortable" else (
+            "inside" if fit in ("good", "tight") else "outside"
+        )
+        reasons.append(
+            f"At {size_mb:.0f} MB it is {headroom} the {max_size_mb:.0f} MB "
+            f"budget LokiAI allows for {phone}"
+            + (f" ({ram_mb} MB RAM)" if ram_mb else "")
+            + "."
+        )
+    reasons.append(f"It is a .{fmt or 'model'} file, which {runtime}.")
+    if model.get("reputable"):
+        reasons.append(
+            f"Published by {model['id'].split('/')[0]}, a publisher LokiAI "
+            "recognises."
+        )
+    return " ".join(reasons)
+
+
+async def _load_cached_descriptions(pool, model_ids: list) -> dict:
+    if not model_ids:
+        return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT model_id, description, source, source_url "
+            "FROM model_descriptions WHERE model_id = ANY($1::text[])",
+            model_ids,
+        )
+    return {r["model_id"]: dict(r) for r in rows}
+
+
+async def _store_descriptions(pool, entries: list) -> None:
+    if not entries:
+        return
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """INSERT INTO model_descriptions
+                   (model_id, description, source, source_url, updated_at)
+               VALUES ($1, $2, $3, $4, NOW())
+               ON CONFLICT (model_id) DO UPDATE
+                   SET description = EXCLUDED.description,
+                       source = EXCLUDED.source,
+                       source_url = EXCLUDED.source_url,
+                       updated_at = NOW()""",
+            entries,
+        )
+
+
+async def _describe_models(
+    pool,
+    client: httpx.AsyncClient,
+    models: list,
+    device: dict,
+    max_size_mb: float,
+    verified: Optional[dict] = None,
+) -> list:
+    """Attach the section 11 response contract to every candidate.
+
+    Mutates and returns `models`. Every entry is guaranteed a non-empty,
+    non-identical description; a metadata lookup that fails degrades to the
+    next source rather than dropping the model or emitting an empty string.
+    """
+    if not models:
+        return models
+
+    verified = verified or {}
+    ids = [m["id"] for m in models]
+    cached = await _load_cached_descriptions(pool, ids)
+
+    async def describe(model: dict) -> tuple:
+        model_id = model["id"]
+        capability = model.get("task") or "unknown"
+        source_url = (
+            model.get("download_url")
+            or (f"https://huggingface.co/{model_id}"
+                if "/" in model_id and not model_id.startswith("upload:")
+                else None)
+        )
+
+        # 1. Verified metadata already stored by LokiAI.
+        own = verified.get(model_id)
+        if own and (own.get("description") or "").strip():
+            return own["description"].strip(), "lokiai_database", source_url
+
+        entry = cached.get(model_id)
+        if entry and (entry.get("description") or "").strip():
+            return entry["description"], entry["source"], entry["source_url"]
+
+        if model_id.startswith("upload:"):
+            return (
+                _compose_description(model, capability, None, None, "fallback"),
+                "user_upload",
+                source_url,
+            )
+
+        # 2. HuggingFace model-card metadata, then 3. the README prose.
+        card_data, card_summary, source = None, None, "task_tag"
+        try:
+            meta_resp = await _hf_get(
+                client, f"https://huggingface.co/api/models/{model_id}"
+            )
+            if meta_resp.status_code == 200:
+                meta = meta_resp.json()
+                card_data = meta.get("cardData") if isinstance(meta, dict) else None
+                capability = meta.get("pipeline_tag") or capability
+                source = "huggingface_metadata"
+        except (httpx.HTTPError, ValueError):
+            pass
+
+        readme = await _fetch_model_card(client, model_id)
+        if readme:
+            card_summary = _first_card_paragraph(readme)
+            if card_summary:
+                source = "huggingface_model_card"
+
+        # 4/5. Task tags, or the clearly-marked conservative fallback.
+        if not card_summary and source not in ("huggingface_metadata",):
+            source = "fallback"
+        return (
+            _compose_description(model, capability, card_summary, card_data, source),
+            source,
+            source_url,
+        )
+
+    described = await asyncio.gather(
+        *(describe(m) for m in models), return_exceptions=True
+    )
+
+    to_store = []
+    for model, outcome in zip(models, described):
+        if isinstance(outcome, Exception):
+            print(f"[describe] {model['id']}: {type(outcome).__name__}: {outcome}")
+            description = _compose_description(
+                model, model.get("task") or "unknown", None, None, "fallback"
+            )
+            source, source_url = "fallback", None
+        else:
+            description, source, source_url = outcome
+            if model["id"] not in cached and source != "user_upload":
+                to_store.append((model["id"], description, source, source_url))
+
+        fit = _device_fit(model.get("size_mb"), max_size_mb)
+        model["display_name"] = model.get("name") or model["id"].split("/")[-1]
+        model["capability"] = model.get("task") or "unknown"
+        model["description"] = description
+        model["why_recommended"] = _compose_why_recommended(
+            model, device, max_size_mb, fit
+        )
+        model["estimated_device_fit"] = fit
+        model["source"] = source
+        model["source_url"] = source_url
+        model["model_id"] = model["id"]
+
+    try:
+        await _store_descriptions(pool, to_store)
+    except Exception as exc:  # caching is an optimisation, never a hard failure
+        print(f"[describe] cache write failed: {type(exc).__name__}: {exc}")
+    return models
+
+
 def _classify_provider_error(exc: Exception) -> "AssistantError":
     """Map a provider exception onto the typed taxonomy.
 
@@ -2693,27 +3496,399 @@ Reply with this JSON shape:
 Copy id/filename/format exactly from the candidate data above."""
 
 
+# ── Conversation / message / run lifecycle ───────────────────────────────────
+# Section 9 of the repair plan. A submitted message is committed before any
+# inference is attempted, every run reaches a terminal status, and a restarted
+# process recovers whatever was in flight. Coordination is database-backed
+# (advisory locks + row state) rather than an in-process boolean, so it stays
+# correct when Render runs more than one worker.
+
+_RUN_WORKER_ID = f"chat-{os.getpid()}-{_uuid.uuid4().hex[:8]}"
+RUN_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+RUN_ACTIVE_STATUSES = {"queued", "routing", "generating"}
+
+# How long a request will wait for an earlier run on the same conversation
+# before handing the caller a run id to poll instead of holding the socket.
+CHAT_QUEUE_WAIT_SECONDS = float(os.getenv("CHAT_QUEUE_WAIT_SECONDS", "25"))
+# A run still non-terminal after this is treated as interrupted on recovery.
+RUN_STALE_AFTER_SECONDS = int(os.getenv("RUN_STALE_AFTER_SECONDS", "300"))
+
+
+def _conversation_lock_key(conversation_id) -> int:
+    """Stable 63-bit key for pg_advisory_lock, derived from the conversation."""
+    digest = hashlib.sha256(str(conversation_id).encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+async def _recover_interrupted_runs(pool: asyncpg.Pool) -> int:
+    """Fail runs that a previous process left mid-flight.
+
+    Without this a crash or redeploy left a run in 'generating' for ever, which
+    is exactly the "stuck on Thinking" symptom: the UI had nothing that could
+    ever move it to a terminal state.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """UPDATE chat_runs
+                  SET status='failed',
+                      error_code='RUN_INTERRUPTED',
+                      error_message='The server restarted while this message '
+                                    'was being answered. Send it again.',
+                      finished_at=NOW(), updated_at=NOW()
+                WHERE status = ANY($1::text[])
+                  AND created_at < NOW() - ($2 || ' seconds')::interval
+             RETURNING id""",
+            list(RUN_ACTIVE_STATUSES), str(RUN_STALE_AFTER_SECONDS),
+        )
+    if rows:
+        print(f"[chat] recovered {len(rows)} interrupted run(s)")
+    return len(rows)
+
+
+async def _resolve_conversation(conn, user_id: str, device_id: Optional[str],
+                                conversation_id: Optional[str]):
+    """Return an existing conversation owned by this account, or create one."""
+    if conversation_id:
+        row = await conn.fetchrow(
+            "SELECT id FROM conversations WHERE id = $1::uuid AND user_id = $2::uuid",
+            conversation_id, user_id,
+        )
+        if row:
+            return row["id"]
+        # A conversation id that is not this account's is not an error the user
+        # can act on; start a fresh conversation rather than leaking existence.
+    row = await conn.fetchrow(
+        "INSERT INTO conversations (user_id, device_id) "
+        "VALUES ($1::uuid, $2) RETURNING id",
+        user_id, _uuid.UUID(device_id) if device_id else None,
+    )
+    return row["id"]
+
+
+async def _claim_or_create_run(pool: asyncpg.Pool, user_id: str,
+                               device_id: Optional[str],
+                               conversation_id: Optional[str],
+                               message: str,
+                               idempotency_key: str) -> dict:
+    """Persist the user's message and its run before any inference runs.
+
+    Returns {"run": <record>, "duplicate": bool}. A repeated idempotency key
+    returns the original run untouched, so a network retry never duplicates the
+    message or starts a second generation.
+    """
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT * FROM chat_runs WHERE user_id = $1::uuid AND idempotency_key = $2",
+            user_id, idempotency_key,
+        )
+        if existing:
+            return {"run": existing, "duplicate": True}
+
+        async with conn.transaction():
+            conv_id = await _resolve_conversation(
+                conn, user_id, device_id, conversation_id
+            )
+            correlation_id = _uuid.uuid4().hex
+            try:
+                run = await conn.fetchrow(
+                    """INSERT INTO chat_runs
+                           (conversation_id, user_id, device_id, status,
+                            idempotency_key, correlation_id, user_message)
+                       VALUES ($1, $2::uuid, $3, 'queued', $4, $5, $6)
+                       RETURNING *""",
+                    conv_id, user_id,
+                    _uuid.UUID(device_id) if device_id else None,
+                    idempotency_key, correlation_id, message,
+                )
+            except asyncpg.exceptions.UniqueViolationError:
+                # Another worker inserted the same key between the SELECT and
+                # the INSERT. Its row is the authoritative one.
+                run = await conn.fetchrow(
+                    "SELECT * FROM chat_runs WHERE user_id = $1::uuid "
+                    "AND idempotency_key = $2",
+                    user_id, idempotency_key,
+                )
+                return {"run": run, "duplicate": True}
+
+            # The user's message is committed here, before the provider is
+            # contacted at all. Losing the request from this point on can lose
+            # the answer, never the question.
+            await conn.execute(
+                "INSERT INTO chat_messages (conversation_id, role, content, run_id) "
+                "VALUES ($1, 'user', $2, $3)",
+                conv_id, message, run["id"],
+            )
+            await conn.execute(
+                "UPDATE conversations SET updated_at = NOW() WHERE id = $1",
+                conv_id,
+            )
+        return {"run": run, "duplicate": False}
+
+
+async def _set_run_status(pool: asyncpg.Pool, run_id, status: str,
+                          response: Optional[dict] = None,
+                          error_code: Optional[str] = None,
+                          error_message: Optional[str] = None) -> None:
+    finished = status in RUN_TERMINAL_STATUSES
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE chat_runs
+                  SET status=$2, response=$3::jsonb, error_code=$4,
+                      error_message=$5, claimed_by=$6, claimed_at=NOW(),
+                      updated_at=NOW(),
+                      finished_at = CASE WHEN $7 THEN NOW() ELSE finished_at END
+                WHERE id=$1""",
+            run_id, status,
+            json.dumps(response) if response is not None else None,
+            error_code, error_message, _RUN_WORKER_ID, finished,
+        )
+
+
+async def _persist_assistant_message(pool: asyncpg.Pool, run) -> None:
+    async with pool.acquire() as conn:
+        stored = await conn.fetchval(
+            "SELECT response FROM chat_runs WHERE id = $1", run["id"]
+        )
+        if not stored:
+            return
+        payload = json.loads(stored) if isinstance(stored, str) else stored
+        await conn.execute(
+            "INSERT INTO chat_messages (conversation_id, role, content, run_id) "
+            "VALUES ($1, 'assistant', $2, $3)",
+            run["conversation_id"], str(payload.get("response") or ""), run["id"],
+        )
+        await conn.execute(
+            "UPDATE conversations SET updated_at = NOW() WHERE id = $1",
+            run["conversation_id"],
+        )
+
+
+class _ConversationTurnLock:
+    """Serialises runs on one conversation across every backend process.
+
+    Different conversations execute concurrently; the same conversation does
+    not. Held on a dedicated connection for the life of the turn.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, conversation_id):
+        self._pool = pool
+        self._key = _conversation_lock_key(conversation_id)
+        self._conn = None
+        self.acquired = False
+
+    async def __aenter__(self):
+        self._conn = await self._pool.acquire()
+        try:
+            # Try without waiting first: the common case is an idle
+            # conversation, and this avoids holding a pool connection blocked.
+            self.acquired = await self._conn.fetchval(
+                "SELECT pg_try_advisory_lock($1)", self._key
+            )
+            if not self.acquired:
+                try:
+                    await asyncio.wait_for(
+                        self._conn.execute("SELECT pg_advisory_lock($1)", self._key),
+                        timeout=CHAT_QUEUE_WAIT_SECONDS,
+                    )
+                    self.acquired = True
+                except asyncio.TimeoutError:
+                    self.acquired = False
+        except Exception:
+            await self._pool.release(self._conn)
+            self._conn = None
+            raise
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._conn is None:
+            return False
+        try:
+            if self.acquired:
+                await self._conn.execute("SELECT pg_advisory_unlock($1)", self._key)
+        finally:
+            await self._pool.release(self._conn)
+            self._conn = None
+        return False
+
+
 class ChatRequest(BaseModel):
     device_id: str
     message: str
     conversation_history: Optional[List[dict]] = None
+    # Both optional so previously distributed mobile and web clients, which
+    # send neither, keep working exactly as before.
+    conversation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 @app.post("/assistant/chat")
 @limiter.limit("20/minute", key_func=_user_or_ip_key)
 async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depends(get_current_user)):
+    """Durable chat turn.
+
+    The message is persisted with its run before any provider is contacted, the
+    conversation is serialised across every backend process, and the run always
+    reaches a terminal status. The answer itself is produced by
+    `_assistant_turn`, whose behaviour and response shape are unchanged for
+    existing clients.
+    """
+    pool = request.app.state.pool
+
+    # A client that sends no key still gets idempotency within a turn; one that
+    # sends its own gets it across network retries too.
+    idempotency_key = (req.idempotency_key or "").strip()[:120] or _uuid.uuid4().hex
+
+    claimed = await _claim_or_create_run(
+        pool, user_id, req.device_id, req.conversation_id,
+        req.message, idempotency_key,
+    )
+    run = claimed["run"]
+    correlation_id = run["correlation_id"]
+
+    if claimed["duplicate"]:
+        # A retry of a submission we already have. Never run it twice.
+        stored = run["response"]
+        if run["status"] == "completed" and stored:
+            payload = json.loads(stored) if isinstance(stored, str) else stored
+            return {**payload, "run_id": str(run["id"]),
+                    "conversation_id": str(run["conversation_id"]),
+                    "run_status": "completed",
+                    "correlation_id": correlation_id}
+        if run["status"] in RUN_ACTIVE_STATUSES:
+            return {"response": "That message is still being answered.",
+                    "action": None, "search_results": [],
+                    "error_code": None,
+                    "run_id": str(run["id"]),
+                    "conversation_id": str(run["conversation_id"]),
+                    "run_status": run["status"],
+                    "correlation_id": correlation_id}
+        return {"response": run["error_message"] or "That message could not be answered.",
+                "action": None, "search_results": [],
+                "error_code": run["error_code"],
+                "run_id": str(run["id"]),
+                "conversation_id": str(run["conversation_id"]),
+                "run_status": run["status"],
+                "correlation_id": correlation_id}
+
+    async with _ConversationTurnLock(pool, run["conversation_id"]) as lock:
+        if not lock.acquired:
+            # An earlier message on this conversation is still generating.
+            # The submission is already durable and queued in FIFO order; the
+            # caller polls GET /assistant/runs/{id} rather than holding a
+            # socket open behind the lock. Documented trade-off, section 9.
+            return {"response": "Your message is queued behind the previous one "
+                                "on this conversation.",
+                    "action": None, "search_results": [], "error_code": None,
+                    "run_id": str(run["id"]),
+                    "conversation_id": str(run["conversation_id"]),
+                    "run_status": "queued",
+                    "correlation_id": correlation_id}
+
+        await _set_run_status(pool, run["id"], "routing")
+        try:
+            payload = await asyncio.wait_for(
+                _assistant_turn(pool, req, user_id, correlation_id),
+                timeout=CHAT_TURN_DEADLINE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await _set_run_status(
+                pool, run["id"], "failed",
+                error_code="TURN_DEADLINE_EXCEEDED",
+                error_message=(
+                    "That took longer than "
+                    f"{CHAT_TURN_DEADLINE_SECONDS:.0f}s and was stopped. "
+                    "Send it again."
+                ),
+            )
+            raise AssistantError(
+                "TURN_DEADLINE_EXCEEDED",
+                f"That took longer than {CHAT_TURN_DEADLINE_SECONDS:.0f}s and "
+                "was stopped so it could not hang. Try sending it again.",
+                http_status=504,
+            )
+        except AssistantError as exc:
+            await _set_run_status(pool, run["id"], "failed",
+                                  error_code=exc.code, error_message=str(exc))
+            raise
+        except Exception as exc:
+            await _set_run_status(pool, run["id"], "failed",
+                                  error_code="INTERNAL_ERROR",
+                                  error_message=f"{type(exc).__name__}: {exc}")
+            raise
+
+        await _set_run_status(pool, run["id"], "completed", response=payload)
+        await _persist_assistant_message(pool, run)
+
+    return {**payload,
+            "run_id": str(run["id"]),
+            "conversation_id": str(run["conversation_id"]),
+            "run_status": "completed",
+            "correlation_id": correlation_id}
+
+
+@app.get("/assistant/runs/{run_id}")
+async def get_run_status(run_id: str, request: Request,
+                         user_id: str = Depends(get_current_user)):
+    """Terminal-state recovery for a queued or interrupted turn.
+
+    This is what guarantees the UI can always leave "Thinking": whatever
+    happened to the process that started the run, its status is readable here.
+    """
+    async with request.app.state.pool.acquire() as conn:
+        run = await conn.fetchrow(
+            "SELECT * FROM chat_runs WHERE id = $1::uuid AND user_id = $2::uuid",
+            run_id, user_id,
+        )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    stored = run["response"]
+    payload = (json.loads(stored) if isinstance(stored, str) else stored) or {}
+    return {
+        "run_id": str(run["id"]),
+        "conversation_id": str(run["conversation_id"]),
+        "run_status": run["status"],
+        "correlation_id": run["correlation_id"],
+        "error_code": run["error_code"],
+        "response": payload.get("response") or run["error_message"],
+        "action": payload.get("action"),
+        "search_results": payload.get("search_results", []),
+        "created_at": run["created_at"],
+        "finished_at": run["finished_at"],
+    }
+
+
+@app.get("/assistant/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: str, request: Request,
+                                    user_id: str = Depends(get_current_user)):
+    """Server-side history, so a reinstalled client no longer loses the thread."""
+    async with request.app.state.pool.acquire() as conn:
+        owner = await conn.fetchval(
+            "SELECT user_id FROM conversations WHERE id = $1::uuid", conversation_id
+        )
+        if str(owner) != str(user_id):
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        rows = await conn.fetch(
+            "SELECT role, content, run_id, created_at FROM chat_messages "
+            "WHERE conversation_id = $1::uuid ORDER BY created_at",
+            conversation_id,
+        )
+    return [dict(r) for r in rows]
+
+
+async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
+                          correlation_id: str) -> dict:
     """Code filters, AI explains:
     1. Load the real paired device — 404 if not found, never guessed.
-    2. One small NIM call classifies the message into a fixed task type, or
-       null for plain conversation. Replaces the old keyword map entirely.
-    3. Real HuggingFace search for that task (unauthenticated, public CDN).
+    2. One small NIM call classifies the message into every requested task,
+       with counts and constraints, or an empty plan for plain conversation.
+    3. Real HuggingFace search per task (unauthenticated, public CDN).
     4. Python filters to phone-runnable files (.tflite/.gguf, q4 preferred)
        that fit max_size_mb = ram_mb * 0.4, using real CDN HEAD sizes.
-    5. A second NIM call — given ONLY the real device specs and the
-       filtered candidates — ranks the best 3 and explains them.
-    6. Every returned model id is re-validated against the filtered list
+    5. Every candidate is given a sourced description.
+    6. A second NIM call — given ONLY the real device specs and the
+       filtered candidates — ranks and explains them.
+    7. Every returned model id is re-validated against the filtered list
        server-side; hallucinated ids are dropped."""
-    pool = request.app.state.pool
 
     # Each account brings its own NVIDIA NIM key — no shared-quota fallback.
     async with pool.acquire() as conn:
@@ -2768,28 +3943,39 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         max_retries=int(os.getenv("NIM_MAX_RETRIES", "1")),
     )
 
-    # A greeting must not pay the classifier plus router round-trip. This is
-    # routing, not a canned reply: the provider still produces the response
-    # using the same account-scoped NIM key and conversation history.
+    # A greeting must not pay the classifier plus router round-trip, and it must
+    # not pay a cold 70b start either — that combination is what made "hi" take
+    # far too long. Section 8 allows exactly one low-latency provider call for a
+    # trivial greeting, so this uses the small intent model with a tight
+    # deadline and falls back to a deterministic local reply. Either way the
+    # turn is terminal in seconds, never indefinite.
     normalized_message = re.sub(r"[^a-z0-9? ]", "", req.message.lower()).strip()
     conversational_fast_path = bool(re.fullmatch(
         r"(?:hi+|hello+|hey+|yo+|thanks|thank you|what can you do\??|who are you\??)",
         normalized_message,
     ))
     if conversational_fast_path:
+        reply = ""
         try:
-            convo = await openai_client.chat.completions.create(
-                model=NIM_ROUTER_MODEL,
-                messages=[{"role": "system", "content": _assistant_system_prompt()},
-                          *history,
-                          {"role": "user", "content": req.message}],
-                temperature=0.6,
-                max_tokens=160,
+            convo = await asyncio.wait_for(
+                openai_client.chat.completions.create(
+                    model=NIM_GREETING_MODEL,
+                    messages=[{"role": "system", "content": _assistant_system_prompt()},
+                              *history,
+                              {"role": "user", "content": req.message}],
+                    temperature=0.6,
+                    max_tokens=160,
+                ),
+                timeout=GREETING_DEADLINE_SECONDS,
             )
             reply = (convo.choices[0].message.content or "").strip()
         except Exception as e:
-            raise _classify_provider_error(e)
-        return {"response": _strip_prompt_leakage(reply) or "I’m here to help you find and deploy on-device AI models.",
+            # A greeting is the one case where a provider failure must not
+            # surface as an error: the deterministic answer is honest, correct,
+            # and instant.
+            print(f"[assistant] greeting fast path fell back "
+                  f"({type(e).__name__}) corr={correlation_id}")
+        return {"response": _strip_prompt_leakage(reply) or _DETERMINISTIC_GREETING,
                 "action": None, "search_results": [], "error_code": None}
 
     # ── Step 2: intent extraction — single fast call, exception fallback ─
@@ -2807,12 +3993,11 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             parsed = json.loads(resp.choices[0].message.content)
         except (json.JSONDecodeError, AttributeError, TypeError):
             parsed = {}
-        raw_tasks = parsed.get("tasks")
-        # Accept the old planner shape while all deployed versions transition.
-        if not isinstance(raw_tasks, list):
-            raw_tasks = [parsed.get("task")]
-        tasks = list(dict.fromkeys(t for t in raw_tasks if t in VALID_TASKS))
-        
+        # Strict validation against the planner schema. Accepts the current
+        # {capability, quantity, constraints} shape, the legacy flat array, and
+        # the original single-task field; anything else is discarded.
+        tasks = _validate_task_plan(parsed)
+
         explicit_model = parsed.get("explicit_model")
         if not explicit_model:
             # Use the same validated extractor as the fast path. The previous
@@ -2834,17 +4019,19 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
     # (and its failure modes) from the most deterministic request we handle.
     direct_repo = _extract_direct_repo(req.message)
     if direct_repo:
-        planned_tasks, explicit_model = [], direct_repo
+        plan, explicit_model = [], direct_repo
     else:
         try:
-            planned_tasks, explicit_model = await classify_intent(NIM_INTENT_MODEL)
+            plan, explicit_model = await classify_intent(NIM_INTENT_MODEL)
         except Exception as e:
             if NIM_ROUTER_MODEL == NIM_INTENT_MODEL:
                 raise _classify_provider_error(e)
             try:
-                planned_tasks, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
+                plan, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
             except Exception as e2:
                 raise _classify_provider_error(e2)
+
+    planned_tasks = [t["capability"] for t in plan]
 
     # If they gave a specific model link, we proceed even if task is None.
     if planned_tasks and not any(t in RUNTIME_SUPPORTED_TASKS for t in planned_tasks) and not explicit_model:
@@ -2872,22 +4059,70 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         return {"response": _strip_prompt_leakage(reply) or "Hey! I'm Loki — your AI sidekick for getting models onto your phone. What are you looking to do?",
                 "action": None, "search_results": [], "error_code": None}
 
-    # ── Steps 3-4: real search + Python-only filtering ───────────────────
-    tasks = list(planned_tasks)
-    # Vision tasks share candidate pools. Add the sibling without dropping a
-    # simultaneously requested chat/audio task.
-    if "object-detection" in planned_tasks and "image-classification" not in tasks:
-        tasks.append("image-classification")
-    elif "image-classification" in planned_tasks and "object-detection" not in tasks:
-        tasks.append("object-detection")
+    # ── Steps 3-4: real search + Python-only filtering, one task at a time ──
+    # Each planned capability is searched independently so that a failure in
+    # one does not lose the others, its requested count is honoured, and the
+    # results can be grouped back by the capability that asked for them. The
+    # previous implementation flattened every capability into a single search
+    # and returned one undifferentiated list.
+    tasks = expand_vision_siblings(planned_tasks)
 
     models_data = []
+    grouped: list = []
+    task_failures: list = []
     explicit_rejection = None
     async with httpx.AsyncClient(timeout=60.0) as client:
-        if tasks:
-            models_data = await search_deployable_models(
-                client, tasks, req.message, max_size_mb, limit=12)
-                
+        async def run_task(task: dict) -> dict:
+            capability = task["capability"]
+            search_tags = expand_vision_siblings([capability])
+            found = await search_deployable_models(
+                client, search_tags, req.message, max_size_mb,
+                limit=max(6, task["quantity"] * 4),
+            )
+            return {"task": task, "models": _apply_task_constraints(
+                found, task["constraints"])}
+
+        if plan:
+            outcomes = await asyncio.gather(
+                *(run_task(task) for task in plan), return_exceptions=True
+            )
+            seen = set()
+            for task, outcome in zip(plan, outcomes):
+                capability = task["capability"]
+                if isinstance(outcome, Exception):
+                    # One capability failing is reported as that capability's
+                    # failure; the rest of the plan still completes.
+                    detail = (outcome.detail if isinstance(outcome, HTTPException)
+                              else str(outcome))
+                    print(f"[assistant] task {capability} failed corr={correlation_id}: "
+                          f"{type(outcome).__name__}: {detail}")
+                    task_failures.append({
+                        "capability": capability,
+                        "error_code": "TASK_SEARCH_FAILED",
+                        "message": f"I could not complete the {capability} part "
+                                   f"of that request: {detail}",
+                    })
+                    continue
+                picked = [m for m in outcome["models"]
+                          if m["id"] not in seen][:task["quantity"]]
+                for m in picked:
+                    seen.add(m["id"])
+                    m["requested_capability"] = capability
+                if picked:
+                    grouped.append({
+                        "capability": capability,
+                        "requested_quantity": task["quantity"],
+                        "models": picked,
+                    })
+                    models_data.extend(picked)
+                else:
+                    task_failures.append({
+                        "capability": capability,
+                        "error_code": "NO_DEPLOYABLE_MODEL",
+                        "message": f"Nothing deployable for {capability} fits "
+                                   f"this phone's {max_size_mb:.0f} MB budget.",
+                    })
+
         # A user naming a specific repo bypasses keyword search entirely. The
         # outcome is decided deterministically here, from real HuggingFace
         # metadata and a real CDN HEAD — never by the language model, and never
@@ -2946,13 +4181,32 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
                 "error_code": explicit_rejection["code"]}
 
     if not models_data:
-        return {"response": "I searched the live model hubs and found nothing deployable "
-                            "that fits your phone for that request. Try different wording "
-                            "(e.g. 'recognize objects with my camera', 'offline chatbot', "
-                            "'identify sounds').",
-                "action": "search_models", "search_results": [], "error_code": None}
+        message = ("I searched the live model hubs and found nothing deployable "
+                   "that fits your phone for that request. Try different wording "
+                   "(e.g. 'recognize objects with my camera', 'offline chatbot', "
+                   "'identify sounds').")
+        if task_failures:
+            message = " ".join(f["message"] for f in task_failures)
+        return {"response": message, "action": "search_models",
+                "search_results": [], "grouped_results": [],
+                "task_failures": task_failures, "error_code": None}
 
-    # ── Step 5: NIM ranks and explains, nothing more ─────────────────────
+    # ── Step 5: a sourced description for every candidate ────────────────
+    # Both the primary path and the selector-failure fallback below return
+    # `models_data`, so describing here covers both. Fixing only the primary
+    # path would leave the fallback with empty descriptions.
+    async with pool.acquire() as conn:
+        verified_rows = await conn.fetch(
+            "SELECT hf_model_id, name FROM models WHERE user_id = $1::uuid",
+            user_id,
+        )
+    verified = {r["hf_model_id"]: dict(r) for r in verified_rows if r["hf_model_id"]}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _describe_models(
+            pool, client, models_data, device, max_size_mb, verified=verified
+        )
+
+    # ── Step 6: NIM ranks and explains, nothing more ─────────────────────
     try:
         sel = await openai_client.chat.completions.create(
             model=NIM_SELECTOR_MODEL,
@@ -2976,14 +4230,22 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         fallback_code = e.code if isinstance(e, AssistantError) else _classify_provider_error(e).code
         print(f"[assistant] selector failed ({fallback_code}: {type(e).__name__}); "
               f"returning backend-ranked results")
-        return {"response": "Here are the best deployable matches I found. "
+        # The fallback carries the same described candidates and grouping as
+        # the primary path; only the prose is the backend's rather than the
+        # provider's.
+        fallback_message = ("Here are the best deployable matches I found. "
                             "Press Deploy on one — the phone downloads it "
-                            "automatically, then open the LokiAI app.",
+                            "automatically, then open the LokiAI app.")
+        if task_failures:
+            fallback_message += " " + " ".join(f["message"] for f in task_failures)
+        return {"response": fallback_message,
                 "action": "search_models",
-                "search_results": models_data[:3],
+                "search_results": models_data[:6],
+                "grouped_results": grouped,
+                "task_failures": task_failures,
                 "error_code": fallback_code}
 
-    # ── Step 6: every returned model must exist in the real candidates ───
+    # ── Step 7: every returned model must exist in the real candidates ───
     # The model's free-form output can never introduce a repository id, a size,
     # a compatibility verdict, or a deploy target — it may only reorder and
     # describe entries the backend already verified.
@@ -2992,15 +4254,25 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
     for r in parsed.get("search_results") or []:
         if isinstance(r, dict) and r.get("id") in by_id:
             validated.append(by_id[r["id"]])
+    # A selector that drops entries must not silently discard a capability the
+    # user explicitly asked for; every grouped pick stays reachable.
+    for entry in grouped:
+        for model in entry["models"]:
+            if model not in validated:
+                validated.append(model)
 
     prose = _strip_prompt_leakage(str(parsed.get("response") or "").strip())
     if not prose:
         prose = ("Here are the best deployable matches I found. Press Deploy on one — "
                  "the phone downloads it automatically, then open the LokiAI app.")
+    if task_failures:
+        prose += " " + " ".join(f["message"] for f in task_failures)
 
     return {"response": prose,
             "action": "search_models",
             "search_results": validated,
+            "grouped_results": grouped,
+            "task_failures": task_failures,
             "error_code": None}
 
 

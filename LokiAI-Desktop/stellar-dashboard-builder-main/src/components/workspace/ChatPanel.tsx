@@ -372,10 +372,15 @@ function ModelCard({
     <div className="rounded-md border border-border bg-panel px-3 py-2">
       <div className="flex items-center gap-2">
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm text-foreground">{rec.name}</div>
+          <div className="truncate text-sm text-foreground" title={rec.id}>
+            {rec.display_name ?? rec.name}
+          </div>
           <div className="text-[11px] text-muted-foreground">
             {rec.size_mb ? `${rec.size_mb} MB · ` : ""}
-            {rec.task}
+            {rec.capability ?? rec.task}
+            {rec.estimated_device_fit && rec.estimated_device_fit !== "unknown"
+              ? ` · ${rec.estimated_device_fit} fit`
+              : ""}
           </div>
         </div>
         {st === "idle" ? (
@@ -402,6 +407,30 @@ function ModelCard({
           </span>
         )}
       </div>
+      {/* What the model does and why it was picked. The backend guarantees
+          both are present and sourced; the card used to show only a name,
+          a size, and a task tag, which is what made recommendations
+          unexplained. */}
+      {rec.description && (
+        <p className="mt-2 text-[11px] leading-relaxed text-foreground/75">
+          {rec.description}
+        </p>
+      )}
+      {rec.why_recommended && (
+        <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+          {rec.why_recommended}
+        </p>
+      )}
+      {rec.source_url && (
+        <a
+          href={rec.source_url}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="mt-1 inline-block text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+        >
+          Source: {rec.source ?? "model card"}
+        </a>
+      )}
       {(st === "downloading" || st === "queued") && (
         <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-secondary">
           <div
