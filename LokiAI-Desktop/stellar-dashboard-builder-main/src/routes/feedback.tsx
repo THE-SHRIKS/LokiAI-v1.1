@@ -2,7 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { ArrowLeft, MessageSquarePlus, CheckCircle2, AlertCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { backendUrl, getToken } from "@/lib/lokiai-api";
+import { getToken, submitFeedback } from "@/lib/lokiai-api";
 
 export const Route = createFileRoute("/feedback")({
   head: () => ({
@@ -40,18 +40,7 @@ function FeedbackPage() {
     setStatus("submitting");
     setErrorMsg("");
     try {
-      const res = await fetch(`${backendUrl()}/feedback`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getToken()!}`,
-        },
-        body: JSON.stringify({ category, message: message.trim() }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body?.detail ?? `HTTP ${res.status}`);
-      }
+      await submitFeedback(category, message.trim());
       setStatus("done");
       setMessage("");
     } catch (e) {

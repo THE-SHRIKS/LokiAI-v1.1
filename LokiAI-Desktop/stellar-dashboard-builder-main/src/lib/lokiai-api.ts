@@ -220,6 +220,13 @@ export async function resetPassword(token: string, newPassword: string) {
   );
 }
 
+export async function submitFeedback(category: string, message: string) {
+  return request<{ ok: true; id: string; email_status: string; correlation_id: string }>(
+    "/feedback",
+    { method: "POST", body: JSON.stringify({ category, message }) },
+  );
+}
+
 export interface Me {
   id: string;
   email: string;

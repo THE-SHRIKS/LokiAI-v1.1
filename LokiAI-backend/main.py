@@ -1078,6 +1078,11 @@ FEEDBACK_TO_EMAIL = os.getenv("FEEDBACK_TO_EMAIL", SMTP_FROM_EMAIL)
 # such block. See LokiAI-Desktop/stellar-dashboard-builder-main/api/send-email.ts.
 EMAIL_RELAY_URL = os.getenv("EMAIL_RELAY_URL")
 EMAIL_RELAY_SECRET = os.getenv("EMAIL_RELAY_SECRET")
+# The relay is a separate Vercel service.  Keep a known-good production
+# endpoint as a recovery path: an old Render environment variable used to
+# point at the marketing site, which returns HTML/404 and prevented every
+# OTP, password-reset and feedback email from leaving Render.
+DEFAULT_EMAIL_RELAY_URL = "https://lokiai.theshriks.space/api/send-email"
 
 OTP_TTL_MINUTES = 10
 OTP_MAX_ATTEMPTS = 5
@@ -1133,14 +1138,15 @@ class EmailRelayMisconfigured(RuntimeError):
 
 async def _send_email_via_relay(to_email: str, subject: str, text_body: str,
                                 html_body: str,
-                                reply_to: Optional[str] = None) -> str:
+                                reply_to: Optional[str] = None,
+                                relay_url: Optional[str] = None) -> str:
     payload = {"to": to_email, "subject": subject, "text": text_body,
                "html": html_body}
     if reply_to:
         payload["replyTo"] = reply_to
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         resp = await client.post(
-            EMAIL_RELAY_URL,
+            relay_url or EMAIL_RELAY_URL,
             json=payload,
             headers={"X-Relay-Secret": EMAIL_RELAY_SECRET},
         )
@@ -1169,6 +1175,8 @@ def email_delivery_path() -> str:
     """Which transport send_email will actually use. No secrets."""
     if EMAIL_RELAY_URL and EMAIL_RELAY_SECRET:
         return "relay"
+    if EMAIL_RELAY_SECRET:
+        return "relay (canonical fallback)"
     if SMTP_HOST and SMTP_USER and SMTP_PASSWORD:
         return "smtp"
     return "unconfigured"
@@ -1193,6 +1201,18 @@ async def send_email(to_email: str, subject: str, text_body: str, html_body: str
             # strictly better than failing outright, and the misconfiguration
             # is logged loudly either way.
             print(f"[email] RELAY MISCONFIGURED: {exc}")
+            # The app's relay is independently reachable at this stable URL.
+            # Try it before SMTP: Render blocks SMTP egress, so falling
+            # straight back to SMTP would make every mail-based flow fail.
+            if EMAIL_RELAY_URL.rstrip("/") != DEFAULT_EMAIL_RELAY_URL:
+                try:
+                    print("[email] trying the canonical relay endpoint")
+                    return await _send_email_via_relay(
+                        to_email, subject, text_body, html_body, reply_to,
+                        relay_url=DEFAULT_EMAIL_RELAY_URL,
+                    )
+                except Exception as fallback_exc:
+                    print(f"[email] canonical relay failed: {fallback_exc}")
             if not smtp_configured:
                 raise
             print("[email] falling back to direct SMTP")
@@ -1200,6 +1220,11 @@ async def send_email(to_email: str, subject: str, text_body: str, html_body: str
                 _send_email_sync, to_email, subject, text_body, html_body,
                 reply_to,
             )
+    if EMAIL_RELAY_SECRET and not EMAIL_RELAY_URL:
+        return await _send_email_via_relay(
+            to_email, subject, text_body, html_body, reply_to,
+            relay_url=DEFAULT_EMAIL_RELAY_URL,
+        )
     # Local dev fallback: direct SMTP (smtplib is synchronous — run off the event loop).
     return await asyncio.to_thread(
         _send_email_sync, to_email, subject, text_body, html_body, reply_to
