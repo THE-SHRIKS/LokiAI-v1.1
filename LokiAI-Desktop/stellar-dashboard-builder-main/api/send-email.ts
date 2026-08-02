@@ -1,6 +1,26 @@
-// Vercel Serverless Function (Node.js runtime) — independent of the
-// TanStack Start app; Vercel deploys anything under /api as its own
-// function regardless of the main framework.
+// !! THIS FILE IS NOT CURRENTLY DEPLOYED. !!
+//
+// It was written when this project was a plain Vercel app, where anything
+// under /api became a serverless function automatically. The workspace is now
+// a TanStack Start app built through Nitro and mounted as a "service" in the
+// repo-root vercel.json, and that build does NOT pick up a bare /api
+// directory. Every candidate URL returns the site's 404 page:
+//
+//   https://lokiai.theshriks.space/api/send-email            -> 404 (HTML)
+//   https://lokiai.theshriks.space/workspace/api/send-email  -> 404 (HTML)
+//   https://www.theshriks.space/api/send-email               -> 404
+//
+// That is why signup failed with "Email relay returned 404: <!DOCTYPE html...":
+// EMAIL_RELAY_URL on Render points at one of these, so the backend was POSTing
+// to a web page. The backend now detects this (EmailRelayMisconfigured), keeps
+// the HTML out of user-facing errors, falls back to direct SMTP, and reports
+// the state from GET /admin/email/status.
+//
+// To make this live again, either deploy it as a real server route of the
+// TanStack Start app, or host it as its own Vercel project and point
+// EMAIL_RELAY_URL at that deployment. Do not assume this file is running.
+//
+// Vercel Serverless Function (Node.js runtime).
 //
 // Why this exists: Render's free tier blocks outbound SMTP entirely
 // (ports 25/465/587), so LokiAI-backend can't send the OTP/password-reset

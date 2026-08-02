@@ -705,6 +705,11 @@ _FEEDBACK_BACKOFF_SECONDS = (60, 300, 900, 3600, 21600)
 
 def _feedback_error_code(exc: Exception) -> str:
     text = str(exc).lower()
+    # Retrying a URL that points at a web page can never succeed; this is a
+    # configuration fault, so it is classed permanent and stays visible.
+    if type(exc).__name__ == "EmailRelayMisconfigured" or (
+            "does not resolve to the relay" in text):
+        return "EMAIL_RELAY_MISCONFIGURED"
     if "not configured" in text:
         return "EMAIL_CONFIGURATION_MISSING"
     if "auth" in text or "535" in text:
@@ -779,7 +784,7 @@ async def _deliver_claimed_feedback(pool: asyncpg.Pool, row: asyncpg.Record) -> 
             return
 
     code = _feedback_error_code(error)
-    permanent = code in {"EMAIL_CONFIGURATION_MISSING", "SMTP_AUTH_REJECTED", "SMTP_RECIPIENT_REJECTED", "SMTP_SENDER_REJECTED"} or attempt >= len(_FEEDBACK_BACKOFF_SECONDS) + 1
+    permanent = code in {"EMAIL_CONFIGURATION_MISSING", "EMAIL_RELAY_MISCONFIGURED", "SMTP_AUTH_REJECTED", "SMTP_RECIPIENT_REJECTED", "SMTP_SENDER_REJECTED"} or attempt >= len(_FEEDBACK_BACKOFF_SECONDS) + 1
     status = "permanently_failed" if permanent else "retrying"
     delay = _FEEDBACK_BACKOFF_SECONDS[min(attempt - 1, len(_FEEDBACK_BACKOFF_SECONDS) - 1)]
     async with pool.acquire() as conn:
@@ -915,7 +920,41 @@ async def email_delivery_status(request: Request, _admin: str = Depends(require_
         "outbox": {row["status"]: row["n"] for row in counts},
         "oldest_unsent_at": oldest_pending,
         "last_error": dict(last_error) if last_error else None,
+        "relay_probe": await _probe_relay(),
     }
+
+
+async def _probe_relay() -> dict:
+    """Check that EMAIL_RELAY_URL actually resolves to the relay function.
+
+    A relay pointing at a web page returns that page's HTML, which is how a
+    404 marketing page ended up rendered inside a signup error. Probing it here
+    turns a user-facing surprise into an operator-visible fact.
+    """
+    if not EMAIL_RELAY_URL:
+        return {"configured": False, "reachable": None,
+                "detail": "EMAIL_RELAY_URL is not set; direct SMTP is in use."}
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            # No secret header: a working relay answers 401, which proves the
+            # function exists without sending anything.
+            resp = await client.post(EMAIL_RELAY_URL, json={})
+    except httpx.HTTPError as exc:
+        return {"configured": True, "reachable": False,
+                "detail": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+    content_type = resp.headers.get("content-type", "")
+    is_page = ("text/html" in content_type
+               or resp.text.lstrip()[:15].lower().startswith("<!doctype"))
+    if resp.status_code == 404 or is_page:
+        return {
+            "configured": True, "reachable": False,
+            "status": resp.status_code,
+            "detail": "EMAIL_RELAY_URL resolves to a web page, not the relay "
+                      "function. Email cannot be sent through it.",
+        }
+    return {"configured": True, "reachable": True, "status": resp.status_code,
+            "detail": "Relay function responded."}
 
 
 class TestDeliveryRequest(BaseModel):
@@ -1084,6 +1123,14 @@ def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: str
     return f"smtp:accepted refused={response or 'none'}"
 
 
+class EmailRelayMisconfigured(RuntimeError):
+    """The relay URL does not point at a working relay function.
+
+    Distinct from a delivery failure: retrying cannot help, and the fix is a
+    configuration change rather than a backoff.
+    """
+
+
 async def _send_email_via_relay(to_email: str, subject: str, text_body: str,
                                 html_body: str,
                                 reply_to: Optional[str] = None) -> str:
@@ -1091,15 +1138,31 @@ async def _send_email_via_relay(to_email: str, subject: str, text_body: str,
                "html": html_body}
     if reply_to:
         payload["replyTo"] = reply_to
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         resp = await client.post(
             EMAIL_RELAY_URL,
             json=payload,
             headers={"X-Relay-Secret": EMAIL_RELAY_SECRET},
         )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Email relay returned {resp.status_code}: {resp.text}")
-    return f"relay:{resp.status_code} {resp.text[:200]}"
+    if resp.status_code == 200:
+        return f"relay:{resp.status_code} {resp.text[:200]}"
+
+    # A 404, or any HTML body, means EMAIL_RELAY_URL is pointing at a web page
+    # rather than at the relay function. Returning the page itself is how a
+    # whole marketing site's markup ended up rendered inside a signup error.
+    content_type = resp.headers.get("content-type", "")
+    looks_like_a_web_page = (
+        "text/html" in content_type
+        or resp.text.lstrip()[:15].lower().startswith("<!doctype")
+    )
+    if resp.status_code == 404 or looks_like_a_web_page:
+        raise EmailRelayMisconfigured(
+            f"EMAIL_RELAY_URL does not resolve to the relay function "
+            f"(HTTP {resp.status_code}, content-type {content_type or 'unknown'})"
+        )
+    raise RuntimeError(
+        f"Email relay returned {resp.status_code}: {resp.text[:200]}"
+    )
 
 
 def email_delivery_path() -> str:
@@ -1118,10 +1181,25 @@ async def send_email(to_email: str, subject: str, text_body: str, html_body: str
     Render's free tier blocks outbound SMTP, so the relay is preferred whenever
     it is configured; direct SMTP remains the local-dev path.
     """
+    smtp_configured = bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
     if EMAIL_RELAY_URL and EMAIL_RELAY_SECRET:
-        return await _send_email_via_relay(
-            to_email, subject, text_body, html_body, reply_to
-        )
+        try:
+            return await _send_email_via_relay(
+                to_email, subject, text_body, html_body, reply_to
+            )
+        except EmailRelayMisconfigured as exc:
+            # A misconfigured relay must not take account creation down with
+            # it. Direct SMTP is blocked on some hosts, but trying it is
+            # strictly better than failing outright, and the misconfiguration
+            # is logged loudly either way.
+            print(f"[email] RELAY MISCONFIGURED: {exc}")
+            if not smtp_configured:
+                raise
+            print("[email] falling back to direct SMTP")
+            return await asyncio.to_thread(
+                _send_email_sync, to_email, subject, text_body, html_body,
+                reply_to,
+            )
     # Local dev fallback: direct SMTP (smtplib is synchronous — run off the event loop).
     return await asyncio.to_thread(
         _send_email_sync, to_email, subject, text_body, html_body, reply_to
@@ -1184,7 +1262,22 @@ async def _issue_otp(conn, user_id, email: str, name: str, purpose: str = "verif
     try:
         await send_email(email, "Your LokiAI verification code", text, html)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not send verification email: {e}")
+        # The provider's own response is for the logs, never for the user: a
+        # relay pointed at a web page returned a whole HTML document, which was
+        # interpolated straight into this message and rendered on the signup
+        # form. Users get a short, actionable sentence; operators get the
+        # detail plus a correlation id from the log.
+        correlation_id = _uuid.uuid4().hex[:12]
+        print(f"[email] OTP send failed corr={correlation_id} "
+              f"path={email_delivery_path()} {type(e).__name__}: {str(e)[:500]}")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "We couldn't send your verification code right now. This is a "
+                "problem on our side, not with your details. Please try again "
+                f"in a few minutes. (Reference {correlation_id})"
+            ),
+        )
 
 
 @app.get("/health")
