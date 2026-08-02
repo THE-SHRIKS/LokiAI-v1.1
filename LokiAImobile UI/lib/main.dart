@@ -293,6 +293,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
 
   CameraInference? _cameraInference;
   String _cameraInferenceResult = "Initializing ML...";
+  String _cameraState = 'idle';
 
   ChatInference? _chatInference;
   VoiceInference? _voiceInference;
@@ -319,15 +320,10 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
   }
 
   Future<void> _bootstrap() async {
-    final camStatus = await Permission.camera.request();
-    final micStatus = await Permission.microphone.request();
-    await Permission.manageExternalStorage.request();
-    await Permission.storage.request();
-
-    await _loadModelRuntime(
-      cameraGranted: camStatus.isGranted,
-      micGranted: micStatus.isGranted,
-    );
+    // Permissions are feature-scoped. Requesting camera, microphone and broad
+    // storage access at launch made a denied camera indistinguishable from a
+    // broken preview and violates modern Android permission guidance.
+    await _loadModelRuntime();
   }
 
   Future<void> _reloadAfterDeployment() async {
@@ -401,7 +397,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
         _appStatus = 'error';
       } else {
         _appStatus = 'ready';
-        _isCameraActive = configResult.config?.inferenceMode == 'camera';
+        _isCameraActive = false;
+        _cameraState = 'idle';
       }
     });
 
@@ -414,11 +411,61 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     // only when the user starts the matching feature (send, camera, or mic).
   }
 
-  void _toggleCamera() {
+  Future<void> _toggleCamera() async {
     HapticFeedback.lightImpact();
-    setState(() {
-      _isCameraActive = !_isCameraActive;
-    });
+    if (_isCameraActive) {
+      final camera = _cameraInference;
+      if (mounted) setState(() { _isCameraActive = false; _cameraState = 'idle'; });
+      _cameraInference = null;
+      await camera?.dispose();
+      return;
+    }
+
+    final config = _configResult?.config;
+    if (config == null || config.inferenceMode != 'camera' || !config.modelPath.endsWith('.tflite')) {
+      if (mounted) setState(() {
+        _cameraState = 'failed';
+        _cameraInferenceResult = 'Select a compatible vision TFLite model first.';
+      });
+      return;
+    }
+
+    if (mounted) setState(() { _cameraState = 'requesting_permission'; _cameraInferenceResult = 'Requesting camera permission…'; });
+    final permission = await Permission.camera.request();
+    if (!mounted) return;
+    _cameraGranted = permission.isGranted;
+    if (!permission.isGranted) {
+      setState(() {
+        _cameraState = permission.isPermanentlyDenied ? 'denied_permanently' : 'denied';
+        _cameraInferenceResult = permission.isPermanentlyDenied
+            ? 'Camera permission is blocked. Open Settings to allow it.'
+            : 'Camera permission was denied.';
+        _isCameraActive = true;
+      });
+      return;
+    }
+
+    setState(() { _cameraState = 'initializing_camera'; _cameraInferenceResult = 'Preparing camera…'; _isCameraActive = true; });
+    final camera = CameraInference();
+    _cameraInference = camera;
+    try {
+      await camera.initialize(config.modelPath, (result) {
+        if (!mounted || !identical(_cameraInference, camera)) return;
+        setState(() {
+          _cameraInferenceResult = result;
+          _cameraState = result.startsWith('Camera unavailable:') || result.startsWith('Error:')
+              ? 'failed'
+              : 'camera_ready';
+        });
+      });
+    } catch (error, stackTrace) {
+      debugPrint('CAMERA: initialization failed: $error\n$stackTrace');
+      if (identical(_cameraInference, camera)) {
+        _cameraInference = null;
+      }
+      await camera.dispose();
+      if (mounted) setState(() { _cameraState = 'failed'; _cameraInferenceResult = 'Unable to initialize camera: $error'; });
+    }
   }
 
   void _toggleMic() {
@@ -683,13 +730,13 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: LokiColors.dividerGray, width: 1),
         ),
-        child: const Center(
+        child: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(Icons.no_photography, color: LokiColors.accent, size: 32),
-              SizedBox(height: 12),
-              Text(
+              const Icon(Icons.no_photography, color: LokiColors.accent, size: 32),
+              const SizedBox(height: 12),
+              const Text(
                 'Camera permission required',
                 style: TextStyle(
                   color: LokiColors.accent,
@@ -697,11 +744,15 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                   fontWeight: FontWeight.w600,
                 ),
               ),
-              SizedBox(height: 4),
+              const SizedBox(height: 4),
               Text(
-                'Grant camera access in device settings',
+                _cameraState == 'denied_permanently'
+                    ? 'Camera access is blocked in Settings'
+                    : 'Grant camera access to use recognition',
                 style: TextStyle(color: LokiColors.textSecondary, fontSize: 12),
               ),
+              if (_cameraState == 'denied_permanently')
+                TextButton(onPressed: openAppSettings, child: const Text('Open Settings')),
             ],
           ),
         ),

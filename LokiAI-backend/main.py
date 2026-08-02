@@ -123,6 +123,40 @@ async def _run_migrations(pool: asyncpg.Pool):
             "CREATE INDEX IF NOT EXISTS feedback_user_created_idx "
             "ON feedback (user_id, created_at DESC)"
         )
+        # Feedback delivery is deliberately separate from submission.  A
+        # Render restart used to discard the request-scoped create_task before
+        # it got to SMTP; this durable outbox is safe across restarts and
+        # multiple web workers.
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS correlation_id TEXT")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS delivery_attempt_count INTEGER NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS last_delivery_attempt_at TIMESTAMPTZ")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS last_error_code TEXT")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS last_error_message TEXT")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'web'")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS application_version TEXT")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS platform TEXT")
+        await conn.execute("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS subject TEXT")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS feedback_email_outbox (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                feedback_id UUID NOT NULL UNIQUE REFERENCES feedback(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                locked_at TIMESTAMPTZ,
+                locked_by TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                delivered_at TIMESTAMPTZ
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS feedback_delivery_idx ON feedback (email_status, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS feedback_correlation_idx ON feedback (correlation_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS feedback_outbox_due_idx ON feedback_email_outbox (status, next_attempt_at)")
 
 
 async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> asyncpg.Pool:
@@ -197,12 +231,18 @@ async def lifespan(app: FastAPI):
     print(f"[presence] startup reconciliation: {reset}")
 
     sweep_task = asyncio.create_task(_presence_sweep(app.state.pool))
+    feedback_task = asyncio.create_task(_feedback_outbox_worker(app.state.pool))
     try:
         yield
     finally:
         sweep_task.cancel()
+        feedback_task.cancel()
         try:
             await sweep_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await feedback_task
         except asyncio.CancelledError:
             pass
         await app.state.pool.close()
@@ -544,44 +584,105 @@ async def monitor_get_log(limit: int = 50, _admin: str = Depends(require_admin))
 class FeedbackPayload(BaseModel):
     category: str
     message: str
+    subject: Optional[str] = None
+    source: Optional[str] = None
+    application_version: Optional[str] = None
+    platform: Optional[str] = None
 
 
-async def _deliver_feedback_email(
-    pool: asyncpg.Pool, feedback_id: _uuid.UUID, user_email: str,
-    user_name: Optional[str], category: str, message: str, created_at: datetime,
-) -> None:
-    """Send feedback notification and record its outcome without losing data."""
-    if not FEEDBACK_TO_EMAIL:
-        status, error = "failed", "FEEDBACK_TO_EMAIL is not configured"
-    else:
-        account = f"{user_name} <{user_email}>" if user_name else user_email
-        text_body = (
-            "New LokiAI feedback\n-------------------\n"
-            f"ID:       {feedback_id}\nFrom:     {account}\nCategory: {category}\n"
-            f"Time:     {created_at.isoformat()}\n\n{message}\n"
-        )
-        html_body = f"""<div style="font-family:sans-serif;background:#0A0A0A;color:#F5F5F5;padding:24px;border-radius:12px;max-width:520px;">
-<h2 style="margin-top:0;color:#8BC34A;">New Feedback</h2>
-<p><strong>Account:</strong> {html.escape(account)}<br><strong>Category:</strong> {html.escape(category)}<br><strong>Time:</strong> {created_at.isoformat()}</p>
-<div style="background:#141414;border-radius:8px;padding:16px;white-space:pre-wrap;">{html.escape(message)}</div></div>"""
-        try:
-            await send_email(
-                to_email=FEEDBACK_TO_EMAIL,
-                subject=f"[LokiAI Feedback] {category} - {user_email}",
-                text_body=text_body,
-                html_body=html_body,
-            )
-        except Exception as exc:
-            status, error = "failed", str(exc)[:500]
-            print(f"[feedback] email delivery failed for {feedback_id}: {error}")
-        else:
-            status, error = "delivered", None
+_FEEDBACK_WORKER_ID = f"feedback-{os.getpid()}-{_uuid.uuid4().hex[:8]}"
+_FEEDBACK_BACKOFF_SECONDS = (60, 300, 900, 3600, 21600)
 
+
+def _feedback_error_code(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "not configured" in text:
+        return "EMAIL_CONFIGURATION_MISSING"
+    if "auth" in text or "535" in text:
+        return "SMTP_AUTH_REJECTED"
+    if "recipient" in text or "rcpt" in text:
+        return "SMTP_RECIPIENT_REJECTED"
+    if "sender" in text or "mail from" in text:
+        return "SMTP_SENDER_REJECTED"
+    if "timeout" in text:
+        return "SMTP_TIMEOUT"
+    return "EMAIL_DELIVERY_FAILED"
+
+
+async def _claim_feedback_outbox(pool: asyncpg.Pool) -> Optional[asyncpg.Record]:
+    """Atomically claim one due record. SKIP LOCKED keeps concurrent workers safe."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE feedback SET email_status = $2, email_error = $3 WHERE id = $1",
-            feedback_id, status, error,
-        )
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """SELECT o.id, o.feedback_id, o.attempt_count, f.user_id, f.user_email,
+                          f.user_name, f.category, f.subject, f.message, f.created_at,
+                          f.source, f.application_version, f.platform, f.correlation_id
+                   FROM feedback_email_outbox o JOIN feedback f ON f.id=o.feedback_id
+                   WHERE o.status IN ('pending','retrying') AND o.next_attempt_at <= NOW()
+                   ORDER BY o.next_attempt_at, o.created_at
+                   FOR UPDATE SKIP LOCKED LIMIT 1"""
+            )
+            if not row:
+                return None
+            await conn.execute(
+                "UPDATE feedback_email_outbox SET status='sending', locked_at=NOW(), locked_by=$2, updated_at=NOW() WHERE id=$1",
+                row["id"], _FEEDBACK_WORKER_ID,
+            )
+            await conn.execute(
+                "UPDATE feedback SET email_status='sending', last_delivery_attempt_at=NOW(), updated_at=NOW() WHERE id=$1",
+                row["feedback_id"],
+            )
+            return row
+
+
+async def _deliver_claimed_feedback(pool: asyncpg.Pool, row: asyncpg.Record) -> None:
+    feedback_id, outbox_id = row["feedback_id"], row["id"]
+    correlation_id = row["correlation_id"] or _uuid.uuid4().hex
+    attempt = int(row["attempt_count"]) + 1
+    if not FEEDBACK_TO_EMAIL:
+        error = RuntimeError("FEEDBACK_TO_EMAIL is not configured")
+    else:
+        account = f"{row['user_name']} <{row['user_email']}>" if row["user_name"] else row["user_email"]
+        subject = row["subject"] or f"[LokiAI Feedback] {row['category']} - {row['user_email']}"
+        text_body = (f"Feedback ID: {feedback_id}\nAccount ID: {row['user_id']}\nAccount: {account}\n"
+                     f"Category: {row['category']}\nSubmitted: {row['created_at'].isoformat()}\n"
+                     f"Source: {row['source']}\nVersion: {row['application_version'] or 'unknown'}\n"
+                     f"Platform: {row['platform'] or 'unknown'}\nCorrelation ID: {correlation_id}\n\n{row['message']}")
+        html_body = f"<h2>New LokiAI feedback</h2><p><b>Feedback:</b> {feedback_id}<br><b>Account:</b> {html.escape(account)}<br><b>Category:</b> {html.escape(row['category'])}<br><b>Correlation:</b> {correlation_id}</p><pre>{html.escape(row['message'])}</pre>"
+        try:
+            await send_email(FEEDBACK_TO_EMAIL, subject, text_body, html_body)
+        except Exception as exc:
+            error = exc
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE feedback_email_outbox SET status='delivered', attempt_count=$2, delivered_at=NOW(), updated_at=NOW(), locked_at=NULL, locked_by=NULL WHERE id=$1", outbox_id, attempt)
+                await conn.execute("UPDATE feedback SET email_status='delivered', delivery_attempt_count=$2, delivered_at=NOW(), email_error=NULL, last_error_code=NULL, last_error_message=NULL, updated_at=NOW(), correlation_id=$3 WHERE id=$1", feedback_id, attempt, correlation_id)
+            print(f"[feedback] delivered feedback_id={feedback_id} correlation_id={correlation_id}")
+            return
+
+    code = _feedback_error_code(error)
+    permanent = code in {"EMAIL_CONFIGURATION_MISSING", "SMTP_AUTH_REJECTED", "SMTP_RECIPIENT_REJECTED", "SMTP_SENDER_REJECTED"} or attempt >= len(_FEEDBACK_BACKOFF_SECONDS) + 1
+    status = "permanently_failed" if permanent else "retrying"
+    delay = _FEEDBACK_BACKOFF_SECONDS[min(attempt - 1, len(_FEEDBACK_BACKOFF_SECONDS) - 1)]
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE feedback_email_outbox SET status=$2, attempt_count=$3, next_attempt_at=NOW() + ($4 || ' seconds')::interval, last_error_code=$5, last_error_message=$6, locked_at=NULL, locked_by=NULL, updated_at=NOW() WHERE id=$1", outbox_id, status, attempt, str(delay), code, str(error)[:500])
+        await conn.execute("UPDATE feedback SET email_status=$2, email_error=$3, delivery_attempt_count=$4, last_error_code=$5, last_error_message=$6, updated_at=NOW(), correlation_id=$7 WHERE id=$1", feedback_id, status, str(error)[:500], attempt, code, str(error)[:500], correlation_id)
+    print(f"[feedback] delivery {status} feedback_id={feedback_id} correlation_id={correlation_id} code={code}")
+
+
+async def _feedback_outbox_worker(pool: asyncpg.Pool) -> None:
+    while True:
+        try:
+            row = await _claim_feedback_outbox(pool)
+            if row:
+                await _deliver_claimed_feedback(pool, row)
+            else:
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[feedback] worker error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(5)
 
 @app.post("/feedback")
 async def submit_feedback(payload: FeedbackPayload, request: Request, user_id: str = Depends(get_current_user)):
@@ -607,17 +708,21 @@ async def submit_feedback(payload: FeedbackPayload, request: Request, user_id: s
             raise HTTPException(status_code=401, detail="Account not found")
         feedback_id = _uuid.uuid4()
         created_at = datetime.now(timezone.utc)
-        await conn.execute(
-            """INSERT INTO feedback
-               (id, user_id, user_email, user_name, category, message, created_at)
-               VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)""",
-            feedback_id, user_id, user["email"], user["name"], category, message, created_at,
-        )
-
-    asyncio.create_task(_deliver_feedback_email(
-        pool, feedback_id, user["email"], user["name"], category, message, created_at,
-    ))
-    return {"ok": True, "id": str(feedback_id), "email_status": "queued"}
+        correlation_id = _uuid.uuid4().hex
+        async with conn.transaction():
+            await conn.execute(
+                """INSERT INTO feedback
+                   (id, user_id, user_email, user_name, category, subject, message, source,
+                    application_version, platform, correlation_id, created_at, email_status)
+                   VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending')""",
+                feedback_id, user_id, user["email"], user["name"], category,
+                (payload.subject or "").strip()[:200] or None, message,
+                (payload.source or "web").strip()[:80],
+                (payload.application_version or "").strip()[:80] or None,
+                (payload.platform or "").strip()[:80] or None, correlation_id, created_at,
+            )
+            await conn.execute("INSERT INTO feedback_email_outbox (feedback_id) VALUES ($1)", feedback_id)
+    return {"ok": True, "id": str(feedback_id), "email_status": "pending", "correlation_id": correlation_id}
 
 @app.get("/feedback")
 async def get_feedback(request: Request, user_id: str = Depends(get_current_user)):
@@ -2169,7 +2274,7 @@ RUNTIME_SUPPORTED_TASKS = {
 
 
 def _intent_system_prompt() -> str:
-    """Stage 1: classify the message into exactly one task, or null. This
+    """Stage 1: classify every requested task, or an empty array. This
     call does ONE job — it never picks models; code does all filtering.
     Per-task example phrasings below were added 2026-07-15 after a real-NIM
     benchmark showed the fast 8b model missed under-specified requests
@@ -2177,7 +2282,7 @@ def _intent_system_prompt() -> str:
     11/11 on the benchmark set at a single ~0.46s call."""
     return """You classify a user's message for LokiAI, an app that finds and deploys on-device AI models to a paired phone.
 
-Map the message to exactly one task type from this fixed list:
+Map the message to every applicable task type from this fixed list:
 - object-detection — locating/detecting objects, or general camera vision requests ("detect", "spot", "find X in view")
 - image-classification — labeling/identifying/recognizing what's in a photo or camera frame ("classify", "recognize", "identify", "is there a cat in this photo")
 - text-generation — any chatbot, chat, assistant, or conversational text model the user wants ON their phone ("give me a chatbot", "I want to talk to an AI", "offline assistant", "something to chat with")
@@ -2185,9 +2290,9 @@ Map the message to exactly one task type from this fixed list:
 - audio-classification — identifying/classifying non-speech sounds ("what sound is that", "classify sounds", "identify noises")
 
 If the user explicitly asks about a specific HuggingFace model by its repository ID (e.g., "prithivMLmods/Fire-Detection-Siglip2" or a huggingface.co link), extract that ID as `explicit_model`.
-If the message is a greeting, thanks, small talk, or a question about LokiAI itself — anything that is NOT a request for a device capability — the task is null.
+If the message is a greeting, thanks, small talk, or a question about LokiAI itself — anything that is NOT a request for a device capability — tasks is an empty array.
 
-Reply with ONLY this JSON, nothing else: {"task": "<one of the list above>", "explicit_model": "<extracted_id_or_null>"} or {"task": null, "explicit_model": null}"""
+Reply with ONLY this JSON, nothing else: {"tasks": ["<zero or more values from the list above>"], "explicit_model": "<extracted_id_or_null>"}. Include every capability the user requests; for example vision plus chat returns ["image-classification", "text-generation"]."""
 
 
 def _assistant_system_prompt() -> str:
@@ -2663,6 +2768,30 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         max_retries=int(os.getenv("NIM_MAX_RETRIES", "1")),
     )
 
+    # A greeting must not pay the classifier plus router round-trip. This is
+    # routing, not a canned reply: the provider still produces the response
+    # using the same account-scoped NIM key and conversation history.
+    normalized_message = re.sub(r"[^a-z0-9? ]", "", req.message.lower()).strip()
+    conversational_fast_path = bool(re.fullmatch(
+        r"(?:hi+|hello+|hey+|yo+|thanks|thank you|what can you do\??|who are you\??)",
+        normalized_message,
+    ))
+    if conversational_fast_path:
+        try:
+            convo = await openai_client.chat.completions.create(
+                model=NIM_ROUTER_MODEL,
+                messages=[{"role": "system", "content": _assistant_system_prompt()},
+                          *history,
+                          {"role": "user", "content": req.message}],
+                temperature=0.6,
+                max_tokens=160,
+            )
+            reply = (convo.choices[0].message.content or "").strip()
+        except Exception as e:
+            raise _classify_provider_error(e)
+        return {"response": _strip_prompt_leakage(reply) or "I’m here to help you find and deploy on-device AI models.",
+                "action": None, "search_results": [], "error_code": None}
+
     # ── Step 2: intent extraction — single fast call, exception fallback ─
     async def classify_intent(model_id: str):
         resp = await openai_client.chat.completions.create(
@@ -2678,8 +2807,11 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             parsed = json.loads(resp.choices[0].message.content)
         except (json.JSONDecodeError, AttributeError, TypeError):
             parsed = {}
-        t = parsed.get("task")
-        t = t if t in VALID_TASKS else None
+        raw_tasks = parsed.get("tasks")
+        # Accept the old planner shape while all deployed versions transition.
+        if not isinstance(raw_tasks, list):
+            raw_tasks = [parsed.get("task")]
+        tasks = list(dict.fromkeys(t for t in raw_tasks if t in VALID_TASKS))
         
         explicit_model = parsed.get("explicit_model")
         if not explicit_model:
@@ -2695,27 +2827,27 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             # than sent to the HuggingFace API.
             explicit_model = None
 
-        return t, explicit_model
+        return tasks, explicit_model
 
     # A pasted repo URL is unambiguous — resolving it needs no model call at
     # all. Skipping the intent hop here removes a whole provider round trip
     # (and its failure modes) from the most deterministic request we handle.
     direct_repo = _extract_direct_repo(req.message)
     if direct_repo:
-        task, explicit_model = None, direct_repo
+        planned_tasks, explicit_model = [], direct_repo
     else:
         try:
-            task, explicit_model = await classify_intent(NIM_INTENT_MODEL)
+            planned_tasks, explicit_model = await classify_intent(NIM_INTENT_MODEL)
         except Exception as e:
             if NIM_ROUTER_MODEL == NIM_INTENT_MODEL:
                 raise _classify_provider_error(e)
             try:
-                task, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
+                planned_tasks, explicit_model = await classify_intent(NIM_ROUTER_MODEL)
             except Exception as e2:
                 raise _classify_provider_error(e2)
 
     # If they gave a specific model link, we proceed even if task is None.
-    if task and task not in RUNTIME_SUPPORTED_TASKS and not explicit_model:
+    if planned_tasks and not any(t in RUNTIME_SUPPORTED_TASKS for t in planned_tasks) and not explicit_model:
         return {
             "response": "LokiAI can currently run on-device sound classification, but its Android runtime does not yet support speech-to-text models such as Whisper or Moonshine. I won't recommend a file that the phone cannot initialise.",
             "action": None,
@@ -2723,7 +2855,7 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
             "error_code": "RUNTIME_UNSUPPORTED_TASK",
         }
 
-    if task is None and not explicit_model:
+    if not planned_tasks and not explicit_model:
         # Ambiguous or conversational — respond naturally, no search.
         try:
             convo = await openai_client.chat.completions.create(
@@ -2741,11 +2873,13 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
                 "action": None, "search_results": [], "error_code": None}
 
     # ── Steps 3-4: real search + Python-only filtering ───────────────────
-    tasks = [task] if task else []
-    if task == "object-detection":
-        tasks = ["object-detection", "image-classification"]
-    elif task == "image-classification":
-        tasks = ["image-classification", "object-detection"]
+    tasks = list(planned_tasks)
+    # Vision tasks share candidate pools. Add the sibling without dropping a
+    # simultaneously requested chat/audio task.
+    if "object-detection" in planned_tasks and "image-classification" not in tasks:
+        tasks.append("image-classification")
+    elif "image-classification" in planned_tasks and "object-detection" not in tasks:
+        tasks.append("object-detection")
 
     models_data = []
     explicit_rejection = None
