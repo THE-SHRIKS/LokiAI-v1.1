@@ -103,23 +103,37 @@ class _PairingScreenState extends State<PairingScreen> {
       _statusIsError = false;
       _statusMessage = 'QR detected — verifying connection…';
     });
-    await _controller.stop();
+    try {
+      await _controller.stop();
 
-    final error = await widget.onScanned(data);
-    if (!mounted) return;
-    if (error != null) {
+      final error = await widget.onScanned(data);
+      if (!mounted) return;
+      if (error != null) {
+        setState(() {
+          _processing = false;
+          _statusIsError = true;
+          // Replace the caller's error with a generic message — never echo
+          // the pairing token, backend URL, or raw API response.
+          _statusMessage = 'Pairing failed — scan a fresh QR.';
+        });
+        await _controller.start();
+      } else {
+        setState(() {
+          _statusMessage = 'Connected to LokiAI';
+        });
+      }
+    } catch (_) {
+      if (!mounted) return;
       setState(() {
         _processing = false;
         _statusIsError = true;
-        // Replace the caller's error with a generic message — never echo
-        // the pairing token, backend URL, or raw API response.
-        _statusMessage = 'Pairing failed — scan a fresh QR.';
+        _statusMessage = 'Pairing could not complete. Try scanning again.';
       });
-      await _controller.start();
-    } else {
-      setState(() {
-        _statusMessage = 'Connected to LokiAI';
-      });
+      try {
+        await _controller.start();
+      } catch (_) {
+        // The scanner errorBuilder provides the recovery state.
+      }
     }
   }
 

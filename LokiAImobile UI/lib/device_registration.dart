@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -25,12 +26,12 @@ class DeviceSpecs {
   });
 
   Map<String, dynamic> toJson() => {
-        'phone_model': phoneModel,
-        'cpu_arch': cpuArch,
-        'ram_mb': ramMb,
-        'storage_free_gb': storageFreeGb,
-        'android_version': androidVersion,
-      };
+    'phone_model': phoneModel,
+    'cpu_arch': cpuArch,
+    'ram_mb': ramMb,
+    'storage_free_gb': storageFreeGb,
+    'android_version': androidVersion,
+  };
 }
 
 class RegistrationResult {
@@ -64,7 +65,8 @@ class DeviceRegistration {
           : 'unknown',
       ramMb: info.physicalRamSize,
       storageFreeGb: double.parse(
-          (info.freeDiskSize / (1024 * 1024 * 1024)).toStringAsFixed(2)),
+        (info.freeDiskSize / (1024 * 1024 * 1024)).toStringAsFixed(2),
+      ),
       androidVersion: info.version.release,
     );
     // ignore: avoid_print
@@ -80,8 +82,7 @@ class DeviceRegistration {
     try {
       specs = await readOwnSpecs();
     } catch (e) {
-      return RegistrationResult(
-          error: 'Could not read device specs: $e');
+      return RegistrationResult(error: 'Could not read device specs: $e');
     }
 
     final client = HttpClient()
@@ -94,8 +95,10 @@ class DeviceRegistration {
       final response = await request.close();
       final body = await response.transform(utf8.decoder).join();
       // ignore: avoid_print
-      print('VERIFICATION: devices_pair -> '
-          'status=${response.statusCode} body=$body');
+      print(
+        'VERIFICATION: devices_pair -> '
+        'status=${response.statusCode} body=$body',
+      );
 
       if (response.statusCode == 200) {
         final json = jsonDecode(body) as Map<String, dynamic>;
@@ -103,7 +106,8 @@ class DeviceRegistration {
         final websocketUrl = json['websocket_url'] as String?;
         if (deviceId == null || deviceId.isEmpty) {
           return const RegistrationResult(
-              error: 'Backend returned no device_id. Try again.');
+            error: 'Backend returned no device_id. Try again.',
+          );
         }
         final deviceToken = json['device_token'] as String?;
         final prefs = await SharedPreferences.getInstance();
@@ -118,24 +122,40 @@ class DeviceRegistration {
           await DeviceCredentialStore.write(deviceToken);
         }
         return RegistrationResult(
-            deviceId: deviceId, websocketUrl: websocketUrl);
+          deviceId: deviceId,
+          websocketUrl: websocketUrl,
+        );
       }
       if (response.statusCode == 400) {
         return const RegistrationResult(
-            error: 'This code has expired or was already used. '
-                'Generate a new one from the dashboard.');
+          error:
+              'This code has expired or was already used. '
+              'Generate a new one from the dashboard.',
+        );
       }
       return RegistrationResult(
-          error: 'Pairing failed (${response.statusCode}): $body');
+        error: 'Pairing failed (${response.statusCode}): $body',
+      );
     } on SocketException catch (e) {
       return RegistrationResult(
-          error: 'Could not reach ${qr.backendUrl} — ${e.message}. '
-              'Check that the phone and the backend are on the same network.');
+        error:
+            'Could not reach ${qr.backendUrl} — ${e.message}. '
+            'Check that the phone and the backend are on the same network.',
+      );
+    } on TimeoutException {
+      return const RegistrationResult(
+        error: 'The backend took too long to respond. Try pairing again.',
+      );
     } on HttpException catch (e) {
       return RegistrationResult(error: 'HTTP error while pairing: $e');
     } on FormatException catch (e) {
       return RegistrationResult(
-          error: 'Backend sent an unreadable response: $e');
+        error: 'Backend sent an unreadable response: $e',
+      );
+    } catch (_) {
+      return const RegistrationResult(
+        error: 'Could not contact LokiAI. Check your connection and try again.',
+      );
     } finally {
       client.close();
     }
@@ -146,7 +166,9 @@ class DeviceRegistration {
     final prefs = await SharedPreferences.getInstance();
     final deviceId = prefs.getString(prefsDeviceId);
     final backendUrl = prefs.getString(prefsBackendUrl);
-    return deviceId != null && deviceId.isNotEmpty &&
-        backendUrl != null && backendUrl.isNotEmpty;
+    return deviceId != null &&
+        deviceId.isNotEmpty &&
+        backendUrl != null &&
+        backendUrl.isNotEmpty;
   }
 }

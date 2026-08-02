@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'config_reader.dart';
 import 'device_credential_store.dart';
 import 'device_registration.dart';
+import 'diagnostics.dart';
 import 'model_downloader.dart';
 
 /// Persistent WebSocket link to the backend (v3 wireless architecture).
@@ -58,7 +59,8 @@ class BackendConnection {
   /// without asking the user to close and reopen the app.
   final ValueNotifier<int> deploymentRevision = ValueNotifier<int>(0);
 
-  bool get isConnected => _socket != null && _socket!.readyState == WebSocket.open;
+  bool get isConnected =>
+      _socket != null && _socket!.readyState == WebSocket.open;
 
   /// Reads pairing data from SharedPreferences and opens the socket.
   /// Safe to call repeatedly — only the first call arms the connection.
@@ -66,11 +68,20 @@ class BackendConnection {
     if (_started) return;
     _started = true;
 
-    if (!await _loadPairingData()) {
+    try {
+      if (!await _loadPairingData()) {
+        _started = false;
+        return;
+      }
+      await _connect();
+    } catch (error, stackTrace) {
       _started = false;
-      return;
+      Diagnostics.capture(
+        feature: 'backend_connection.start',
+        error: error,
+        stackTrace: stackTrace,
+      );
     }
-    await _connect();
   }
 
   /// Re-reads pairing data and reconnects immediately if the socket is down.
@@ -92,8 +103,16 @@ class BackendConnection {
     print('VERIFICATION: ws -> resume: reconnecting now');
     _reconnectTimer?.cancel();
     _reconnectAttempts = 0;
-    await _loadPairingData();
-    await _connect();
+    try {
+      await _loadPairingData();
+      await _connect();
+    } catch (error, stackTrace) {
+      Diagnostics.capture(
+        feature: 'backend_connection.resume',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   Future<bool> _loadPairingData() async {
@@ -104,7 +123,8 @@ class BackendConnection {
     _wsUrl = prefs.getString(DeviceRegistration.prefsWebsocketUrl);
 
     if ((_wsUrl == null || _wsUrl!.isEmpty) &&
-        _deviceId != null && _deviceId!.isNotEmpty) {
+        _deviceId != null &&
+        _deviceId!.isNotEmpty) {
       final backend = prefs.getString(DeviceRegistration.prefsBackendUrl);
       if (backend != null && backend.isNotEmpty) {
         final wsBase = backend
@@ -118,15 +138,19 @@ class BackendConnection {
     // saved websocket_url from pairing already carries it; older installs
     // (paired before device tokens existed) have a stored token but a bare
     // URL, so attach it here.
-    if (_wsUrl != null && _wsUrl!.isNotEmpty &&
-        deviceToken != null && deviceToken.isNotEmpty &&
+    if (_wsUrl != null &&
+        _wsUrl!.isNotEmpty &&
+        deviceToken != null &&
+        deviceToken.isNotEmpty &&
         !_wsUrl!.contains('token=')) {
       final sep = _wsUrl!.contains('?') ? '&' : '?';
       _wsUrl = '$_wsUrl${sep}token=$deviceToken';
     }
 
-    if (_wsUrl == null || _wsUrl!.isEmpty ||
-        _deviceId == null || _deviceId!.isEmpty) {
+    if (_wsUrl == null ||
+        _wsUrl!.isEmpty ||
+        _deviceId == null ||
+        _deviceId!.isEmpty) {
       // ignore: avoid_print
       print('VERIFICATION: ws -> no pairing data saved, not connecting');
       return false;
@@ -147,16 +171,21 @@ class BackendConnection {
     _connecting = true;
     try {
       // ignore: avoid_print
-      print('VERIFICATION: ws -> connecting (attempt ${_reconnectAttempts + 1})');
-      _socket = await WebSocket.connect(_wsUrl!)
-          .timeout(const Duration(seconds: 15));
+      print(
+        'VERIFICATION: ws -> connecting (attempt ${_reconnectAttempts + 1})',
+      );
+      _socket = await WebSocket.connect(
+        _wsUrl!,
+      ).timeout(const Duration(seconds: 15));
       _reconnectAttempts = 0;
       // ignore: avoid_print
       print('VERIFICATION: ws -> connected device_id=$_deviceId');
 
       _heartbeatTimer?.cancel();
-      _heartbeatTimer =
-          Timer.periodic(heartbeatInterval, (_) => _sendHeartbeat());
+      _heartbeatTimer = Timer.periodic(
+        heartbeatInterval,
+        (_) => _sendHeartbeat(),
+      );
 
       _socket!.listen(
         _onMessage,
@@ -197,6 +226,14 @@ class BackendConnection {
       print('VERIFICATION: ws -> websocket error: $e');
       _socket = null;
       _scheduleReconnect();
+    } catch (error, stackTrace) {
+      Diagnostics.capture(
+        feature: 'backend_connection.connect',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      _socket = null;
+      _scheduleReconnect();
     } finally {
       _connecting = false;
     }
@@ -218,7 +255,9 @@ class BackendConnection {
   /// fallback.
   void _onCredentialRejected() {
     // ignore: avoid_print
-    print('VERIFICATION: ws -> credential rejected by backend; re-pair required');
+    print(
+      'VERIFICATION: ws -> credential rejected by backend; re-pair required',
+    );
     _heartbeatTimer?.cancel();
     _reconnectTimer?.cancel();
     _socket = null;
@@ -238,18 +277,27 @@ class BackendConnection {
   /// Exponential backoff with full jitter, capped, and never giving up.
   void _scheduleReconnect() {
     _reconnectAttempts += 1;
-    final expMs = minReconnectDelay.inMilliseconds * pow(2, _reconnectAttempts - 1);
-    final cappedMs = min(expMs.toDouble(), maxReconnectDelay.inMilliseconds.toDouble());
+    final expMs =
+        minReconnectDelay.inMilliseconds * pow(2, _reconnectAttempts - 1);
+    final cappedMs = min(
+      expMs.toDouble(),
+      maxReconnectDelay.inMilliseconds.toDouble(),
+    );
     // Full jitter: pick uniformly in [min, capped] so a fleet of devices
     // reconnecting after a backend restart spreads out instead of stampeding.
-    final jitteredMs = minReconnectDelay.inMilliseconds +
-        _rng.nextInt(max(1, (cappedMs - minReconnectDelay.inMilliseconds).round() + 1));
+    final jitteredMs =
+        minReconnectDelay.inMilliseconds +
+        _rng.nextInt(
+          max(1, (cappedMs - minReconnectDelay.inMilliseconds).round() + 1),
+        );
 
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(Duration(milliseconds: jitteredMs), () {
       // ignore: avoid_print
-      print('VERIFICATION: ws -> reconnect attempt $_reconnectAttempts '
-          'after ${jitteredMs}ms');
+      print(
+        'VERIFICATION: ws -> reconnect attempt $_reconnectAttempts '
+        'after ${jitteredMs}ms',
+      );
       _connect();
     });
   }
@@ -296,8 +344,10 @@ class BackendConnection {
     final socket = _socket;
     if (socket == null || socket.readyState != WebSocket.open) {
       // ignore: avoid_print
-      print('VERIFICATION: ws -> send skipped (not connected): '
-          '${payload['type'] ?? payload['status'] ?? 'message'}');
+      print(
+        'VERIFICATION: ws -> send skipped (not connected): '
+        '${payload['type'] ?? payload['status'] ?? 'message'}',
+      );
       return;
     }
     socket.add(jsonEncode(payload));
@@ -318,7 +368,12 @@ class BackendConnection {
     }
 
     if (data['action'] == 'deploy') {
-      _handleDeployment(data);
+      unawaited(
+        Diagnostics.guard(
+          'backend_connection.deployment',
+          () => _handleDeployment(data),
+        ),
+      );
       return;
     }
 
