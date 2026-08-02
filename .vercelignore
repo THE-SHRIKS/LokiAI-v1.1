@@ -1,0 +1,9 @@
+# Render owns the backend; Vercel only builds the marketing and workspace
+# services declared in vercel.json. Excluding these keeps local binaries and
+# Android build assets out of the deployment upload.
+LokiAI-backend/**
+LokiAImobile UI/**
+Timeline 1.mov
+flutter/**
+go/**
+.pub-cache/**
