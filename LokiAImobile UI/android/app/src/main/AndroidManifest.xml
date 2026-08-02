@@ -1,7 +1,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
+    <!--
+      Storage: every model, config and registry file this app writes goes to
+      getApplicationDocumentsDirectory() - app-private internal storage, which
+      needs no permission at all. The only external read is the legacy v2
+      /sdcard/edgemind/config.json fallback, so READ is scoped to the API
+      levels where it was actually required.
+
+      MANAGE_EXTERNAL_STORAGE (All Files Access) was declared here but never
+      requested anywhere in the code, and nothing needs it. It is a
+      high-risk permission that triggers Play Store policy review and shows
+      users an alarming "access all files" prompt for no functionality.
+      Removed. WRITE_EXTERNAL_STORAGE is likewise unused and is capped at the
+      last API level where it had any effect.
+    -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.CAMERA"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>

@@ -349,6 +349,11 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
   final CameraFeatureController _camera = CameraFeatureController();
   final MicFeatureController _mic = MicFeatureController();
 
+  /// Every model downloaded to this phone, from the on-device registry. The
+  /// camera and microphone resolve their model from here, so they are not
+  /// limited to whichever single model is currently active for chat.
+  List<AppConfig> _installed = const [];
+
   ChatInference? _chatInference;
   late final VoidCallback _deploymentListener;
   Future<void> _runtimeQueue = Future.value();
@@ -479,6 +484,10 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
     bool? micGranted,
   }) async {
     final configResult = await ConfigReader.load();
+    // Every model this phone has downloaded, not just the active one. The
+    // camera and microphone are separate features from chat and must not be
+    // dead simply because the *active* deployment happens to be a chat model.
+    final installed = await ConfigReader.loadInstalled();
     await _disposeInferenceRuntimes();
     // A model switch invalidates whatever runtime the camera has open.
     await _camera.close();
@@ -487,6 +496,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
 
     setState(() {
       _configResult = configResult;
+      _installed = installed;
 
       if (configResult.error == 'no_model') {
         _appStatus = 'no_model';
@@ -503,15 +513,49 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
     // only when the user starts the matching feature (send, camera, or mic).
   }
 
-  /// The deployed TFLite model for a given feature, or null when the active
-  /// deployment is for something else. The camera preview no longer depends on
-  /// this -- only live labelling does.
+  /// A downloaded TFLite model for [inferenceMode], or null if none exists.
+  ///
+  /// This used to consider only the ACTIVE deployment, which is why the
+  /// microphone did nothing: config.json holds a single model, so with a chat
+  /// model active the lookup returned null and the mic reported "deploy an
+  /// audio model" even when an audio model was already downloaded. The active
+  /// model is still preferred; the rest of the registry is the fallback, so
+  /// camera and mic work alongside chat.
   String? _modelPathFor(String inferenceMode) {
-    final config = _configResult?.config;
-    if (config == null) return null;
-    if (config.inferenceMode != inferenceMode) return null;
-    if (!config.modelPath.endsWith('.tflite')) return null;
-    return config.modelPath;
+    final active = _configResult?.config;
+    if (active != null &&
+        active.inferenceMode == inferenceMode &&
+        active.modelPath.endsWith('.tflite')) {
+      return active.modelPath;
+    }
+    for (final model in _installed) {
+      if (model.inferenceMode == inferenceMode &&
+          model.modelPath.endsWith('.tflite')) {
+        return model.modelPath;
+      }
+    }
+    return null;
+  }
+
+  /// The GGUF chat model to talk to, active deployment first.
+  ///
+  /// Same rule as [_modelPathFor], and for the same reason: only one model can
+  /// be active at a time, so looking solely at the active one made chat go
+  /// dead whenever a camera or voice model was deployed.
+  String? _chatModelPath() {
+    bool isChat(AppConfig c) =>
+        c.llmPath != null ||
+        (c.inferenceMode == 'chat' &&
+            (c.modelPath.endsWith('.gguf') || c.modelPath.endsWith('.bin')));
+
+    final active = _configResult?.config;
+    if (active != null && isChat(active)) {
+      return active.llmPath ?? active.modelPath;
+    }
+    for (final model in _installed) {
+      if (isChat(model)) return model.llmPath ?? model.modelPath;
+    }
+    return null;
   }
 
   Future<void> _toggleCamera() async {
@@ -590,9 +634,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
 
     try {
       if (_chatInference == null) {
-        final config = _configResult?.config;
-        final chatPath = config?.llmPath ??
-            (config?.inferenceMode == 'chat' ? config?.modelPath : null);
+        final chatPath = _chatModelPath();
         if (chatPath == null ||
             !(chatPath.endsWith('.gguf') || chatPath.endsWith('.bin'))) {
           finish(
@@ -733,7 +775,14 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
       );
     }
 
-    if (_appStatus == 'no_model') {
+    // These two states used to return early and unconditionally, so anything
+    // already in the conversation was hidden. A camera or microphone message
+    // added while no chat model was active therefore never appeared, and both
+    // buttons looked completely dead. The empty state is now only shown when
+    // there is genuinely nothing else to display.
+    final hasContent = _messages.isNotEmpty || _camera.isOpen;
+
+    if (_appStatus == 'no_model' && !hasContent) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -750,7 +799,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
             ),
             const SizedBox(height: 8),
             const Text(
-              'Connect to laptop to deploy.',
+              'Deploy one from the LokiAI dashboard.',
               style: TextStyle(color: LokiColors.textSecondary, fontSize: 13),
             ),
           ],
@@ -758,16 +807,20 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
       );
     }
 
-    if (_appStatus == 'error') {
+    if (_appStatus == 'error' && !hasContent) {
       return Center(
-        child: Text(
-          'Error: ${_configResult?.error}',
-          style: const TextStyle(color: LokiColors.accent),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Text(
+            'Error: ${_configResult?.error}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: LokiColors.accent),
+          ),
         ),
       );
     }
 
-    if (_messages.isEmpty && !_camera.isOpen) {
+    if (!hasContent) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
