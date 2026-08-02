@@ -2656,7 +2656,9 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         # yields a typed NIM_TIMEOUT the UI can act on, which is far better
         # than an indefinite spinner.
         timeout=float(os.getenv("NIM_TIMEOUT_SECONDS", "20")),
-        max_retries=0,
+        # One SDK-managed retry covers transient connection and timeout errors
+        # without changing prompts, models, routing, or response schemas.
+        max_retries=int(os.getenv("NIM_MAX_RETRIES", "1")),
     )
 
     # ── Step 2: intent extraction — single fast call, exception fallback ─
