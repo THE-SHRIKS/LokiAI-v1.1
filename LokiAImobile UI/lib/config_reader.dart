@@ -66,6 +66,19 @@ class AppConfig {
     }
     return '$displayMode — $modelName';
   }
+
+  Map<String, dynamic> toJson() => {
+        'model_name': modelName,
+        'model_path': modelPath,
+        'inference_mode': inferenceMode,
+        'format': format,
+        'confidence_threshold': confidenceThreshold,
+        'deployment_id': deploymentId,
+        'model_size_bytes': modelSizeBytes,
+        'model_sha256': modelSha256,
+        if (llmModel != null) 'llm_model': llmModel,
+        if (llmPath != null) 'llm_path': llmPath,
+      };
 }
 
 /// Result returned by ConfigReader.load()
@@ -83,6 +96,36 @@ class ConfigResult {
 /// pipeline), then the legacy /sdcard/edgemind path as fallback.
 /// Does NOT request permissions — caller must do that first.
 class ConfigReader {
+  static Future<List<AppConfig>> loadInstalled() async {
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final registry = File('${docs.path}/model-registry.json');
+      if (!await registry.exists()) {
+        final active = await load();
+        return active.config == null ? [] : [active.config!];
+      }
+      final decoded = jsonDecode(await registry.readAsString());
+      if (decoded is! List) return [];
+      final installed = <AppConfig>[];
+      for (final item in decoded) {
+        if (item is! Map) continue;
+        final config = AppConfig.fromJson(Map<String, dynamic>.from(item));
+        if (config.modelPath.isNotEmpty && await File(config.modelPath).exists()) {
+          installed.add(config);
+        }
+      }
+      return installed;
+    } catch (e) {
+      print('VERIFICATION: config_reader -> installed models error: $e');
+      return [];
+    }
+  }
+
+  static Future<void> activate(AppConfig config) async {
+    final docs = await getApplicationDocumentsDirectory();
+    await File('${docs.path}/config.json').writeAsString(jsonEncode(config.toJson()));
+  }
+
   static Future<ConfigResult> load() async {
     // v3 wireless deployments write to internal app storage.
     try {

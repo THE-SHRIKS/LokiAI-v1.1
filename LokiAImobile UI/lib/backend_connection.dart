@@ -53,6 +53,11 @@ class BackendConnection {
   /// silently never comes online. Retrying is suspended while set.
   final ValueNotifier<bool> needsRePair = ValueNotifier<bool>(false);
 
+  /// Increments after a deployment has finished downloading. The home screen
+  /// listens to this so a newly deployed model becomes available immediately,
+  /// without asking the user to close and reopen the app.
+  final ValueNotifier<int> deploymentRevision = ValueNotifier<int>(0);
+
   bool get isConnected => _socket != null && _socket!.readyState == WebSocket.open;
 
   /// Reads pairing data from SharedPreferences and opens the socket.
@@ -313,7 +318,7 @@ class BackendConnection {
     }
 
     if (data['action'] == 'deploy') {
-      ModelDownloader.handleDeploy(data, send);
+      _handleDeployment(data);
       return;
     }
 
@@ -325,5 +330,11 @@ class BackendConnection {
       // ignore: avoid_print
       print('VERIFICATION: ws -> state_ack pending=$pending');
     }
+  }
+
+  Future<void> _handleDeployment(Map<String, dynamic> data) async {
+    await ModelDownloader.handleDeploy(data, send);
+    deploymentRevision.value += 1;
+    await _sendStateReport();
   }
 }

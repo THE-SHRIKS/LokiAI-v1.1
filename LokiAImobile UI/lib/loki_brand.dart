@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
 class LokiBrand extends StatelessWidget {
-  const LokiBrand({super.key, this.imageHeight = 28, this.showName = true});
+  const LokiBrand({super.key, this.imageHeight = 28, this.showName = false});
 
   final double imageHeight;
   final bool showName;

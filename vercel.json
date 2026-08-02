@@ -44,6 +44,10 @@
   ],
   "rewrites": [
     {
+      "source": "/downloads/lokiai-android.apk",
+      "destination": "https://lokiai.onrender.com/apk/download"
+    },
+    {
       "source": "/workspace/(.*)",
       "destination": {
         "service": "workspace"

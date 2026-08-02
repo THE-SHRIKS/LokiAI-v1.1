@@ -3,6 +3,7 @@ import { useState, type FormEvent } from "react";
 import { Asterisk, LogIn, UserPlus, Mail, ArrowLeft } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { login, register, verifyOtp, resendOtp, getToken, ApiError } from "@/lib/lokiai-api";
+import lokiaiLogoUrl from "@/assets/lokiai-logo.png";
 
 export const Route = createFileRoute("/login")({
   // `mode=signup` lets an external entry point (the marketing site's
@@ -132,7 +133,7 @@ function LoginPage() {
     <div className="flex h-screen flex-col items-center justify-center bg-background text-foreground">
       <div className="w-full max-w-sm rounded-md border border-border bg-panel">
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-          <img src="/lokiai-logo.png" alt="LokiAI" style={{ height: 22, width: "auto", opacity: 0.9 }} />
+          <img src={lokiaiLogoUrl} alt="LokiAI" style={{ height: 22, width: "auto", opacity: 0.9 }} />
           <span className="ml-auto text-[11px] text-muted-foreground">
             on-device AI, no cloud
           </span>

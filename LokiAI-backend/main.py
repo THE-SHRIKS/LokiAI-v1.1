@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException, Request, Response, Depends, UploadFile, File, Form
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
 from typing import Optional, List
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timezone, timedelta
 import asyncio
+import html
 import os
 import re
 import asyncpg
@@ -105,6 +106,23 @@ async def _run_migrations(pool: asyncpg.Pool):
         # is unusable (and the shared free-tier quota unshared) until the
         # user provides one. Encrypted at rest; never returned to the client.
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS nvidia_api_key_encrypted TEXT")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id              UUID PRIMARY KEY,
+                user_id         UUID REFERENCES users(id) NOT NULL,
+                user_email      TEXT NOT NULL,
+                user_name       TEXT,
+                category        TEXT NOT NULL,
+                message         TEXT NOT NULL,
+                email_status    TEXT NOT NULL DEFAULT 'queued',
+                email_error     TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS feedback_user_created_idx "
+            "ON feedback (user_id, created_at DESC)"
+        )
 
 
 async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> asyncpg.Pool:
@@ -191,7 +209,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-limiter = Limiter(key_func=get_remote_address)
+# A conservative default protects every HTTP endpoint, including routes that
+# don't have a bespoke limit. More expensive actions retain tighter limits
+# below. This is intentionally high enough for normal app polling/download
+# setup while making a free-tier Render instance much less attractive to
+# simple request floods.
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 app.state.limiter = limiter
 
 
@@ -223,6 +246,7 @@ def _user_or_ip_key(request: Request) -> str:
 # origins (not "*") are required anyway once allow_credentials=True — the
 # refresh-token cookie only works with a concrete origin allowlist.
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 import time, collections, uuid as _uuid
 
@@ -266,9 +290,17 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_origin_regex=_LOCALHOST_ORIGIN_REGEX,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
+
+# Host-header poisoning is only meaningful in production. Local development
+# and LAN pairing deliberately accept their local host/IP; Render only accepts
+# the known backend names unless an operator explicitly adds another host.
+if os.getenv("RENDER"):
+    _default_hosts = "lokiai.onrender.com,lokiai.theshriks.space"
+    _allowed_hosts = [h.strip() for h in os.getenv("ALLOWED_HOSTS", _default_hosts).split(",") if h.strip()]
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -280,6 +312,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Content-Security-Policy"] = "default-src 'self'"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # Authentication and account responses must never be cached by a
+        # browser, shared proxy, or intermediary.
+        if request.url.path.startswith("/auth/") or request.headers.get("authorization"):
+            response.headers["Cache-Control"] = "no-store, private"
         return response
 
 
@@ -397,7 +434,9 @@ class MonitorMiddleware(BaseHTTPMiddleware):
             entry = {
                 "id": rid, "ts": datetime.now(timezone.utc).isoformat(),
                 "method": method, "path": path, "status": 500,
-                "ms": elapsed, "error": str(exc),
+                # The operator UI does not need exception text; retaining it
+                # would make an unexpected secret/driver error visible there.
+                "ms": elapsed, "error": "Unhandled request error",
             }
             monitor_log.append(entry)
             if len(monitor_log) > MAX_LOG:
@@ -501,11 +540,47 @@ async def monitor_get_log(limit: int = 50, _admin: str = Depends(require_admin))
     return monitor_log[-limit:]
 
 # ── Feedback ──────────────────────────────────────────────────────────────────
-feedback_store: list[dict] = []
-
 class FeedbackPayload(BaseModel):
     category: str
     message: str
+
+
+async def _deliver_feedback_email(
+    pool: asyncpg.Pool, feedback_id: _uuid.UUID, user_email: str,
+    user_name: Optional[str], category: str, message: str, created_at: datetime,
+) -> None:
+    """Send feedback notification and record its outcome without losing data."""
+    if not FEEDBACK_TO_EMAIL:
+        status, error = "failed", "FEEDBACK_TO_EMAIL is not configured"
+    else:
+        account = f"{user_name} <{user_email}>" if user_name else user_email
+        text_body = (
+            "New LokiAI feedback\n-------------------\n"
+            f"ID:       {feedback_id}\nFrom:     {account}\nCategory: {category}\n"
+            f"Time:     {created_at.isoformat()}\n\n{message}\n"
+        )
+        html_body = f"""<div style="font-family:sans-serif;background:#0A0A0A;color:#F5F5F5;padding:24px;border-radius:12px;max-width:520px;">
+<h2 style="margin-top:0;color:#8BC34A;">New Feedback</h2>
+<p><strong>Account:</strong> {html.escape(account)}<br><strong>Category:</strong> {html.escape(category)}<br><strong>Time:</strong> {created_at.isoformat()}</p>
+<div style="background:#141414;border-radius:8px;padding:16px;white-space:pre-wrap;">{html.escape(message)}</div></div>"""
+        try:
+            await send_email(
+                to_email=FEEDBACK_TO_EMAIL,
+                subject=f"[LokiAI Feedback] {category} - {user_email}",
+                text_body=text_body,
+                html_body=html_body,
+            )
+        except Exception as exc:
+            status, error = "failed", str(exc)[:500]
+            print(f"[feedback] email delivery failed for {feedback_id}: {error}")
+        else:
+            status, error = "delivered", None
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE feedback SET email_status = $2, email_error = $3 WHERE id = $1",
+            feedback_id, status, error,
+        )
 
 @app.post("/feedback")
 async def submit_feedback(payload: FeedbackPayload, request: Request, user_id: str = Depends(get_current_user)):
@@ -513,73 +588,59 @@ async def submit_feedback(payload: FeedbackPayload, request: Request, user_id: s
     # /feedback endpoints raised NameError -> 500 on every call. get_current_user
     # is the same JWT validation every other authenticated route already uses
     # (signature, expiry, jti, type, and blacklist revocation).
-    if not payload.message.strip():
+    message = payload.message.strip()
+    category = payload.category.strip()
+    if not message:
         raise HTTPException(status_code=422, detail="Message cannot be empty")
-    if len(payload.message) > 2000:
+    if len(message) > 2000:
         raise HTTPException(status_code=422, detail="Message too long (max 2000 chars)")
+    if not category or len(category) > 80:
+        raise HTTPException(status_code=422, detail="Invalid feedback category")
 
     pool = request.app.state.pool
     async with pool.acquire() as conn:
-        user_email = await conn.fetchval("SELECT email FROM users WHERE id = $1::uuid", user_id)
-    user_email = user_email or "unknown"
-
-    ts = datetime.now(timezone.utc).isoformat()
-    entry_id = _uuid.uuid4().hex[:8]
-
-    entry = {
-        "id": entry_id,
-        "ts": ts,
-        "user_id": user_id,
-        "user": user_email,
-        "category": payload.category,
-        "message": payload.message.strip(),
-    }
-    feedback_store.append(entry)
-
-    # Fire-and-forget email to team inbox
-    text_body = (
-        f"New LokiAI feedback\n"
-        f"──────────────────\n"
-        f"ID:       {entry_id}\n"
-        f"From:     {user_email}\n"
-        f"Category: {payload.category}\n"
-        f"Time:     {ts}\n\n"
-        f"{payload.message.strip()}\n"
-    )
-    html_body = f"""<div style="font-family:sans-serif;background:#0A0A0A;color:#F5F5F5;padding:24px;border-radius:12px;max-width:520px;">
-<h2 style="margin-top:0;color:#8BC34A;">New Feedback</h2>
-<table style="border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px;">
-  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">From</td><td style="color:#F5F5F5;">{user_email}</td></tr>
-  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">Category</td><td style="color:#F5F5F5;">{payload.category}</td></tr>
-  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">ID</td><td style="color:#555;font-family:monospace;">{entry_id}</td></tr>
-  <tr><td style="color:#8A8A8A;padding:4px 12px 4px 0;white-space:nowrap;">Time</td><td style="color:#555;font-family:monospace;">{ts}</td></tr>
-</table>
-<div style="background:#141414;border-radius:8px;padding:16px;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#E8EDE0;">{payload.message.strip()}</div>
-</div>"""
-
-    asyncio.create_task(
-        send_email(
-            to_email=SMTP_FROM_EMAIL,
-            subject=f"[LokiAI Feedback] {payload.category} — {user_email}",
-            text_body=text_body,
-            html_body=html_body,
+        user = await conn.fetchrow(
+            "SELECT email, name FROM users WHERE id = $1::uuid", user_id,
         )
-    )
+        if not user:
+            raise HTTPException(status_code=401, detail="Account not found")
+        feedback_id = _uuid.uuid4()
+        created_at = datetime.now(timezone.utc)
+        await conn.execute(
+            """INSERT INTO feedback
+               (id, user_id, user_email, user_name, category, message, created_at)
+               VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)""",
+            feedback_id, user_id, user["email"], user["name"], category, message, created_at,
+        )
 
-    return {"ok": True, "id": entry_id}
+    asyncio.create_task(_deliver_feedback_email(
+        pool, feedback_id, user["email"], user["name"], category, message, created_at,
+    ))
+    return {"ok": True, "id": str(feedback_id), "email_status": "queued"}
 
 @app.get("/feedback")
-async def get_feedback(user_id: str = Depends(get_current_user)):
-    # Own submissions only. This previously returned every user's feedback
-    # (including their email address) to any authenticated caller.
-    return [e for e in reversed(feedback_store) if e.get("user_id") == user_id]
+async def get_feedback(request: Request, user_id: str = Depends(get_current_user)):
+    """Return only the authenticated account's persisted submissions."""
+    async with request.app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, category, message, email_status, created_at
+               FROM feedback WHERE user_id = $1::uuid ORDER BY created_at DESC""",
+            user_id,
+        )
+    return [dict(row) for row in rows]
 
 
 @app.get("/admin/feedback")
-async def get_all_feedback(_admin: str = Depends(require_admin)):
+async def get_all_feedback(request: Request, _admin: str = Depends(require_admin)):
     """Cross-tenant feedback view, operator-only — replaces the unrestricted
     listing that GET /feedback used to provide."""
-    return list(reversed(feedback_store))
+    async with request.app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, user_id, user_email, user_name, category, message,
+                      email_status, email_error, created_at
+               FROM feedback ORDER BY created_at DESC"""
+        )
+    return [dict(row) for row in rows]
 
 
 class AuthUser(BaseModel):
@@ -635,6 +696,10 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USER)
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "LokiAI")
+# Dedicated destination for product feedback. Falling back to the sender keeps
+# existing deployments working while allowing the team inbox to be configured
+# independently.
+FEEDBACK_TO_EMAIL = os.getenv("FEEDBACK_TO_EMAIL", SMTP_FROM_EMAIL)
 
 # Render's free tier blocks outbound SMTP entirely (confirmed by testing,
 # not just a routing quirk — forcing IPv4 didn't help either). When set,
@@ -858,7 +923,10 @@ def _set_refresh_cookie(response: Response, request: Request, refresh_token: str
     # "site" for cookie purposes on localhost, so Lax already crosses that
     # boundary in dev. In production behind HTTPS with a separate domain,
     # cross-site delivery needs SameSite=None+Secure instead.
-    is_https = request.url.scheme == "https"
+    # Render terminates TLS before forwarding to Uvicorn, so request.url can
+    # appear as HTTP even though the browser is using HTTPS. Honor the proxy's
+    # protocol marker to keep production refresh cookies Secure.
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https"
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
         value=refresh_token,
@@ -994,6 +1062,7 @@ async def login(user: AuthUser, request: Request, response: Response):
 
 
 @app.post("/auth/refresh")
+@limiter.limit("30/minute")
 async def refresh_access_token(request: Request, response: Response):
     """Silent refresh: the dashboard calls this with the httpOnly refresh
     cookie (no Authorization header needed) to get a new short-lived access
@@ -1024,6 +1093,7 @@ async def refresh_access_token(request: Request, response: Response):
 
 
 @app.post("/auth/logout")
+@limiter.limit("30/minute")
 async def logout(request: Request, response: Response, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))):
     """Blacklists both the access token's jti (from the Authorization header,
     if present — an already-expired access token is fine to skip) and the
@@ -1275,8 +1345,75 @@ def _public_base_url(request: Request) -> str:
 # ── APK distribution ──────────────────────────────────────────────────────────
 _APK_PATH = os.path.join(os.path.dirname(__file__), "apk", "lokiai.apk")
 
+
+def _apk_proxy_headers(headers) -> dict[str, str]:
+    """Return only safe file-delivery headers from an upstream APK host."""
+    allowed = {
+        "accept-ranges", "content-length", "content-range", "etag",
+        "last-modified",
+    }
+    return {
+        name.title(): value
+        for name, value in headers.items()
+        if name.lower() in allowed
+    }
+
+
+async def _stream_external_apk(request: Request):
+    """Stream an externally hosted APK without exposing its URL to users."""
+    forwarded_headers = {}
+    if range_header := request.headers.get("range"):
+        forwarded_headers["Range"] = range_header
+
+    if request.method == "HEAD":
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            upstream = await client.head(APK_DOWNLOAD_URL, headers=forwarded_headers)
+        if upstream.is_error:
+            raise HTTPException(status_code=502, detail="APK host is unavailable")
+        return Response(
+            status_code=upstream.status_code,
+            headers={
+                **_apk_proxy_headers(upstream.headers),
+                "Content-Disposition": "attachment; filename=lokiai.apk",
+            },
+        )
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, read=None), follow_redirects=True,
+    )
+    try:
+        upstream = await client.send(
+            client.build_request("GET", APK_DOWNLOAD_URL, headers=forwarded_headers),
+            stream=True,
+        )
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="APK host is unavailable") from exc
+    if upstream.is_error:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="APK host is unavailable")
+
+    async def stream_apk():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_apk(),
+        status_code=upstream.status_code,
+        media_type="application/vnd.android.package-archive",
+        headers={
+            **_apk_proxy_headers(upstream.headers),
+            "Content-Disposition": "attachment; filename=lokiai.apk",
+        },
+    )
+
 @app.api_route("/apk/download", methods=["GET", "HEAD"])
-async def download_apk():
+async def download_apk(request: Request):
     """The single canonical APK delivery route, linked from GET /install.
 
     Redirects to APK_DOWNLOAD_URL when one is configured (preferred in
@@ -1284,7 +1421,7 @@ async def download_apk():
     serves the copy shipped alongside the backend.
     """
     if APK_DOWNLOAD_URL:
-        return RedirectResponse(APK_DOWNLOAD_URL, status_code=302)
+        return await _stream_external_apk(request)
     if not os.path.exists(_APK_PATH):
         raise HTTPException(status_code=404, detail="APK not found on server")
     return FileResponse(
@@ -1411,6 +1548,7 @@ def _verify_device_token(token: str, device_id: str) -> Optional[str]:
 
 
 @app.post("/devices/pair")
+@limiter.limit("10/minute")
 async def pair_device(req: DevicePairRequest, request: Request):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -1743,6 +1881,12 @@ async def search_deployable_models(
         for m in resp.json():
             if m["id"] in seen:
                 continue
+            # Keyword searches are format-filtered but not task-filtered by
+            # HuggingFace. Do not let an unrelated TFLite helper file become
+            # a recommendation for the user's requested runtime.
+            pipeline_tag = m.get("pipeline_tag")
+            if pipeline_tag and pipeline_tag not in tasks:
+                continue
             if unsafe.search(m["id"]) and not user_wants_unsafe:
                 continue
             fname = None
@@ -1757,7 +1901,15 @@ async def search_deployable_models(
                     q4 = [f for f in matches if "q4" in f.lower()]
                     fname = q4[0] if q4 else matches[0]
                 else:
-                    fname = matches[0]
+                    # A repository may contain tiny utility models alongside
+                    # its actual runtime. DTLN/denoising/VAD files are not
+                    # general audio-recognition models and were the source of
+                    # the misleading 0.36 MB "Whisper" recommendation.
+                    runtime_matches = [
+                        f for f in matches
+                        if not re.search(r"(?:dtln|denois|enhanc|separat|\bvad\b)", f, re.I)
+                    ]
+                    fname = (runtime_matches or matches)[0]
                 break
             if fname:
                 seen.add(m["id"])
@@ -2003,6 +2155,15 @@ NIM_INTENT_MODEL = os.getenv("NIM_INTENT_MODEL", "meta/llama-3.1-8b-instruct")
 
 VALID_TASKS = ["object-detection", "image-classification", "text-generation",
                "audio-classification", "automatic-speech-recognition"]
+
+# The Android runtime currently runs sound classification TFLite models, but
+# not multi-file speech-to-text stacks such as Whisper or Moonshine. Keeping
+# this explicit prevents the recommender from promising a model the phone
+# cannot initialise (for example a random .tflite utility file in a Whisper
+# repository).
+RUNTIME_SUPPORTED_TASKS = {
+    "object-detection", "image-classification", "text-generation", "audio-classification"
+}
 
 
 def _intent_system_prompt() -> str:
@@ -2550,6 +2711,14 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
                 raise _classify_provider_error(e2)
 
     # If they gave a specific model link, we proceed even if task is None.
+    if task and task not in RUNTIME_SUPPORTED_TASKS and not explicit_model:
+        return {
+            "response": "LokiAI can currently run on-device sound classification, but its Android runtime does not yet support speech-to-text models such as Whisper or Moonshine. I won't recommend a file that the phone cannot initialise.",
+            "action": None,
+            "search_results": [],
+            "error_code": "RUNTIME_UNSUPPORTED_TASK",
+        }
+
     if task is None and not explicit_model:
         # Ambiguous or conversational — respond naturally, no search.
         try:

@@ -288,22 +288,25 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
 
   final TextEditingController _textController = TextEditingController();
   final List<ChatMessage> _messages = [];
-  bool _isRecordingVoiceMessage = false;
 
   CameraInference? _cameraInference;
   String _cameraInferenceResult = "Initializing ML...";
 
   ChatInference? _chatInference;
   VoiceInference? _voiceInference;
+  late final VoidCallback _deploymentListener;
 
   @override
   void initState() {
     super.initState();
+    _deploymentListener = _reloadAfterDeployment;
+    BackendConnection.instance.deploymentRevision.addListener(_deploymentListener);
     _bootstrap();
   }
 
   @override
   void dispose() {
+    BackendConnection.instance.deploymentRevision.removeListener(_deploymentListener);
     _cameraInference?.dispose();
     _chatInference?.dispose();
     _voiceInference?.dispose();
@@ -316,11 +319,31 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     await Permission.manageExternalStorage.request();
     await Permission.storage.request();
 
+    await _loadModelRuntime(
+      cameraGranted: camStatus.isGranted,
+      micGranted: micStatus.isGranted,
+    );
+  }
+
+  Future<void> _reloadAfterDeployment() async {
+    await _loadModelRuntime();
+  }
+
+  Future<void> _loadModelRuntime({bool? cameraGranted, bool? micGranted}) async {
     final configResult = await ConfigReader.load();
 
+    await _cameraInference?.dispose();
+    await _chatInference?.dispose();
+    await _voiceInference?.dispose();
+    _cameraInference = null;
+    _chatInference = null;
+    _voiceInference = null;
+
+    if (!mounted) return;
+
     setState(() {
-      _cameraGranted = camStatus.isGranted;
-      _micGranted = micStatus.isGranted;
+      if (cameraGranted != null) _cameraGranted = cameraGranted;
+      if (micGranted != null) _micGranted = micGranted;
       _configResult = configResult;
 
       if (configResult.error == 'no_model') {
@@ -329,12 +352,11 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
         _appStatus = 'error';
       } else {
         _appStatus = 'ready';
-        _isCameraActive =
-            configResult.config?.inferenceMode == 'camera' ||
-            configResult.config?.modelPath != null;
+        _isCameraActive = configResult.config?.inferenceMode == 'camera';
 
         // Initialize camera inference if we have a TFLite model
-        if (configResult.config?.modelPath != null &&
+        if (configResult.config?.inferenceMode == 'camera' &&
+            configResult.config?.modelPath != null &&
             configResult.config!.modelPath!.endsWith('.tflite')) {
           _cameraInference = CameraInference();
           _cameraInference!.initialize(configResult.config!.modelPath!, (
@@ -381,12 +403,22 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
 
   void _toggleMic() {
     HapticFeedback.lightImpact();
+    if (_voiceInference == null) {
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            text: 'Select a compatible voice model to use live microphone input.',
+            role: MessageRole.ai,
+          ),
+        );
+      });
+      return;
+    }
     final newState = !_isMicLive;
     setState(() {
       _isMicLive = newState;
     });
-    if (_voiceInference != null) {
-      if (newState) {
+    if (newState) {
         // Start recording and run model
         _voiceInference!.startListening((result) {
           if (mounted) {
@@ -400,10 +432,9 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
             });
           }
         });
-      } else {
+    } else {
         // Stop recording
         _voiceInference!.stopListening();
-      }
     }
   }
 
@@ -810,9 +841,41 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               GestureDetector(
-                onTap: () {
+                onTap: () async {
                   HapticFeedback.lightImpact();
-                  // Show model selector sheet
+                  final models = await ConfigReader.loadInstalled();
+                  if (!mounted) return;
+                  await showModalBottomSheet<void>(
+                    context: context,
+                    backgroundColor: LokiColors.surface1,
+                    builder: (sheetContext) => SafeArea(
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: [
+                          const ListTile(
+                            title: Text('Downloaded models', style: TextStyle(color: LokiColors.textPrimary)),
+                          ),
+                          if (models.isEmpty)
+                            const ListTile(
+                              title: Text('No downloaded models', style: TextStyle(color: LokiColors.textSecondary)),
+                            ),
+                          for (final model in models)
+                            ListTile(
+                              title: Text(model.displayLabel, style: const TextStyle(color: LokiColors.textPrimary)),
+                              subtitle: Text(model.modelName, style: const TextStyle(color: LokiColors.textSecondary)),
+                              trailing: model.deploymentId == _configResult?.config?.deploymentId
+                                  ? const Icon(Icons.check, color: LokiColors.textPrimary)
+                                  : null,
+                              onTap: () async {
+                                await ConfigReader.activate(model);
+                                if (sheetContext.mounted) Navigator.pop(sheetContext);
+                                await _loadModelRuntime();
+                              },
+                            ),
+                        ],
+                      ),
+                    ),
+                  );
                 },
                 child: Container(
                   height: 36,
@@ -843,17 +906,6 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                   ),
                 ),
               ),
-              IconButton(
-                icon: const Icon(
-                  Icons.attach_file,
-                  color: LokiColors.textSecondary,
-                  size: 20,
-                ),
-                onPressed: () {},
-                tooltip: 'Attach File',
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -862,55 +914,6 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              // Mic to text inline
-              GestureDetector(
-                onLongPressStart: (_) {
-                  setState(() => _isRecordingVoiceMessage = true);
-                  HapticFeedback.lightImpact();
-                  if (_voiceInference != null) {
-                    _voiceInference!.startListening((result) {
-                      if (mounted) {
-                        setState(() {
-                          _messages.add(
-                            ChatMessage(
-                              text: "Voice ML Output: $result",
-                              role: MessageRole.ai,
-                            ),
-                          );
-                        });
-                      }
-                    });
-                  }
-                },
-                onLongPressEnd: (_) async {
-                  setState(() => _isRecordingVoiceMessage = false);
-                  HapticFeedback.lightImpact();
-                  if (_voiceInference != null) {
-                    await _voiceInference!.stopListening();
-                  }
-                },
-                child: Container(
-                  padding: const EdgeInsets.all(10),
-                  margin: const EdgeInsets.only(right: 8, bottom: 4),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: _isRecordingVoiceMessage
-                          ? LokiColors.accent
-                          : LokiColors.dividerGray,
-                      width: _isRecordingVoiceMessage ? 2 : 1,
-                    ),
-                  ),
-                  child: Icon(
-                    Icons.mic,
-                    color: _isRecordingVoiceMessage
-                        ? LokiColors.accent
-                        : LokiColors.textSecondary,
-                    size: 20,
-                  ),
-                ),
-              ),
-
               // Text Field
               Expanded(
                 child: Container(

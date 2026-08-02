@@ -19,9 +19,9 @@ export default defineConfig({
   },
   vite: {
     // The Vercel Services deployment mounts this application at /workspace.
-    // Keep local development at /. In production, emit the workspace assets
-    // into the same public namespace that Vercel routes to this service.
-    base: "/",
+    // Asset URLs must use that mount too; otherwise imported images resolve at
+    // /assets and are handled by the marketing site instead of this service.
+    base: isVercelDeployment ? "/workspace/" : "/",
     define: {
       "import.meta.env.VITE_WORKSPACE_MOUNTED": JSON.stringify(
         isVercelDeployment ? "true" : "false",
@@ -31,7 +31,7 @@ export default defineConfig({
     // unminified map of the app's real source to anyone who opens DevTools.
     build: {
       sourcemap: false,
-      assetsDir: isVercelDeployment ? "workspace/assets" : "assets",
+      assetsDir: "assets",
     },
   },
 });

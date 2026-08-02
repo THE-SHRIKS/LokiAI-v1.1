@@ -63,8 +63,9 @@ class ModelDownloader {
             modelUrl, modelName, deploymentId, expectedSha, send);
         // Record the sanitized name that was actually written to disk, so
         // config.json can never disagree with the real file.
-        await _saveConfig(sanitizeFilename(modelName), saved.path, config,
+        final savedConfig = await _saveConfig(sanitizeFilename(modelName), saved.path, config,
             deploymentId, saved.bytes, saved.sha256);
+        await _recordInstalledModel(savedConfig);
         send({
           'deployment_id': deploymentId,
           'status': 'complete',
@@ -188,7 +189,7 @@ class ModelDownloader {
   /// Writes config.json to internal storage (spec Config JSON Format).
   /// model_size_bytes/model_sha256 let the loader detect corrupt files
   /// before handing them to native inference runtimes.
-  static Future<void> _saveConfig(
+  static Future<Map<String, dynamic>> _saveConfig(
     String modelName,
     String modelPath,
     Map<String, dynamic> config,
@@ -217,6 +218,25 @@ class ModelDownloader {
     // ignore: avoid_print
     print('VERIFICATION: config_receiver -> saved ${configFile.path}: '
         '${jsonEncode(json)}');
+    return json;
+  }
+
+  /// Keeps a small local index so the user can switch between models already
+  /// downloaded to the phone without downloading them again.
+  static Future<void> _recordInstalledModel(Map<String, dynamic> config) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final registryFile = File('${docs.path}/model-registry.json');
+    List<dynamic> registry = [];
+    if (await registryFile.exists()) {
+      try {
+        final decoded = jsonDecode(await registryFile.readAsString());
+        if (decoded is List) registry = decoded;
+      } catch (_) {}
+    }
+    registry.removeWhere((item) => item is Map &&
+        item['deployment_id'] == config['deployment_id']);
+    registry.add(config);
+    await registryFile.writeAsString(jsonEncode(registry));
   }
 }
 
