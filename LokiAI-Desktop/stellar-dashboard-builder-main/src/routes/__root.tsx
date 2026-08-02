@@ -140,7 +140,7 @@ function AuthBootScreen() {
         </p>
         {takingLonger && (
           <p className="mt-3 text-sm text-muted-foreground">
-            Waking up the LokiAI service. This can take a moment on the first visit.
+            Preparing your workspace. Thanks for your patience.
           </p>
         )}
       </div>
