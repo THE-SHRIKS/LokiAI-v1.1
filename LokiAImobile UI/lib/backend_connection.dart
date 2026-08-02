@@ -322,6 +322,14 @@ class BackendConnection {
       return;
     }
 
+    if (data['action'] == 'cancel_deployment') {
+      final deploymentId = data['deployment_id'] as String?;
+      if (deploymentId != null && deploymentId.isNotEmpty) {
+        ModelDownloader.cancel(deploymentId);
+      }
+      return;
+    }
+
     if (data['type'] == 'state_ack') {
       // Server's view of what is still outstanding for this device after our
       // state report. Logged for diagnosis; the server has already reconciled

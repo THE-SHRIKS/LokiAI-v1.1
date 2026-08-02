@@ -376,6 +376,13 @@ export async function getDeployment(deploymentId: string) {
   return request<DeploymentStatus>(`/deployments/${deploymentId}`);
 }
 
+export async function cancelDeployment(deploymentId: string) {
+  return request<{ deployment_id: string; status: "cancelled" }>(
+    `/deployments/${deploymentId}/cancel`,
+    { method: "POST" },
+  );
+}
+
 export interface DeploymentRecord {
   id: string;
   device_id: string | null;

@@ -18,6 +18,7 @@ import {
   Circle,
   CheckCircle2,
   XCircle,
+  Ban,
   Loader2,
   Trash2,
   ArrowLeft,
@@ -456,14 +457,29 @@ function useDeployments() {
 
 export function TasksPanel({ onClose }: { onClose?: () => void }) {
   const { deployments, error } = useDeployments();
+  const [cancelling, setCancelling] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   const active = deployments.filter((d) => d.status === "queued" || d.status === "downloading");
-  const finished = deployments.filter((d) => d.status === "complete" || d.status === "failed").slice(0, 15);
+  const finished = deployments.filter((d) => d.status === "complete" || d.status === "failed" || d.status === "cancelled").slice(0, 15);
+
+  const cancel = async (deploymentId: string) => {
+    setCancelling(deploymentId);
+    setCancelError(null);
+    try {
+      const { cancelDeployment } = await import("@/lib/lokiai-api");
+      await cancelDeployment(deploymentId);
+    } catch (e) {
+      setCancelError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCancelling(null);
+    }
+  };
 
   const item = (d: DeploymentRecord) => (
     <li key={d.id} className="flex items-center gap-2 rounded border border-border bg-background/40 px-2 py-1.5 text-xs">
       {d.status === "complete" ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-olive-bright" />
-        : d.status === "failed" ? <XCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
+        : (d.status === "failed" || d.status === "cancelled") ? <XCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
         : <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-olive-bright" />}
       <div className="min-w-0 flex-1">
         <div className="truncate text-foreground">{d.model_name ?? "model"}</div>
@@ -471,15 +487,26 @@ export function TasksPanel({ onClose }: { onClose?: () => void }) {
           {d.phone_model ?? "device"} · <span className={cn(
             d.status === "complete" && "text-olive-glow/80",
             (d.status === "queued" || d.status === "downloading") && "text-olive-bright",
-            d.status === "failed" && "text-destructive",
+            (d.status === "failed" || d.status === "cancelled") && "text-destructive",
           )}>
             {d.status}{(d.status === "queued" || d.status === "downloading") ? ` ${d.progress}%` : ""}
           </span>
         </div>
-        {d.status === "failed" && d.error_message && (
+        {(d.status === "failed" || d.status === "cancelled") && d.error_message && (
           <div className="truncate text-[10px] text-destructive">{d.error_message}</div>
         )}
       </div>
+      {(d.status === "queued" || d.status === "downloading") && (
+        <button
+          type="button"
+          onClick={() => void cancel(d.id)}
+          disabled={cancelling === d.id}
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-destructive/40 px-1.5 py-1 text-[10px] text-destructive hover:bg-destructive/10 disabled:opacity-50"
+          title="Cancel deployment"
+        >
+          <Ban className="h-3 w-3" /> {cancelling === d.id ? "Cancelling" : "Cancel"}
+        </button>
+      )}
     </li>
   );
 
@@ -490,6 +517,7 @@ export function TasksPanel({ onClose }: { onClose?: () => void }) {
       onClose={onClose}
     >
       {error && <div className="px-3 py-2 text-[11px] text-destructive">{error}</div>}
+      {cancelError && <div className="px-3 py-2 text-[11px] text-destructive">{cancelError}</div>}
       {active.length > 0 && (
         <>
           <div className="px-3 py-2 text-[11px] uppercase tracking-wider text-olive-glow">Active</div>

@@ -128,7 +128,7 @@ function ModelsPage() {
               error: st.error_message ?? undefined,
             },
           }));
-          if (st.status === "complete" || st.status === "failed") clearInterval(poll);
+          if (st.status === "complete" || st.status === "failed" || st.status === "cancelled") clearInterval(poll);
         } catch {
           /* transient — keep polling */
         }

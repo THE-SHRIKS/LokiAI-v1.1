@@ -287,7 +287,7 @@ function Index() {
               error: st.error_message ?? undefined,
             },
           }));
-          if (st.status === "complete" || st.status === "failed") clearInterval(poll);
+          if (st.status === "complete" || st.status === "failed" || st.status === "cancelled") clearInterval(poll);
         } catch {
           /* transient — keep polling */
         }
@@ -370,7 +370,7 @@ function Index() {
               ...s,
               [rec.id]: { status: st.status as DeployState["status"], progress: st.progress_percent ?? 0, error: st.error_message ?? undefined },
             }));
-            if (st.status === "complete" || st.status === "failed") clearInterval(poll);
+            if (st.status === "complete" || st.status === "failed" || st.status === "cancelled") clearInterval(poll);
           } catch {
             /* transient — keep polling */
           }

@@ -9,6 +9,16 @@ import 'package:path_provider/path_provider.dart';
 /// WebSocket, and writes config.json (v3 wireless deployment, Tasks 2.5/2.6).
 class ModelDownloader {
   static const int maxAttempts = 3;
+  static final Set<String> _cancelledDeployments = <String>{};
+  static final Map<String, HttpClient> _activeClients = <String, HttpClient>{};
+
+  /// Stops an active download immediately when the dashboard cancels it.
+  /// Closing the client aborts a blocked network read; the existing cleanup
+  /// path then removes the partial file.
+  static void cancel(String deploymentId) {
+    _cancelledDeployments.add(deploymentId);
+    _activeClients.remove(deploymentId)?.close(force: true);
+  }
 
   /// Reduces a server-supplied model_name to a bare, safe filename.
   ///
@@ -53,6 +63,16 @@ class ModelDownloader {
       return;
     }
 
+    if (_cancelledDeployments.remove(deploymentId)) {
+      send({
+        'deployment_id': deploymentId,
+        'status': 'cancelled',
+        'progress_percent': 0,
+        'error_message': 'Cancelled by user',
+      });
+      return;
+    }
+
     String lastError = 'unknown error';
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -61,6 +81,15 @@ class ModelDownloader {
             'url=$modelUrl');
         final saved = await _download(
             modelUrl, modelName, deploymentId, expectedSha, send);
+        if (_cancelledDeployments.remove(deploymentId)) {
+          send({
+            'deployment_id': deploymentId,
+            'status': 'cancelled',
+            'progress_percent': 0,
+            'error_message': 'Cancelled by user',
+          });
+          return;
+        }
         // Record the sanitized name that was actually written to disk, so
         // config.json can never disagree with the real file.
         final savedConfig = await _saveConfig(sanitizeFilename(modelName), saved.path, config,
@@ -80,6 +109,15 @@ class ModelDownloader {
             'bytes=${saved.bytes} sha256=${saved.sha256}');
         return;
       } catch (e) {
+        if (_cancelledDeployments.remove(deploymentId)) {
+          send({
+            'deployment_id': deploymentId,
+            'status': 'cancelled',
+            'progress_percent': 0,
+            'error_message': 'Cancelled by user',
+          });
+          return;
+        }
         lastError = e.toString();
         // ignore: avoid_print
         print('VERIFICATION: download -> attempt $attempt failed: $lastError');
@@ -117,7 +155,11 @@ class ModelDownloader {
 
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 30);
+    _activeClients[deploymentId] = client;
     try {
+      if (_cancelledDeployments.contains(deploymentId)) {
+        throw const HttpException('Download cancelled by user');
+      }
       final request = await client.getUrl(Uri.parse(url));
       final response = await request.close();
       if (response.statusCode != 200) {
@@ -134,6 +176,9 @@ class ModelDownloader {
       try {
         await for (final chunk in response
             .timeout(const Duration(seconds: 60))) {
+          if (_cancelledDeployments.contains(deploymentId)) {
+            throw const HttpException('Download cancelled by user');
+          }
           sink.add(chunk);
           shaSink.add(chunk);
           receivedBytes += chunk.length;
@@ -182,6 +227,9 @@ class ModelDownloader {
       }
       rethrow;
     } finally {
+      if (identical(_activeClients[deploymentId], client)) {
+        _activeClients.remove(deploymentId);
+      }
       client.close();
     }
   }

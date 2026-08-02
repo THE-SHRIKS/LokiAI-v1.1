@@ -2943,7 +2943,7 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
     status = data.get("status")
     progress = data.get("progress_percent", 0)
     error_message = data.get("error_message")
-    if not deployment_id or status not in ("downloading", "complete", "failed"):
+    if not deployment_id or status not in ("downloading", "complete", "failed", "cancelled"):
         return
 
     # The deployment must belong to the device reporting on it. Without this a
@@ -2951,14 +2951,19 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
     # deployment in the system just by naming its id.
     try:
         async with pool.acquire() as conn:
-            owns = await conn.fetchval(
-                "SELECT 1 FROM deployments WHERE id = $1::uuid AND device_id = $2::uuid",
+            current_status = await conn.fetchval(
+                "SELECT status FROM deployments WHERE id = $1::uuid AND device_id = $2::uuid",
                 deployment_id, device_id,
             )
     except (asyncpg.PostgresError, ValueError):
         return
-    if not owns:
+    if current_status is None:
         print(f"[WS] device {device_id} tried to update foreign deployment {deployment_id} — ignored")
+        return
+
+    # A user cancellation wins over a late packet from a phone that had
+    # already received the deployment instruction.
+    if current_status == "cancelled":
         return
 
     deployment_status[deployment_id] = {
@@ -2973,9 +2978,9 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
                     "UPDATE deployments SET status = $2, progress = $3, completed_at = NOW() WHERE id = $1::uuid",
                     deployment_id, status, progress
                 )
-            elif status == "failed":
+            elif status in ("failed", "cancelled"):
                 await conn.execute(
-                    "UPDATE deployments SET status = $2, progress = $3, error_message = $4 WHERE id = $1::uuid",
+                    "UPDATE deployments SET status = $2, progress = $3, error_message = $4 WHERE id = $1::uuid AND status <> 'cancelled'",
                     deployment_id, status, progress, error_message
                 )
             else:
@@ -3467,6 +3472,41 @@ async def get_deployment_status(deployment_id: str, request: Request, user_id: s
             "error_message": row["error_message"],
             "progress_percent": 100 if row["status"] == "complete" else (row["progress"] or 0)
         }
+
+@app.post("/deployments/{deployment_id}/cancel")
+async def cancel_deployment(deployment_id: str, request: Request, user_id: str = Depends(get_current_user)):
+    """Cancel an in-flight deployment owned by the signed-in user.
+
+    The database status is changed first so a late phone update cannot revive
+    it. If the phone is online, it receives a cancellation instruction to stop
+    the active download and discard its partial file.
+    """
+    pool = request.app.state.pool
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE deployments
+                   SET status = 'cancelled', error_message = 'Cancelled by user'
+                   WHERE id = $1::uuid AND user_id = $2::uuid
+                     AND status IN ('queued', 'downloading')
+                   RETURNING device_id""",
+                deployment_id, user_id,
+            )
+    except (asyncpg.PostgresError, ValueError):
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    if not row:
+        raise HTTPException(status_code=409, detail="Only queued or downloading deployments can be cancelled")
+
+    deployment_status[deployment_id] = {
+        "status": "cancelled", "progress_percent": 0,
+        "error_message": "Cancelled by user",
+    }
+    if row["device_id"]:
+        await ws_manager.send_json(str(row["device_id"]), {
+            "action": "cancel_deployment", "deployment_id": deployment_id,
+        })
+    return {"deployment_id": deployment_id, "status": "cancelled"}
+
 
 @app.get("/admin/stats")
 async def get_admin_stats(request: Request, _admin: str = Depends(require_admin)):
