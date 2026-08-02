@@ -452,7 +452,7 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
     final chat = _chatInference;
     _chatInference = null;
     try {
-      chat?.dispose();
+      await chat?.dispose();
     } catch (e) {
       debugPrint('CHAT: dispose failed: $e');
     }
