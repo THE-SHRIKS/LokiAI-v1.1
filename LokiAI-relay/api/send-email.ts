@@ -69,7 +69,13 @@ export default async function handler(req: any, res: any) {
 
   const relaySecret = process.env.EMAIL_RELAY_SECRET;
   const smtpPassword = process.env.SMTP_PASSWORD;
-  if (!relaySecret && !smtpPassword) {
+  // During an SMTP password rotation, Render can still sign requests using
+  // the previous password while this relay sends with the new one.  The
+  // legacy value is authentication-only and remains an encrypted production
+  // variable; remove it once Render has been rotated.
+  const relayAuthPasswords = [smtpPassword, process.env.RELAY_LEGACY_AUTH_PASSWORD]
+    .filter((value): value is string => Boolean(value));
+  if (!relaySecret && relayAuthPasswords.length === 0) {
     sendJson(res, 500, { error: "Relay authentication is not configured" });
     return;
   }
@@ -100,12 +106,11 @@ export default async function handler(req: any, res: any) {
 
   const suppliedSignature = req.headers["x-relay-signature"];
   const signaturePayload = [to, subject, text, html ?? "", replyTo ?? ""].join("\n");
-  const expectedSignature = smtpPassword
-    ? createHmac("sha256", smtpPassword).update(signaturePayload).digest("hex")
-    : "";
-  const signatureMatches = typeof suppliedSignature === "string"
-    && expectedSignature.length === suppliedSignature.length
-    && timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(suppliedSignature));
+  const signatureMatches = typeof suppliedSignature === "string" && relayAuthPasswords.some((password) => {
+    const expectedSignature = createHmac("sha256", password).update(signaturePayload).digest("hex");
+    return expectedSignature.length === suppliedSignature.length
+      && timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(suppliedSignature));
+  });
   if (suppliedSecret !== relaySecret && !signatureMatches) {
     sendJson(res, 401, { error: "Unauthorized" });
     return;
