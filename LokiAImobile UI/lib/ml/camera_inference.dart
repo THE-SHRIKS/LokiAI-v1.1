@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:isolate';
@@ -25,7 +26,7 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 /// so the isolate can send results back, plus config. Labels are loaded on
 /// the main isolate (rootBundle is unavailable in spawned isolates).
 class _BootMsg {
-  final SendPort mainPort;   // isolate sends results here
+  final SendPort mainPort; // isolate sends results here
   final String modelPath;
   final double threshold;
   final List<String> labels; // empty when no label set matches the model
@@ -40,16 +41,21 @@ class _FrameMsg {
   final int imgW, imgH;
   final int yBPR, yBPP, uvBPR, uvBPP;
   _FrameMsg({
-    required this.yData, required this.uData, required this.vData,
-    required this.imgW, required this.imgH,
-    required this.yBPR, required this.yBPP,
-    required this.uvBPR, required this.uvBPP,
+    required this.yData,
+    required this.uData,
+    required this.vData,
+    required this.imgW,
+    required this.imgH,
+    required this.yBPR,
+    required this.yBPP,
+    required this.uvBPR,
+    required this.uvBPP,
   });
 }
 
 /// Sent isolate → main when model is loaded and ready.
 class _ReadyMsg {
-  final SendPort framePort;   // main sends frames here
+  final SendPort framePort; // main sends frames here
   final List<int> inputShape;
   final List<int> outputShape;
   final String inputType;
@@ -58,8 +64,8 @@ class _ReadyMsg {
 
 /// Inference result sent isolate → main every frame.
 class _ResultMsg {
-  final String label;     // human-readable top predictions
-  final double maxConf;   // top-1 confidence 0..1
+  final String label; // human-readable top predictions
+  final double maxConf; // top-1 confidence 0..1
   _ResultMsg(this.label, this.maxConf);
 }
 
@@ -100,9 +106,15 @@ void _inferenceIsolateEntry(SendPort bootPort) async {
         // The DEPLOYED model file is the only model this app runs. No
         // bundled fallbacks — if the deployment is broken the user must
         // see the error, not silently get a different model.
-        Future<Interpreter?> tryLoad(InterpreterOptions opts, String label) async {
+        Future<Interpreter?> tryLoad(
+          InterpreterOptions opts,
+          String label,
+        ) async {
           try {
-            final i = await Interpreter.fromFile(File(boot!.modelPath), options: opts);
+            final i = await Interpreter.fromFile(
+              File(boot!.modelPath),
+              options: opts,
+            );
             i.allocateTensors();
             print('VISION: [$label] loaded deployed model ${boot!.modelPath}');
             return i;
@@ -114,7 +126,9 @@ void _inferenceIsolateEntry(SendPort bootPort) async {
 
         if (Platform.isAndroid) {
           try {
-            final opts = InterpreterOptions()..useNnApiForAndroid = true..threads = 4;
+            final opts = InterpreterOptions()
+              ..useNnApiForAndroid = true
+              ..threads = 4;
             interp = await tryLoad(opts, 'NNAPI');
           } catch (e) {
             print('FIRE: NNAPI unavailable: $e');
@@ -149,7 +163,9 @@ void _inferenceIsolateEntry(SendPort bootPort) async {
         // works for any rank instead of assuming a detection layout.
         preAllocOut = _allocForShape(outputShape);
 
-        toMain.send(_ReadyMsg(fromMain.sendPort, inputShape, outputShape, inputType));
+        toMain.send(
+          _ReadyMsg(fromMain.sendPort, inputShape, outputShape, inputType),
+        );
       }
       continue;
     }
@@ -157,8 +173,18 @@ void _inferenceIsolateEntry(SendPort bootPort) async {
     // Phase 2: Processing Frames
     if (m is! _FrameMsg) continue;
     try {
-      toMain!.send(_infer(
-          m, interp!, inputShape, outputShape, inputType, threshold, labels, preAllocOut));
+      toMain!.send(
+        _infer(
+          m,
+          interp!,
+          inputShape,
+          outputShape,
+          inputType,
+          threshold,
+          labels,
+          preAllocOut,
+        ),
+      );
     } catch (e, st) {
       print('VISION: inference error: $e\n$st');
       toMain!.send(_ErrMsg(e.toString()));
@@ -192,7 +218,7 @@ _ResultMsg _infer(
   String inputType,
   double threshold,
   List<String> labels,
-  dynamic preAllocOut,  // reused buffer — no per-frame allocation
+  dynamic preAllocOut, // reused buffer — no per-frame allocation
 ) {
   // Recover bytes — zero-copy materialise
   final yB = f.yData.materialize().asUint8List();
@@ -203,11 +229,34 @@ _ResultMsg _infer(
   final int H = nchw ? inputShape[2] : inputShape[1];
   final int W = nchw ? inputShape[3] : inputShape[2];
   // Quantized models take raw 0..255 values; float models take 0..1.
-  final bool quantizedInput = inputType.contains('uint8') || inputType.contains('int8');
+  final bool quantizedInput =
+      inputType.contains('uint8') || inputType.contains('int8');
 
   final dynamic input = nchw
-    ? List.generate(1, (_) => List.generate(3, (_) => List.generate(H, (_) => quantizedInput ? List<int>.filled(W, 0) : List<double>.filled(W, 0.0))))
-    : List.generate(1, (_) => List.generate(H, (_) => List.generate(W, (_) => quantizedInput ? List<int>.filled(3, 0) : List<double>.filled(3, 0.0))));
+      ? List.generate(
+          1,
+          (_) => List.generate(
+            3,
+            (_) => List.generate(
+              H,
+              (_) => quantizedInput
+                  ? List<int>.filled(W, 0)
+                  : List<double>.filled(W, 0.0),
+            ),
+          ),
+        )
+      : List.generate(
+          1,
+          (_) => List.generate(
+            H,
+            (_) => List.generate(
+              W,
+              (_) => quantizedInput
+                  ? List<int>.filled(3, 0)
+                  : List<double>.filled(3, 0.0),
+            ),
+          ),
+        );
 
   // BT.601 YUV → RGB, nearest-neighbour resize
   for (int dy = 0; dy < H; dy++) {
@@ -216,7 +265,8 @@ _ResultMsg _infer(
       final sx = ((dx * f.imgW) ~/ W).clamp(0, f.imgW - 1);
       final yi = sy * f.yBPR + sx * f.yBPP;
       final yv = yi < yB.length ? yB[yi] & 0xFF : 0;
-      final uvr = sy >> 1; final uvc = sx >> 1;
+      final uvr = sy >> 1;
+      final uvc = sx >> 1;
       final uvi = uvr * f.uvBPR + uvc * f.uvBPP;
       final uv = uvi < uB.length ? uB[uvi] & 0xFF : 128;
       final vv = uvi < vB.length ? vB[uvi] & 0xFF : 128;
@@ -269,7 +319,9 @@ _ResultMsg _infer(
   if (bestClass < 0) {
     return _ResultMsg('No detections', 0.0);
   }
-  final name = (bestClass < labels.length) ? labels[bestClass] : 'class $bestClass';
+  final name = (bestClass < labels.length)
+      ? labels[bestClass]
+      : 'class $bestClass';
   return _ResultMsg('$name ${(bestConf * 100).toStringAsFixed(0)}%', bestConf);
 }
 
@@ -309,19 +361,22 @@ _ResultMsg _classify(List<double> scores, List<String> labels) {
 class CameraInference {
   CameraController? _cameraController;
   Isolate? _isolate;
-  ReceivePort? _fromIsolate;   // main receives FROM isolate here
-  SendPort? _toIsolate;        // main sends TO isolate here (frames + boot)
-  SendPort? _frameSendPort;    // the isolate's own frame port (given in ReadyMsg)
+  ReceivePort? _fromIsolate; // main receives FROM isolate here
+  SendPort? _toIsolate; // main sends TO isolate here (frames + boot)
+  SendPort? _frameSendPort; // the isolate's own frame port (given in ReadyMsg)
 
   bool _modelReady = false;
-  bool _isolateBusy = false;  // back-pressure: don't queue frames faster than inference
+  bool _isolateBusy =
+      false; // back-pressure: don't queue frames faster than inference
   int _lastDispatchMs = 0;
-  static const int _throttleMs = 33; // ~30 fps cap — backpressure will naturally throttle it
+  static const int _throttleMs =
+      33; // ~30 fps cap — backpressure will naturally throttle it
 
   final ValueNotifier<bool> isFireDetected = ValueNotifier(false);
   final ValueNotifier<String> statusLabel = ValueNotifier('Initializing...');
 
-  double confidenceThreshold = 0.65; // Fix false positives (lights): require 65% confidence
+  double confidenceThreshold =
+      0.65; // Fix false positives (lights): require 65% confidence
 
   Future<void> initialize(String modelPath, Function(String) callback) async {
     statusLabel.value = 'Spawning inference isolate…';
@@ -367,23 +422,33 @@ class CameraInference {
     if (msg is SendPort) {
       // Isolate sent us its port — now send the BootMsg
       _toIsolate = msg;
-      _toIsolate!.send(_BootMsg(
-        _fromIsolate!.sendPort,
-        _pendingModelPath ?? '',
-        confidenceThreshold,
-        _labels,
-      ));
+      _toIsolate!.send(
+        _BootMsg(
+          _fromIsolate!.sendPort,
+          _pendingModelPath ?? '',
+          confidenceThreshold,
+          _labels,
+        ),
+      );
     } else if (msg is _ReadyMsg) {
       _frameSendPort = msg.framePort;
       _modelReady = true;
-      statusLabel.value = 'Model OK in=${msg.inputShape} out=${msg.outputShape}';
-      _startCamera();
+      statusLabel.value =
+          'Model OK in=${msg.inputShape} out=${msg.outputShape}';
+      unawaited(
+        _startCamera().catchError((Object error, StackTrace stackTrace) {
+          print('VISION: camera startup failed: $error\n$stackTrace');
+          _modelReady = false;
+          statusLabel.value = 'Camera unavailable: $error';
+          callback('Camera unavailable: $error');
+        }),
+      );
     } else if (msg is _ResultMsg) {
-      _isolateBusy = false;  // isolate done — ready for next frame
+      _isolateBusy = false; // isolate done — ready for next frame
       print('VISION: result -> ${msg.label}');
       callback(msg.label);
     } else if (msg is _ErrMsg) {
-      _isolateBusy = false;  // also reset on error
+      _isolateBusy = false; // also reset on error
       print('VISION: isolate error: ${msg.msg}');
       statusLabel.value = 'Error: ${msg.msg}';
       callback('Error: ${msg.msg}');
@@ -422,30 +487,50 @@ class CameraInference {
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastDispatchMs < _throttleMs) return;
     _lastDispatchMs = now;
-    _isolateBusy = true;  // mark busy until _ResultMsg arrives
+    _isolateBusy = true; // mark busy until _ResultMsg arrives
 
     final p = image.planes;
     // Zero-copy: TransferableTypedData transfers ownership, no memcpy
-    _frameSendPort!.send(_FrameMsg(
-      yData: TransferableTypedData.fromList([p[0].bytes]),
-      uData: TransferableTypedData.fromList([p[1].bytes]),
-      vData: TransferableTypedData.fromList([p[2].bytes]),
-      imgW: image.width,
-      imgH: image.height,
-      yBPR: p[0].bytesPerRow,
-      yBPP: p[0].bytesPerPixel ?? 1,
-      uvBPR: p[1].bytesPerRow,
-      uvBPP: p[1].bytesPerPixel ?? 2,
-    ));
+    _frameSendPort!.send(
+      _FrameMsg(
+        yData: TransferableTypedData.fromList([p[0].bytes]),
+        uData: TransferableTypedData.fromList([p[1].bytes]),
+        vData: TransferableTypedData.fromList([p[2].bytes]),
+        imgW: image.width,
+        imgH: image.height,
+        yBPR: p[0].bytesPerRow,
+        yBPP: p[0].bytesPerPixel ?? 1,
+        uvBPR: p[1].bytesPerRow,
+        uvBPP: p[1].bytesPerPixel ?? 2,
+      ),
+    );
   }
 
   CameraController? get cameraController => _cameraController;
 
-  void dispose() {
-    _cameraController?.stopImageStream();
-    _cameraController?.dispose();
+  Future<void> dispose() async {
+    final camera = _cameraController;
+    _cameraController = null;
+    if (camera != null) {
+      try {
+        if (camera.value.isStreamingImages) {
+          await camera.stopImageStream();
+        }
+      } catch (e) {
+        print('VISION: stopping image stream failed: $e');
+      }
+      try {
+        await camera.dispose();
+      } catch (e) {
+        print('VISION: camera dispose failed: $e');
+      }
+    }
     _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
     _fromIsolate?.close();
+    _fromIsolate = null;
+    _toIsolate = null;
+    _frameSendPort = null;
     isFireDetected.dispose();
     statusLabel.dispose();
   }

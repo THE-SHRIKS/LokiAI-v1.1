@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -295,21 +297,24 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
   ChatInference? _chatInference;
   VoiceInference? _voiceInference;
   late final VoidCallback _deploymentListener;
+  Future<void> _runtimeQueue = Future.value();
 
   @override
   void initState() {
     super.initState();
     _deploymentListener = _reloadAfterDeployment;
-    BackendConnection.instance.deploymentRevision.addListener(_deploymentListener);
+    BackendConnection.instance.deploymentRevision.addListener(
+      _deploymentListener,
+    );
     _bootstrap();
   }
 
   @override
   void dispose() {
-    BackendConnection.instance.deploymentRevision.removeListener(_deploymentListener);
-    _cameraInference?.dispose();
-    _chatInference?.dispose();
-    _voiceInference?.dispose();
+    BackendConnection.instance.deploymentRevision.removeListener(
+      _deploymentListener,
+    );
+    unawaited(_disposeInferenceRuntimes());
     super.dispose();
   }
 
@@ -329,15 +334,59 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
     await _loadModelRuntime();
   }
 
-  Future<void> _loadModelRuntime({bool? cameraGranted, bool? micGranted}) async {
-    final configResult = await ConfigReader.load();
-
-    _cameraInference?.dispose();
-    _chatInference?.dispose();
-    _voiceInference?.dispose();
+  Future<void> _disposeInferenceRuntimes() async {
+    final camera = _cameraInference;
+    final chat = _chatInference;
+    final voice = _voiceInference;
     _cameraInference = null;
     _chatInference = null;
     _voiceInference = null;
+
+    try {
+      await camera?.dispose();
+    } catch (e) {
+      debugPrint('CAMERA: dispose failed: $e');
+    }
+    try {
+      chat?.dispose();
+    } catch (e) {
+      debugPrint('CHAT: dispose failed: $e');
+    }
+    try {
+      await voice?.dispose();
+    } catch (e) {
+      debugPrint('VOICE: dispose failed: $e');
+    }
+  }
+
+  /// Deployment, model switching, and initial boot can all request a runtime
+  /// reload. Serialize them so an old runtime can never be disposed while a
+  /// new native interpreter is being created.
+  Future<void> _loadModelRuntime({bool? cameraGranted, bool? micGranted}) {
+    _runtimeQueue = _runtimeQueue
+        .then(
+          (_) => _loadModelRuntimeNow(
+            cameraGranted: cameraGranted,
+            micGranted: micGranted,
+          ),
+        )
+        .catchError((Object error, StackTrace stackTrace) {
+          debugPrint('MODEL: runtime reload failed: $error\n$stackTrace');
+          if (mounted) {
+            setState(() {
+              _appStatus = 'error';
+            });
+          }
+        });
+    return _runtimeQueue;
+  }
+
+  Future<void> _loadModelRuntimeNow({
+    bool? cameraGranted,
+    bool? micGranted,
+  }) async {
+    final configResult = await ConfigReader.load();
+    await _disposeInferenceRuntimes();
 
     if (!mounted) return;
 
@@ -353,45 +402,46 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
       } else {
         _appStatus = 'ready';
         _isCameraActive = configResult.config?.inferenceMode == 'camera';
-
-        // Initialize camera inference if we have a TFLite model
-        if (configResult.config?.inferenceMode == 'camera' &&
-            configResult.config?.modelPath != null &&
-            configResult.config!.modelPath!.endsWith('.tflite')) {
-          _cameraInference = CameraInference();
-          _cameraInference!.initialize(configResult.config!.modelPath!, (
-            result,
-          ) {
-            if (mounted) {
-              setState(() {
-                _cameraInferenceResult = result;
-              });
-            }
-          });
-        }
-
-        // Initialize chat inference if we have an LLM path or inference mode is chat
-        final chatModelPath =
-            configResult.config?.llmPath ??
-            (configResult.config?.inferenceMode == 'chat'
-                ? configResult.config?.modelPath
-                : null);
-
-        if (chatModelPath != null &&
-            (chatModelPath.endsWith('.gguf') ||
-                chatModelPath.endsWith('.bin'))) {
-          _chatInference = ChatInference();
-          _chatInference!.initialize(chatModelPath);
-        }
-
-        // Initialize voice inference
-        if (configResult.config?.inferenceMode == 'voice' &&
-            configResult.config?.modelPath != null) {
-          _voiceInference = VoiceInference();
-          _voiceInference!.initialize(configResult.config!.modelPath!);
-        }
       }
     });
+
+    final config = configResult.config;
+    if (configResult.error != null || config == null) return;
+
+    // Initialize outside setState and await every native setup. This turns a
+    // bad/unsupported model into a visible app error instead of an unhandled
+    // asynchronous exception that can terminate the Android process.
+    try {
+      if (config.inferenceMode == 'camera' &&
+          config.modelPath.endsWith('.tflite')) {
+        final camera = CameraInference();
+        _cameraInference = camera;
+        await camera.initialize(config.modelPath, (result) {
+          if (mounted) setState(() => _cameraInferenceResult = result);
+        });
+      }
+
+      final chatModelPath =
+          config.llmPath ??
+          (config.inferenceMode == 'chat' ? config.modelPath : null);
+      if (chatModelPath != null &&
+          (chatModelPath.endsWith('.gguf') || chatModelPath.endsWith('.bin'))) {
+        final chat = ChatInference();
+        _chatInference = chat;
+        await chat.initialize(chatModelPath);
+      }
+
+      if (config.inferenceMode == 'voice' &&
+          config.modelPath.endsWith('.tflite')) {
+        final voice = VoiceInference();
+        _voiceInference = voice;
+        await voice.initialize(config.modelPath);
+      }
+    } catch (e) {
+      debugPrint('MODEL: failed to initialise ${config.modelName}: $e');
+      await _disposeInferenceRuntimes();
+      if (mounted) setState(() => _appStatus = 'error');
+    }
   }
 
   void _toggleCamera() {
@@ -407,7 +457,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
       setState(() {
         _messages.add(
           ChatMessage(
-            text: 'Select a compatible voice model to use live microphone input.',
+            text:
+                'Select a compatible voice model to use live microphone input.',
             role: MessageRole.ai,
           ),
         );
@@ -419,22 +470,19 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
       _isMicLive = newState;
     });
     if (newState) {
-        // Start recording and run model
-        _voiceInference!.startListening((result) {
-          if (mounted) {
-            setState(() {
-              _messages.add(
-                ChatMessage(
-                  text: 'Voice result: $result',
-                  role: MessageRole.ai,
-                ),
-              );
-            });
-          }
-        });
+      // Start recording and run model
+      _voiceInference!.startListening((result) {
+        if (mounted) {
+          setState(() {
+            _messages.add(
+              ChatMessage(text: 'Voice result: $result', role: MessageRole.ai),
+            );
+          });
+        }
+      });
     } else {
-        // Stop recording
-        _voiceInference!.stopListening();
+      // Stop recording
+      _voiceInference!.stopListening();
     }
   }
 
@@ -853,22 +901,46 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
                         shrinkWrap: true,
                         children: [
                           const ListTile(
-                            title: Text('Downloaded models', style: TextStyle(color: LokiColors.textPrimary)),
+                            title: Text(
+                              'Downloaded models',
+                              style: TextStyle(color: LokiColors.textPrimary),
+                            ),
                           ),
                           if (models.isEmpty)
                             const ListTile(
-                              title: Text('No downloaded models', style: TextStyle(color: LokiColors.textSecondary)),
+                              title: Text(
+                                'No downloaded models',
+                                style: TextStyle(
+                                  color: LokiColors.textSecondary,
+                                ),
+                              ),
                             ),
                           for (final model in models)
                             ListTile(
-                              title: Text(model.displayLabel, style: const TextStyle(color: LokiColors.textPrimary)),
-                              subtitle: Text(model.modelName, style: const TextStyle(color: LokiColors.textSecondary)),
-                              trailing: model.deploymentId == _configResult?.config?.deploymentId
-                                  ? const Icon(Icons.check, color: LokiColors.textPrimary)
+                              title: Text(
+                                model.displayLabel,
+                                style: const TextStyle(
+                                  color: LokiColors.textPrimary,
+                                ),
+                              ),
+                              subtitle: Text(
+                                model.modelName,
+                                style: const TextStyle(
+                                  color: LokiColors.textSecondary,
+                                ),
+                              ),
+                              trailing:
+                                  model.deploymentId ==
+                                      _configResult?.config?.deploymentId
+                                  ? const Icon(
+                                      Icons.check,
+                                      color: LokiColors.textPrimary,
+                                    )
                                   : null,
                               onTap: () async {
                                 await ConfigReader.activate(model);
-                                if (sheetContext.mounted) Navigator.pop(sheetContext);
+                                if (sheetContext.mounted)
+                                  Navigator.pop(sheetContext);
                                 await _loadModelRuntime();
                               },
                             ),

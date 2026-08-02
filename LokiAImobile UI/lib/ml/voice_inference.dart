@@ -26,11 +26,14 @@ class VoiceInference {
       _interpreter = await Interpreter.fromFile(File(modelPath));
       _interpreter!.allocateTensors();
       // ignore: avoid_print
-      print('VOICE: model loaded: $modelPath '
-          'in=${_interpreter!.getInputTensor(0).shape} '
-          'out=${_interpreter!.getOutputTensor(0).shape}');
+      print(
+        'VOICE: model loaded: $modelPath '
+        'in=${_interpreter!.getInputTensor(0).shape} '
+        'out=${_interpreter!.getOutputTensor(0).shape}',
+      );
     } catch (e) {
-      _loadError = 'This audio model could not load: $e. '
+      _loadError =
+          'This audio model could not load: $e. '
           'Try a different one from the dashboard.';
       // ignore: avoid_print
       print('VOICE: failed to load audio model: $e');
@@ -63,11 +66,13 @@ class VoiceInference {
     _isRecording = true;
 
     try {
-      final stream = await _audioRecorder.startStream(const RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: 16000,
-        numChannels: 1,
-      ));
+      final stream = await _audioRecorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+      );
 
       // Samples needed by the model (e.g. YAMNet: 15600 = 0.975s @ 16kHz).
       final wanted = _interpreter!
@@ -77,17 +82,20 @@ class VoiceInference {
       final bytesNeeded = wanted * 2; // PCM16 = 2 bytes/sample
       final audioBuffer = <int>[];
 
-      _audioSubscription = stream.listen((data) {
-        if (!_isRecording) return;
-        audioBuffer.addAll(data);
-        if (audioBuffer.length >= bytesNeeded) {
-          final chunk = audioBuffer.sublist(0, bytesNeeded);
-          audioBuffer.removeRange(0, bytesNeeded);
-          _runInference(chunk, onResult);
-        }
-      }, onError: (Object e) {
-        onResult('Microphone stream error: $e');
-      });
+      _audioSubscription = stream.listen(
+        (data) {
+          if (!_isRecording) return;
+          audioBuffer.addAll(data);
+          if (audioBuffer.length >= bytesNeeded) {
+            final chunk = audioBuffer.sublist(0, bytesNeeded);
+            audioBuffer.removeRange(0, bytesNeeded);
+            _runInference(chunk, onResult);
+          }
+        },
+        onError: (Object e) {
+          onResult('Microphone stream error: $e');
+        },
+      );
     } catch (e) {
       _isRecording = false;
       onResult('Could not start recording: $e');
@@ -126,6 +134,7 @@ class VoiceInference {
           v.forEach(flatten);
         }
       }
+
       flatten(output);
       if (scores.isEmpty) {
         onResult('Model produced no output');
@@ -136,8 +145,9 @@ class VoiceInference {
       indexed.sort((a, b) => scores[b].compareTo(scores[a]));
       final top = indexed.take(3).toList();
 
-      String nameOf(int i) =>
-          (_labels.length == scores.length) ? (_labels[i] ?? 'class $i') : 'class $i';
+      String nameOf(int i) => (_labels.length == scores.length)
+          ? (_labels[i] ?? 'class $i')
+          : 'class $i';
 
       final text = top
           .map((i) => '${nameOf(i)} ${(scores[i] * 100).toStringAsFixed(0)}%')
@@ -161,9 +171,12 @@ class VoiceInference {
     } catch (_) {}
   }
 
-  void dispose() {
-    _audioSubscription?.cancel();
-    _audioRecorder.dispose();
+  Future<void> dispose() async {
+    _isRecording = false;
+    await _audioSubscription?.cancel();
+    _audioSubscription = null;
+    await _audioRecorder.dispose();
     _interpreter?.close();
+    _interpreter = null;
   }
 }

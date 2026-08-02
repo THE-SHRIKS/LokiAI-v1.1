@@ -13,7 +13,6 @@ import {
   Send,
   ChevronDown,
   Dot,
-  Activity,
   LogOut,
   MessageSquarePlus,
 } from "lucide-react";
@@ -91,7 +90,6 @@ export function Sidebar({ collapsed, onToggle, recents, activeRecentId, onSelect
         <SideItem icon={Plus} label="New session" onClick={onNewSession} />
         <SideItem icon={Repeat} label="Models" onClick={() => navigate({ to: "/models" })} />
         <SideItem icon={Send} label="Devices" onClick={() => navigate({ to: "/devices" })} />
-        <SideItem icon={Activity} label="Monitor" onClick={() => navigate({ to: "/monitor" })} />
         <SideItem icon={MessageSquarePlus} label="Feedback" onClick={() => navigate({ to: "/feedback" })} />
       </nav>
 
