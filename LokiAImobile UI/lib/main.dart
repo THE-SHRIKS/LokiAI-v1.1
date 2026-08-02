@@ -332,9 +332,9 @@ class _LokiHomeScreenState extends State<LokiHomeScreen> {
   Future<void> _loadModelRuntime({bool? cameraGranted, bool? micGranted}) async {
     final configResult = await ConfigReader.load();
 
-    await _cameraInference?.dispose();
-    await _chatInference?.dispose();
-    await _voiceInference?.dispose();
+    _cameraInference?.dispose();
+    _chatInference?.dispose();
+    _voiceInference?.dispose();
     _cameraInference = null;
     _chatInference = null;
     _voiceInference = null;
