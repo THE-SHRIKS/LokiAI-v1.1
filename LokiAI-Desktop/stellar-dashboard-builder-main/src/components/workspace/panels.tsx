@@ -495,18 +495,18 @@ export function TasksPanel({ onClose }: { onClose?: () => void }) {
         {(d.status === "failed" || d.status === "cancelled") && d.error_message && (
           <div className="truncate text-[10px] text-destructive">{d.error_message}</div>
         )}
+        {(d.status === "queued" || d.status === "downloading") && (
+          <button
+            type="button"
+            onClick={() => void cancel(d.id)}
+            disabled={cancelling === d.id}
+            className="mt-2 inline-flex items-center gap-1 rounded border border-destructive/50 px-2 py-1 text-[10px] font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+            title="Cancel deployment"
+          >
+            <Ban className="h-3 w-3" /> {cancelling === d.id ? "Cancelling download..." : "Cancel download"}
+          </button>
+        )}
       </div>
-      {(d.status === "queued" || d.status === "downloading") && (
-        <button
-          type="button"
-          onClick={() => void cancel(d.id)}
-          disabled={cancelling === d.id}
-          className="inline-flex shrink-0 items-center gap-1 rounded border border-destructive/40 px-1.5 py-1 text-[10px] text-destructive hover:bg-destructive/10 disabled:opacity-50"
-          title="Cancel deployment"
-        >
-          <Ban className="h-3 w-3" /> {cancelling === d.id ? "Cancelling" : "Cancel"}
-        </button>
-      )}
     </li>
   );
 
