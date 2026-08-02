@@ -8,6 +8,9 @@
     "workspace": {
       "root": "LokiAI-Desktop/stellar-dashboard-builder-main",
       "framework": "tanstack-start"
+    },
+    "relay": {
+      "root": "LokiAI-relay"
     }
   },
   "redirects": [
@@ -46,6 +49,12 @@
     {
       "source": "/downloads/lokiai-android.apk",
       "destination": "https://lokiai.onrender.com/apk/download"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "relay"
+      }
     },
     {
       "source": "/workspace/(.*)",
