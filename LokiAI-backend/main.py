@@ -2505,6 +2505,18 @@ def expand_vision_siblings(capabilities: list) -> list:
     return tasks
 
 
+_EDGE_TPU_TFLITE = re.compile(r"(?:coral|edge[-_ ]?tpu|edgetpu)", re.IGNORECASE)
+
+
+def is_android_tflite_file(filename: str) -> bool:
+    """Whether a TFLite file runs with the app's bundled CPU runtime.
+
+    Coral/Edge-TPU models require an extra native delegate which LokiAI does
+    not ship. Reject them before they can reach a phone.
+    """
+    return not bool(_EDGE_TPU_TFLITE.search(filename))
+
+
 async def search_deployable_models(
     client: httpx.AsyncClient, tasks: list, user_message: str, max_size_mb: float,
     limit: int = 12,
@@ -2590,7 +2602,16 @@ async def search_deployable_models(
                         f for f in matches
                         if not re.search(r"(?:dtln|denois|enhanc|separat|\bvad\b)", f, re.I)
                     ]
-                    fname = (runtime_matches or matches)[0]
+                    # A Coral/Edge-TPU export needs a delegate the Android
+                    # runtime does not bundle, so it must never be selected.
+                    runtime_matches = [
+                        f for f in runtime_matches
+                        if is_android_tflite_file(m["id"])
+                        and is_android_tflite_file(f)
+                    ]
+                    if not runtime_matches:
+                        continue
+                    fname = runtime_matches[0]
                 break
             if fname:
                 seen.add(m["id"])
@@ -5375,6 +5396,12 @@ async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".
     largest file that fits the device budget (largest = most capable variant
     that still fits). Raises HTTPException with a precise reason otherwise.
     """
+    if ext == ".tflite" and not is_android_tflite_file(hf_model_id):
+        raise HTTPException(
+            status_code=422,
+            detail="This Coral/Edge-TPU model is incompatible with LokiAI's Android runtime. "
+                   "Choose a standard CPU TFLite model instead."
+        )
     url = f"https://huggingface.co/api/models/{hf_model_id}"
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await _hf_get(client, url, params={"full": "true"})
@@ -5389,6 +5416,8 @@ async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".
         # search path: /deployments can be called directly with any repo id.
         candidates = [f for f in siblings
                       if f.endswith(ext) and not is_split_shard(f)]
+        if ext == ".tflite":
+            candidates = [f for f in candidates if is_android_tflite_file(f)]
         if not candidates:
             shards = [f for f in siblings if is_split_shard(f)]
             if shards:
@@ -5519,6 +5548,12 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
             )
         model_url = req.model_url
         filename = req.model_filename or os.path.basename(url_path)
+        if filename.lower().endswith(".tflite") and not is_android_tflite_file(req.model_url):
+            raise HTTPException(
+                status_code=422,
+                detail="This Coral/Edge-TPU TFLite model needs hardware LokiAI's "
+                       "Android runtime does not include. Deploy a standard CPU TFLite model instead."
+            )
         model_basename = os.path.basename(filename)
         # No repo metadata for arbitrary hosts; the phone still hash-verifies
         # its own download internally (sha reported back in its completion).
@@ -5534,6 +5569,15 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
             max_size_mb = (device["ram_mb"] or 4096) * 0.4
             ext = ".gguf" if req.effective_mode == "chat" else ".tflite"
             filename = await resolve_model_file(req.hf_model_id, max_size_mb, ext)
+
+        if filename.lower().endswith(".tflite") and not (
+            is_android_tflite_file(req.hf_model_id) and is_android_tflite_file(filename)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="This Coral/Edge-TPU TFLite model is incompatible with the "
+                       "Android runtime. Deploy a standard CPU TFLite model instead."
+            )
 
         model_url = f"https://huggingface.co/{req.hf_model_id}/resolve/main/{filename}"
         model_basename = os.path.basename(filename)

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -39,8 +40,10 @@ class ModelGuard {
   /// llama.cpp's split naming convention, e.g. `-00001-of-00009.gguf`.
   /// Loading one shard alone is always fatal: the tensors live across all of
   /// them and the loader aborts when it cannot find the rest.
-  static final RegExp _shardPattern =
-      RegExp(r'-\d{5}-of-\d{5}\.gguf$', caseSensitive: false);
+  static final RegExp _shardPattern = RegExp(
+    r'-\d{5}-of-\d{5}\.gguf$',
+    caseSensitive: false,
+  );
 
   /// A GGUF chat model below this is a fragment, an adapter, a vocab-only
   /// file, or a shard — never something llama.cpp can converse with.
@@ -130,6 +133,60 @@ class ModelGuard {
     return null;
   }
 
+  /// Validates the subset of TFLite audio models this app can actually run.
+  /// Coral/Edge-TPU exports require a native delegate the app does not ship.
+  static Future<ModelRejection?> validateAudioTflite(String path) async {
+    final file = File(path);
+    final lowerPath = path.toLowerCase();
+    if (lowerPath.contains('coral') ||
+        lowerPath.contains('edgetpu') ||
+        lowerPath.contains('edge_tpu') ||
+        lowerPath.contains('edge-tpu')) {
+      return const ModelRejection(
+        'AUDIO_MODEL_REQUIRES_EDGE_TPU',
+        'This audio model is built for Coral Edge TPU hardware, which this '
+            'phone cannot use. Deploy a standard CPU TFLite audio model from '
+            'the dashboard.',
+      );
+    }
+    if (!await file.exists()) {
+      return const ModelRejection(
+        'MODEL_FILE_MISSING',
+        'The deployed audio model file is missing. Re-deploy it from the dashboard.',
+      );
+    }
+    try {
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in file.openRead(0, 128 * 1024)) {
+        builder.add(chunk);
+      }
+      final bytes = builder.toBytes();
+      if (bytes.length < 8 ||
+          bytes[4] != 0x54 ||
+          bytes[5] != 0x46 ||
+          bytes[6] != 0x4c ||
+          bytes[7] != 0x33) {
+        return const ModelRejection(
+          'AUDIO_MODEL_NOT_TFLITE',
+          'The deployed audio file is not a valid TFLite model. Re-deploy it from the dashboard.',
+        );
+      }
+      if (_containsAsciiIgnoreCase(bytes, 'edgetpu') ||
+          _containsAsciiIgnoreCase(bytes, 'coral')) {
+        return const ModelRejection(
+          'AUDIO_MODEL_REQUIRES_EDGE_TPU',
+          'This audio model requires Coral Edge TPU hardware. Deploy a standard CPU TFLite audio model instead.',
+        );
+      }
+    } catch (e) {
+      return ModelRejection(
+        'AUDIO_MODEL_UNREADABLE',
+        'The deployed audio model could not be inspected ($e). Re-deploy it.',
+      );
+    }
+    return null;
+  }
+
   static bool _hasGgufMagic(Uint8List header) =>
       header.length >= 4 &&
       header[0] == 0x47 && // G
@@ -143,6 +200,20 @@ class ModelGuard {
     for (var i = 0; i + bytes.length <= haystack.length; i++) {
       for (var j = 0; j < bytes.length; j++) {
         if (haystack[i + j] != bytes[j]) continue outer;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  static bool _containsAsciiIgnoreCase(Uint8List haystack, String needle) {
+    final bytes = needle.toLowerCase().codeUnits;
+    outer:
+    for (var i = 0; i + bytes.length <= haystack.length; i++) {
+      for (var j = 0; j < bytes.length; j++) {
+        final value = haystack[i + j];
+        final lower = value >= 0x41 && value <= 0x5a ? value + 0x20 : value;
+        if (lower != bytes[j]) continue outer;
       }
       return true;
     }

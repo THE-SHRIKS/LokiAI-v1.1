@@ -8,6 +8,8 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:record/record.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
+import 'model_guard.dart';
+
 /// TFLite audio classification on live microphone input.
 ///
 /// Model-generic: input/output tensor shapes are introspected at load time.
@@ -31,14 +33,27 @@ class VoiceInference {
   /// Loads [modelPath]. Returns null on success, or a user-readable reason.
   Future<String?> loadModel(String modelPath) async {
     if (_disposed) return 'The microphone was closed before the model loaded.';
+    final rejection = await ModelGuard.validateAudioTflite(modelPath);
+    if (rejection != null) {
+      debugPrint('VOICE: refusing audio model: $rejection');
+      return rejection.message;
+    }
+    Interpreter? interpreter;
     try {
-      final file = File(modelPath);
-      if (!await file.exists()) {
-        return 'The deployed audio model file is missing. '
-            'Re-deploy it from the dashboard.';
-      }
-      final interpreter = Interpreter.fromFile(file);
+      interpreter = Interpreter.fromFile(File(modelPath));
       interpreter.allocateTensors();
+      final inputs = interpreter.getInputTensors();
+      final outputs = interpreter.getOutputTensors();
+      if (inputs.length != 1 ||
+          outputs.isEmpty ||
+          inputs.first.type != TensorType.float32 ||
+          outputs.first.type != TensorType.float32 ||
+          inputs.first.shape.any((dimension) => dimension <= 0) ||
+          outputs.first.shape.any((dimension) => dimension <= 0)) {
+        interpreter.close();
+        return 'This audio model is not compatible with LokiAI microphone input. '
+            'Deploy a standard float32 sound-classification TFLite model.';
+      }
       _interpreter = interpreter;
       debugPrint(
         'VOICE: model loaded: $modelPath '
@@ -46,9 +61,12 @@ class VoiceInference {
         'out=${interpreter.getOutputTensor(0).shape}',
       );
     } catch (e) {
+      try {
+        interpreter?.close();
+      } catch (_) {}
       debugPrint('VOICE: failed to load audio model: $e');
-      return 'This audio model could not load: $e. '
-          'Try a different one from the dashboard.';
+      return 'This audio model could not load on this phone. '
+          'Deploy a standard CPU TFLite sound-classification model from the dashboard.';
     }
 
     try {
@@ -98,8 +116,10 @@ class VoiceInference {
       _isRecording = true;
 
       // Samples needed by the model (e.g. YAMNet: 15600 = 0.975s @ 16kHz).
-      final wanted =
-          interpreter.getInputTensor(0).shape.reduce((a, b) => a * b);
+      final wanted = interpreter
+          .getInputTensor(0)
+          .shape
+          .reduce((a, b) => a * b);
       final bytesNeeded = wanted * 2; // PCM16 = 2 bytes/sample
       final audioBuffer = <int>[];
 

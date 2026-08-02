@@ -28,6 +28,17 @@ Future<File> _makeGguf(
   return file;
 }
 
+Future<File> _makeTflite(Directory dir, String name, {String? marker}) async {
+  final bytes = Uint8List(1024);
+  bytes.setRange(4, 8, 'TFL3'.codeUnits);
+  if (marker != null) {
+    bytes.setRange(32, 32 + marker.length, marker.codeUnits);
+  }
+  final file = File('${dir.path}/$name');
+  await file.writeAsBytes(bytes);
+  return file;
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -56,10 +67,7 @@ void main() {
     });
 
     test('does not flag ordinary single-file models', () {
-      expect(
-        ModelGuard.isShard('Llama-3.2-1B-Instruct-Q8_0.gguf'),
-        isFalse,
-      );
+      expect(ModelGuard.isShard('Llama-3.2-1B-Instruct-Q8_0.gguf'), isFalse);
       expect(ModelGuard.isShard('mobilenet_v2.tflite'), isFalse);
     });
 
@@ -77,30 +85,47 @@ void main() {
 
   group('file validation', () {
     test('accepts a plausible single-file GGUF', () async {
-      final file = await _makeGguf(temp, 'good.gguf',
-          sizeBytes: 25 * 1024 * 1024);
+      final file = await _makeGguf(
+        temp,
+        'good.gguf',
+        sizeBytes: 25 * 1024 * 1024,
+      );
       expect(await ModelGuard.validateGguf(file.path), isNull);
     });
 
     test('refuses a file that is too small to be a chat model', () async {
       // 9 MB is the size that passed the device budget in production.
-      final file = await _makeGguf(temp, 'tiny.gguf',
-          sizeBytes: 9 * 1024 * 1024);
+      final file = await _makeGguf(
+        temp,
+        'tiny.gguf',
+        sizeBytes: 9 * 1024 * 1024,
+      );
       final rejection = await ModelGuard.validateGguf(file.path);
       expect(rejection?.code, 'MODEL_TOO_SMALL');
       expect(rejection!.message, contains('fragment'));
     });
 
     test('refuses a file that is not a GGUF at all', () async {
-      final file = await _makeGguf(temp, 'bogus.gguf',
-          sizeBytes: 25 * 1024 * 1024, validMagic: false);
-      expect((await ModelGuard.validateGguf(file.path))?.code, 'MODEL_NOT_GGUF');
+      final file = await _makeGguf(
+        temp,
+        'bogus.gguf',
+        sizeBytes: 25 * 1024 * 1024,
+        validMagic: false,
+      );
+      expect(
+        (await ModelGuard.validateGguf(file.path))?.code,
+        'MODEL_NOT_GGUF',
+      );
     });
 
     test('refuses a shard whose filename does not admit it', () async {
       // Shard 1 carries split.count in its metadata even when renamed.
-      final file = await _makeGguf(temp, 'innocent-name.gguf',
-          sizeBytes: 25 * 1024 * 1024, extraHeaderText: 'split.count');
+      final file = await _makeGguf(
+        temp,
+        'innocent-name.gguf',
+        sizeBytes: 25 * 1024 * 1024,
+        extraHeaderText: 'split.count',
+      );
       expect(
         (await ModelGuard.validateGguf(file.path))?.code,
         'MODEL_IS_SPLIT_SHARD',
@@ -113,6 +138,30 @@ void main() {
         'MODEL_FILE_MISSING',
       );
     });
+  });
+
+  group('audio TFLite validation', () {
+    test('refuses Coral models before native interpreter loading', () async {
+      final file = await _makeTflite(temp, 'yamnet_coral.tflite');
+      final rejection = await ModelGuard.validateAudioTflite(file.path);
+      expect(rejection?.code, 'AUDIO_MODEL_REQUIRES_EDGE_TPU');
+    });
+
+    test('refuses Edge TPU metadata even with an innocent filename', () async {
+      final file = await _makeTflite(temp, 'sound.tflite', marker: 'EdgeTPU');
+      expect(
+        (await ModelGuard.validateAudioTflite(file.path))?.code,
+        'AUDIO_MODEL_REQUIRES_EDGE_TPU',
+      );
+    });
+
+    test(
+      'accepts a standard TFLite header for interpreter validation',
+      () async {
+        final file = await _makeTflite(temp, 'yamnet.tflite');
+        expect(await ModelGuard.validateAudioTflite(file.path), isNull);
+      },
+    );
   });
 
   group('native crash quarantine', () {

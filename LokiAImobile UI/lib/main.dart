@@ -427,7 +427,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
       setState(() {
         _messages.add(
           ChatMessage(
-            text: 'The last model closed LokiAI while it was loading, so it '
+            text:
+                'The last model closed LokiAI while it was loading, so it '
                 'has been disabled. Deploy a different chat model from the '
                 'dashboard - a single-file .gguf under about 1 GB works best '
                 'on this phone.',
@@ -579,6 +580,13 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
     if (_mic.state == MicFeatureState.failed ||
         _mic.state == MicFeatureState.permissionDenied ||
         _mic.state == MicFeatureState.permissionPermanentlyDenied) {
+      // A bad deployment should yield one actionable message, not a duplicate
+      // bubble every time the user retries the microphone button.
+      if (_messages.isNotEmpty &&
+          _messages.last.role == MessageRole.ai &&
+          _messages.last.text == message) {
+        return;
+      }
       setState(() {
         _messages.add(ChatMessage(text: message, role: MessageRole.ai));
       });
@@ -624,10 +632,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
     void finish(String text) {
       _updateMessage(
         placeholder.id,
-        (m) => m.copyWith(
-          text: text.isEmpty ? m.text : text,
-          isStreaming: false,
-        ),
+        (m) =>
+            m.copyWith(text: text.isEmpty ? m.text : text, isStreaming: false),
       );
       if (mounted) setState(() => _generating = false);
     }
@@ -659,25 +665,27 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
 
       final completion = Completer<void>();
       late final StreamSubscription<String> subscription;
-      subscription = chat.generateText(prompt).listen(
-        (token) => _updateMessage(
-          placeholder.id,
-          (m) => m.copyWith(text: m.text + token),
-        ),
-        onDone: () {
-          if (!completion.isCompleted) completion.complete();
-        },
-        onError: (Object error, StackTrace stackTrace) {
-          Diagnostics.capture(
-            feature: 'chat.generate',
-            error: error,
-            stackTrace: stackTrace,
-            correlationId: correlationId,
+      subscription = chat
+          .generateText(prompt)
+          .listen(
+            (token) => _updateMessage(
+              placeholder.id,
+              (m) => m.copyWith(text: m.text + token),
+            ),
+            onDone: () {
+              if (!completion.isCompleted) completion.complete();
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              Diagnostics.capture(
+                feature: 'chat.generate',
+                error: error,
+                stackTrace: stackTrace,
+                correlationId: correlationId,
+              );
+              if (!completion.isCompleted) completion.completeError(error);
+            },
+            cancelOnError: true,
           );
-          if (!completion.isCompleted) completion.completeError(error);
-        },
-        cancelOnError: true,
-      );
 
       try {
         await completion.future;
@@ -745,7 +753,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
                 icon: Icons.camera_alt_outlined,
                 activeIcon: Icons.camera_alt,
                 isActive: _camera.isOpen,
-                isGranted: _camera.state != CameraFeatureState.permissionDenied &&
+                isGranted:
+                    _camera.state != CameraFeatureState.permissionDenied &&
                     _camera.state !=
                         CameraFeatureState.permissionPermanentlyDenied,
                 onTap: _toggleCamera,
@@ -756,7 +765,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
                 icon: Icons.mic_none,
                 activeIcon: Icons.mic,
                 isActive: _mic.isListening,
-                isGranted: _mic.state != MicFeatureState.permissionDenied &&
+                isGranted:
+                    _mic.state != MicFeatureState.permissionDenied &&
                     _mic.state != MicFeatureState.permissionPermanentlyDenied,
                 onTap: _toggleMic,
                 semanticLabel: 'Toggle Live Mic',
@@ -960,7 +970,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
 
   Widget _cameraSurface() {
     final controller = _camera.previewController;
-    final busy = _camera.state == CameraFeatureState.capturing ||
+    final busy =
+        _camera.state == CameraFeatureState.capturing ||
         _camera.state == CameraFeatureState.processing;
     return Container(
       margin: const EdgeInsets.only(bottom: 24),
