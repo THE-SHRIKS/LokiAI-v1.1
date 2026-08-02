@@ -315,6 +315,9 @@ export interface ModelRecommendation {
   source_url?: string;
   /** The planned capability this model was selected to satisfy. */
   requested_capability?: string;
+  /** Technical evidence, shown behind the card's Details disclosure. */
+  runtime?: string;
+  publisher?: string;
 }
 
 /** Recommendations grouped by the capability the user asked for, so a request

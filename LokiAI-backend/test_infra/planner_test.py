@@ -143,8 +143,9 @@ def test_plan_schema_validation():
 
     legacy_single = main._validate_task_plan({"task": "audio-classification"})
     check(
-        legacy_single == [{"capability": "audio-classification", "quantity": 1,
-                           "constraints": {}}],
+        len(legacy_single) == 1
+        and legacy_single[0]["capability"] == "audio-classification"
+        and legacy_single[0]["quantity"] == 1,
         "original single-task schema still accepted",
         f"{legacy_single}",
     )
@@ -155,13 +156,15 @@ def test_plan_schema_validation():
         main._validate_task_plan({"tasks": ["not-a-real-task", 42, None]}) == [],
         "unknown capabilities are discarded, not passed downstream",
     )
+    clamped = main._validate_task_plan({
+        "tasks": [{"capability": "text-generation", "quantity": 99,
+                   "constraints": {"evil": "x", "max_size_mb": 10}}]
+    })
     check(
-        main._validate_task_plan({
-            "tasks": [{"capability": "text-generation", "quantity": 99,
-                       "constraints": {"evil": "x", "max_size_mb": 10}}]
-        }) == [{"capability": "text-generation", "quantity": 5,
-                "constraints": {"max_size_mb": 10}}],
+        len(clamped) == 1 and clamped[0]["quantity"] == 5
+        and clamped[0]["constraints"] == {"max_size_mb": 10},
         "quantity is clamped and unknown constraint keys are dropped",
+        f"{clamped}",
     )
 
     merged = main._validate_task_plan({
@@ -171,9 +174,26 @@ def test_plan_schema_validation():
         ]
     })
     check(
-        merged == [{"capability": "text-generation", "quantity": 3, "constraints": {}}],
+        len(merged) == 1 and merged[0]["quantity"] == 3,
         "a repeated capability merges rather than searching the same pool twice",
         f"{merged}",
+    )
+
+    with_pref = main._validate_task_plan({
+        "tasks": [{"capability": "text-generation", "quantity": 1,
+                   "size_preference": "small", "constraints": {}}]
+    })
+    check(
+        with_pref[0]["size_preference"] == "small",
+        "a stated size preference survives validation",
+        f"{with_pref}",
+    )
+    check(
+        main._validate_task_plan({
+            "tasks": [{"capability": "text-generation",
+                       "size_preference": "enormous"}]
+        })[0]["size_preference"] == "any",
+        "an invented size preference falls back to 'any'",
     )
 
 
@@ -310,7 +330,7 @@ def test_descriptions():
 
     required = ["model_id", "display_name", "capability", "description",
                 "why_recommended", "format", "size_mb", "estimated_device_fit",
-                "source", "source_url"]
+                "source", "source_url", "runtime", "publisher"]
     for model in models:
         for field in required:
             check(field in model,
@@ -319,10 +339,30 @@ def test_descriptions():
             bool((model.get("description") or "").strip()),
             f"{model['id']} description is non-empty",
         )
+        # why_recommended is now a DISTINGUISHING note, not a template. It is
+        # deliberately empty when there is nothing to distinguish, so the old
+        # "non-empty on every card" assertion would re-enforce boilerplate.
         check(
-            bool((model.get("why_recommended") or "").strip()),
-            f"{model['id']} why_recommended is non-empty",
+            isinstance(model.get("why_recommended"), str),
+            f"{model['id']} why_recommended is a string",
         )
+        check(
+            "budget LokiAI allows" not in (model.get("why_recommended") or ""),
+            f"{model['id']} carries no templated budget sentence",
+            model.get("why_recommended"),
+        )
+
+    notes = [m["why_recommended"] for m in models if m["why_recommended"]]
+    check(
+        len(notes) == len(set(notes)),
+        "comparison notes are distinct, not one sentence repeated",
+        f"{notes}",
+    )
+    check(
+        any("Smallest" in n for n in notes),
+        "the smallest candidate is called out relative to the others",
+        f"{notes}",
+    )
 
     descriptions = [m["description"] for m in models]
     check(
@@ -343,15 +383,14 @@ def test_descriptions():
         models[1]["description"],
     )
     check(
-        models[2]["source"] == "fallback"
-        and "publisher supplied no model card" in models[2]["description"],
-        "the fallback is clearly marked as such rather than invented",
-        models[2]["description"],
+        models[2]["source"] == "fallback",
+        "a model with no card is marked internally as a fallback",
+        models[2]["source"],
     )
     check(
-        "Redmi Note 8 Pro" in models[0]["why_recommended"],
-        "why_recommended names the actual device",
-        models[0]["why_recommended"],
+        len(models[2]["description"]) <= main.MAX_DESCRIPTION_CHARS + 40,
+        "the fallback description is still short, not an apology paragraph",
+        models[2]["description"],
     )
     # 14 MB and 400 MB against a 2254 MB budget are both genuinely comfortable;
     # the thresholds themselves are checked directly below.
@@ -530,10 +569,21 @@ def test_description_readability():
         f"{len(a)} / {len(b)}",
     )
     check(
-        a.startswith("Offline chat."),
-        "the capability clause is one short phrase, not a full paragraph",
+        not a.startswith("Offline chat."),
+        "no fixed capability clause is prefixed to real publisher prose",
         a,
     )
+    for text in (a, b):
+        check(
+            len(text) <= main.MAX_DESCRIPTION_CHARS,
+            f"description respects the {main.MAX_DESCRIPTION_CHARS}-char limit",
+            f"{len(text)}: {text}",
+        )
+        check(
+            len(text.split()) <= main.MAX_DESCRIPTION_WORDS,
+            f"description respects the {main.MAX_DESCRIPTION_WORDS}-word limit",
+            text,
+        )
 
 
 def test_no_repeated_model_lines():
@@ -625,6 +675,188 @@ def test_conversational_path_cannot_invent_models():
         "text-generation" in
         [t["capability"] for t in main.classify_task_plan("small chat models")],
         "'small chat models' maps to text-generation, not small talk",
+    )
+
+
+def test_size_preference_and_ranking():
+    print("\n== size preference narrows and re-ranks (spec 4, 5) ==")
+
+    check(main.extract_size_preference("small chat model") == "small",
+          "'small' is detected")
+    check(main.extract_size_preference("small model not big") == "small",
+          "'small ... not big' is detected")
+    check(main.extract_size_preference("tiny chat") == "tiny", "'tiny' is detected")
+    check(main.extract_size_preference("giveme a model for tiny chat no heavy")
+          == "tiny", "a real transcript phrasing is detected")
+    check(main.extract_size_preference("a chat model") == "any",
+          "no size word means no preference")
+    check(main.extract_size_preference("most capable model") == "large",
+          "'most capable' is a large preference")
+
+    budget = 2254.0
+    check(main.size_ceiling_for("small", budget) < budget,
+          "a small preference tightens the ceiling below the device budget")
+    check(main.size_ceiling_for("tiny", budget)
+          < main.size_ceiling_for("small", budget),
+          "tiny is stricter than small")
+    check(main.size_ceiling_for("any", budget) == budget,
+          "no preference uses the full device budget")
+
+    # The exact set from the transcript, where a 1905 MB model was offered
+    # first even after the user said "small model not big".
+    candidates = [
+        {"id": "Qwen/Qwen2.5-3B-Instruct-GGUF", "size_mb": 1905.33,
+         "reputable": True, "downloads": 900},
+        {"id": "Qwen/Qwen2.5-1.5B-Instruct-GGUF", "size_mb": 1016.83,
+         "reputable": True, "downloads": 800},
+        {"id": "hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF",
+         "size_mb": 1259.88, "reputable": True, "downloads": 1000},
+    ]
+    ranked = main.rank_candidates(candidates, "small")
+    check(
+        ranked[0]["id"] == "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        "asking for small puts the genuinely smallest first",
+        f"{[c['id'] for c in ranked]}",
+    )
+    check(
+        ranked[-1]["size_mb"] == 1905.33,
+        "the largest is ranked last for a small request",
+    )
+    check(
+        [c["size_mb"] for c in ranked] == sorted(c["size_mb"] for c in ranked),
+        "a small request ranks strictly by ascending size",
+    )
+    check(
+        main.rank_candidates(candidates, "any")[0]["downloads"] == 1000,
+        "with no preference, popularity still leads",
+    )
+    ceiling = main.size_ceiling_for("small", 2254.0)
+    within = [c for c in candidates if c["size_mb"] <= ceiling]
+    check(
+        all(c["size_mb"] < 1905 for c in within),
+        "the 1.9 GB option is excluded by a small preference",
+        f"ceiling={ceiling}",
+    )
+
+
+def test_refinement_detection():
+    print("\n== follow-ups refine rather than restart (spec 5) ==")
+
+    for message in ("small model not big", "smaller", "a smaller one",
+                    "show lighter options", "no not big", "lighter please"):
+        check(main._is_refinement(message),
+              f"{message!r} is treated as a refinement")
+
+    for message in ("i want a vision model", "give me a camera model",
+                    "find me an audio model and a chat model"):
+        check(not main._is_refinement(message),
+              f"{message!r} is a fresh request, not a refinement")
+
+    history = [
+        {"role": "user", "content": "i want a model for chat small one"},
+        {"role": "assistant", "content": "Here are three options."},
+        {"role": "user", "content": "small model not big"},
+    ]
+    previous = main._previous_plan_from_history(history)
+    check(
+        previous and previous[0]["capability"] == "text-generation",
+        "the capability under discussion is recovered from history",
+        f"{previous}",
+    )
+
+
+def test_numbered_selection():
+    print("\n== numbered selection resolves a stored candidate (spec 5) ==")
+
+    for message, expected in [
+        ("second one", 2), ("the second one", 2), ("2", 2), ("number 2", 2),
+        ("option 3", 3), ("first", 1), ("3.", 3), ("last", -1),
+    ]:
+        check(main.parse_candidate_selection(message) == expected,
+              f"{message!r} parses to {expected}",
+              str(main.parse_candidate_selection(message)))
+
+    for message in ("i want a chat model", "small model not big", "hey",
+                    "give me 3 models"):
+        check(main.parse_candidate_selection(message) is None,
+              f"{message!r} is not a selection")
+
+    stored = [{"id": "a/one"}, {"id": "a/two"}, {"id": "a/three"}]
+    check(main.select_from_previous(stored, 2)["id"] == "a/two",
+          "the second stored candidate is returned")
+    check(main.select_from_previous(stored, -1)["id"] == "a/three",
+          "'last' resolves to the final candidate")
+    check(main.select_from_previous(stored, 9) is None,
+          "an out-of-range pick resolves to nothing rather than guessing")
+    check(main.select_from_previous([], 1) is None,
+          "no stored candidates means no selection")
+
+
+def test_response_grounding():
+    print("\n== generated prose cannot introduce a model or size (spec 6) ==")
+
+    candidates = [
+        {"id": "Qwen/Qwen2.5-1.5B-Instruct-GGUF", "size_mb": 1016.83},
+        {"id": "hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF",
+         "size_mb": 1259.88},
+    ]
+
+    ok = ("These two are the lightest that still hold a proper conversation "
+          "offline - the Qwen one is the smaller of them.")
+    check(
+        main._response_grounding_violation(ok, candidates) is None,
+        "a grounded sentence passes",
+        str(main._response_grounding_violation(ok, candidates)),
+    )
+
+    # The exact hallucination from the transcript.
+    invented = ("1. DistilBERT: around 66MB in size. 2. T5-Small: around 70MB.")
+    violation = main._response_grounding_violation(invented, candidates)
+    check(violation is not None,
+          "the DistilBERT/T5-Small hallucination is rejected", str(violation))
+
+    check(
+        main._response_grounding_violation(
+            "Try meta-llama/Llama-3.3-70B-Instruct instead.", candidates
+        ) is not None,
+        "an unlisted repository id is rejected",
+    )
+    check(
+        main._response_grounding_violation(
+            "The Qwen model is about 400 MB.", candidates
+        ) is not None,
+        "an invented size is rejected",
+    )
+    check(
+        main._response_grounding_violation(
+            "The Qwen one is 1016.83 MB.", candidates
+        ) is None,
+        "a real candidate size is allowed",
+    )
+    check(
+        main._response_grounding_violation(
+            "Qwen/Qwen2.5-1.5B-Instruct-GGUF is the smallest.", candidates
+        ) is None,
+        "naming a real candidate is allowed",
+    )
+    check(
+        main._response_grounding_violation("", candidates) == "empty",
+        "an empty response is not accepted",
+    )
+
+
+def test_deterministic_fallback_is_not_boilerplate():
+    print("\n== the ungrounded fallback states nothing the cards show ==")
+
+    line = main._deterministic_recommendation_line([{"id": "a/one"},
+                                                    {"id": "a/two"}])
+    for banned in ("MB", "budget", "GGUF", "Press Deploy", "runs on the phone"):
+        check(banned not in line,
+              f"the fallback line does not restate {banned!r}", line)
+    check(len(line) < 120, "the fallback line is one short sentence", line)
+    check(
+        main._deterministic_recommendation_line([]) != line,
+        "the no-results case reads differently from the results case",
     )
 
 
@@ -725,6 +957,11 @@ if __name__ == "__main__":
     test_no_repeated_model_lines()
     test_options_and_cache_versioning()
     test_conversational_path_cannot_invent_models()
+    test_size_preference_and_ranking()
+    test_refinement_detection()
+    test_numbered_selection()
+    test_response_grounding()
+    test_deterministic_fallback_is_not_boilerplate()
     test_card_paragraph_extraction()
     test_run_lifecycle_helpers()
     test_greeting_path_is_bounded()

@@ -2121,6 +2121,9 @@ MIN_CHAT_MODEL_MB = float(os.getenv("MIN_CHAT_MODEL_MB", "20"))
 # result is not a recommendation, it is a take-it-or-leave-it.
 MIN_OPTIONS_PER_CAPABILITY = int(os.getenv("MIN_OPTIONS_PER_CAPABILITY", "3"))
 
+# Upper bound on cards in one reply, across all requested capabilities.
+MAX_RENDERED_CANDIDATES = int(os.getenv("MAX_RENDERED_CANDIDATES", "6"))
+
 
 def is_split_shard(filename: str) -> bool:
     return bool(_SPLIT_SHARD_RE.search(filename or ""))
@@ -2260,6 +2263,62 @@ def _extract_quantity(message: str, capability: str) -> int:
     return 1
 
 
+# Size intent expressed in words, as a fraction of the device budget. A user
+# saying "small" is stating a preference about the model, not about the phone,
+# so it must both filter and re-rank - previously "small model not big" returned
+# the identical three options including a 1.9 GB one.
+_SIZE_PREFERENCE_WORDS = [
+    ("tiny", ("tiny", "smallest", "very small", "as small as possible",
+              "super small", "ultra light", "featherweight")),
+    ("small", ("small", "smaller", "light", "lighter", "lightweight", "compact",
+               "not big", "not heavy", "no heavy", "nothing big", "less heavy",
+               "low memory", "quick")),
+    ("large", ("large", "big", "biggest", "most capable", "best quality",
+               "powerful", "strongest")),
+]
+
+# Fraction of the device budget each preference allows.
+_SIZE_PREFERENCE_CEILING = {"tiny": 0.25, "small": 0.5, "any": 1.0, "large": 1.0}
+
+
+def extract_size_preference(message: str) -> str:
+    """'tiny' | 'small' | 'large' | 'any' from the user's own words."""
+    msg = message.lower()
+    for preference, words in _SIZE_PREFERENCE_WORDS:
+        if any(w in msg for w in words):
+            return preference
+    return "any"
+
+
+def size_ceiling_for(preference: str, max_size_mb: float) -> float:
+    """The effective budget once the user's stated preference is applied."""
+    return max_size_mb * _SIZE_PREFERENCE_CEILING.get(preference, 1.0)
+
+
+def rank_candidates(models: list, size_preference: str) -> list:
+    """Order candidates by what the user actually asked for.
+
+    Default ranking is (reputable, downloads). When the user asked for a small
+    or tiny model, size becomes the primary key so genuinely smaller options
+    come first instead of being buried under more popular large ones.
+    """
+    if size_preference in ("small", "tiny"):
+        return sorted(
+            models,
+            key=lambda m: (m.get("size_mb") or float("inf"),
+                           not m.get("reputable", False)),
+        )
+    if size_preference == "large":
+        return sorted(
+            models,
+            key=lambda m: (-(m.get("size_mb") or 0), not m.get("reputable", False)),
+        )
+    return sorted(
+        models,
+        key=lambda m: (not m.get("reputable", False), -(m.get("downloads") or 0)),
+    )
+
+
 def classify_task_plan(message: str) -> list:
     """User message -> ordered plan of {capability, quantity, constraints}.
 
@@ -2279,6 +2338,7 @@ def classify_task_plan(message: str) -> list:
         plan.append({
             "capability": capability,
             "quantity": _extract_quantity(message, capability),
+            "size_preference": extract_size_preference(message),
             "constraints": {},
             "_position": position,
         })
@@ -2287,7 +2347,12 @@ def classify_task_plan(message: str) -> list:
         task.pop("_position")
     if not plan:
         # An unrecognised request is a chat request, matching prior behaviour.
-        plan = [{"capability": "text-generation", "quantity": 1, "constraints": {}}]
+        plan = [{
+            "capability": "text-generation",
+            "quantity": 1,
+            "size_preference": extract_size_preference(message),
+            "constraints": {},
+        }]
     return plan
 
 
@@ -2793,6 +2858,7 @@ def _validate_task_plan(parsed: dict) -> list:
     plan: list = []
     by_capability: dict = {}
     for entry in raw:
+        size_preference = "any"
         if isinstance(entry, str):
             capability, quantity, constraints = entry, 1, {}
         elif isinstance(entry, dict):
@@ -2807,6 +2873,9 @@ def _validate_task_plan(parsed: dict) -> list:
                 k: v for k, v in raw_constraints.items()
                 if k in _ALLOWED_CONSTRAINT_KEYS
             } if isinstance(raw_constraints, dict) else {}
+            candidate_pref = entry.get("size_preference")
+            if candidate_pref in ("tiny", "small", "large", "any"):
+                size_preference = candidate_pref
         else:
             continue
 
@@ -2818,10 +2887,13 @@ def _validate_task_plan(parsed: dict) -> list:
             existing = by_capability[capability]
             existing["quantity"] = min(5, existing["quantity"] + quantity)
             existing["constraints"].update(constraints)
+            if size_preference != "any":
+                existing["size_preference"] = size_preference
             continue
         task = {
             "capability": capability,
             "quantity": quantity,
+            "size_preference": size_preference,
             "constraints": constraints,
         }
         by_capability[capability] = task
@@ -3224,6 +3296,52 @@ def _strip_markup(text: str) -> str:
     return out.strip()
 
 
+# A card description sits under a model name in a narrow panel. One sentence.
+MAX_DESCRIPTION_CHARS = int(os.getenv("MAX_DESCRIPTION_CHARS", "120"))
+MAX_DESCRIPTION_WORDS = int(os.getenv("MAX_DESCRIPTION_WORDS", "20"))
+
+# Sentences that describe the *packaging* rather than the model. These are the
+# ones that filled the cards: "This model was converted to GGUF format from
+# meta-llama/... using llama.cpp via the ggml.ai's GGUF-my-repo space."
+_PACKAGING_NOISE = re.compile(
+    r"(converted to \w+ format|gguf-my-repo|using llama\.cpp|quantiz\w+ (?:by|with|using)"
+    r"|refer to the original model card|see the original|for more details"
+    r"|this (?:repo|repository) contains|these are .{0,30}(?:weights|files)"
+    r"|read our|check out|follow us|join our|star (?:us|the repo)"
+    r"|^we (?:release|are)|benchmark|discord|newsletter)",
+    re.IGNORECASE,
+)
+
+
+def _shorten_description(text: str) -> Optional[str]:
+    """One informative sentence, within the card's length budget.
+
+    Model cards open with marketing, conversion history and links. Taking their
+    first paragraph verbatim is what put "This model was converted to GGUF
+    format from meta-llama/... via the ggml.ai's GGUF-my-repo space" on a card
+    where a single line was wanted.
+    """
+    if not text:
+        return None
+    cleaned = _strip_markup(text)
+    # Split into sentences and take the first that actually describes the model.
+    for sentence in re.split(r"(?<=[.!?])\s+", cleaned):
+        sentence = sentence.strip()
+        if len(sentence) < 25:
+            continue
+        if _PACKAGING_NOISE.search(sentence):
+            continue
+        words = sentence.split()
+        if len(words) > MAX_DESCRIPTION_WORDS:
+            sentence = " ".join(words[:MAX_DESCRIPTION_WORDS]).rstrip(",;:") + "..."
+        if len(sentence) > MAX_DESCRIPTION_CHARS:
+            window = sentence[:MAX_DESCRIPTION_CHARS]
+            cut = window.rfind(" ")
+            sentence = (window[:cut] if cut > 40 else window).rstrip(",;:") + "..."
+        return sentence
+    return None
+
+
 def _first_card_paragraph(readme: str, limit: int = 220) -> Optional[str]:
     """First substantive prose sentence(s) of a model card, or None.
 
@@ -3245,15 +3363,14 @@ def _first_card_paragraph(readme: str, limit: int = 220) -> Optional[str]:
         letters = sum(c.isalpha() or c.isspace() for c in cleaned)
         if letters / len(cleaned) < 0.75:
             continue
-        if len(cleaned) <= limit:
-            return cleaned
-        # Cut at the last sentence end inside the limit, else the last word.
-        window = cleaned[:limit]
-        cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
-        if cut >= 60:
-            return window[:cut + 1].strip()
-        cut = window.rfind(" ")
-        return (window[:cut] if cut >= 60 else window).strip() + "..."
+        # Many cards open with conversion/marketing prose and only describe the
+        # model further down. Keep scanning until a paragraph actually yields a
+        # descriptive sentence, instead of giving up on the first one and
+        # falling back to a generic capability line.
+        usable = _shorten_description(cleaned)
+        if usable:
+            return usable
+    del limit
     return None
 
 
@@ -3299,46 +3416,59 @@ def _compose_description(
             "Task not stated by the publisher.",
         ),
     )
-    # With real prose from the publisher, only a short clause is prepended.
-    # Prefixing the full sentence every time is what made every card open with
-    # the same two lines.
+    # When the publisher wrote usable prose, it stands alone. The capability is
+    # already a chip on the card ("text-generation"), so prefixing a clause to
+    # every card was pure repetition. `clause` is retained only for callers
+    # that need a bare capability phrase.
+    del clause
     if card_summary:
-        return f"{clause} {card_summary}"
-    if card_data and isinstance(card_data.get("base_model"), str):
-        return f"{full} Converted from {card_data['base_model']}."
-    if source == "fallback":
-        return (f"{full} (Summarised from its task tag - the "
-                "publisher supplied no model card text.)")
+        shortened = _shorten_description(card_summary)
+        if shortened:
+            return shortened
     return full
 
 
-def _compose_why_recommended(
-    model: dict, device: dict, max_size_mb: float, fit: str
-) -> str:
-    size_mb = model.get("size_mb")
-    fmt = (model.get("format") or "").lower()
-    runtime = _FORMAT_RUNTIME.get(fmt, "runs on the phone's on-device runtime")
-    phone = device.get("phone_model") or "the paired phone"
-    ram_mb = device.get("ram_mb")
+def _annotate_comparisons(models: list, max_size_mb: float) -> None:
+    """Give each candidate a short note that DISTINGUISHES it from the others.
 
-    reasons = []
-    if size_mb and max_size_mb > 0:
-        headroom = "well inside" if fit == "comfortable" else (
-            "inside" if fit in ("good", "tight") else "outside"
-        )
-        reasons.append(
-            f"At {size_mb:.0f} MB it is {headroom} the {max_size_mb:.0f} MB "
-            f"budget LokiAI allows for {phone}"
-            + (f" ({ram_mb} MB RAM)" if ram_mb else "")
-            + "."
-        )
-    reasons.append(f"It is a .{fmt or 'model'} file, which {runtime}.")
-    if model.get("reputable"):
-        reasons.append(
-            f"Published by {model['id'].split('/')[0]}, a publisher LokiAI "
-            "recognises."
-        )
-    return " ".join(reasons)
+    This replaces a fixed three-clause template ("At N MB it is inside the M MB
+    budget LokiAI allows for <phone> (R MB RAM). It is a .gguf file, which runs
+    on the phone's llama.cpp runtime. Published by X, a publisher LokiAI
+    recognises.") that rendered verbatim under every single card with only the
+    numbers changed. It read as generated because it was: assembled from a
+    fixed pattern, and restating the size and format that the card header
+    already shows.
+
+    A note is only emitted when it adds something the header does not, so a
+    card with nothing distinguishing to say stays quiet instead of padding.
+    """
+    sized = [m for m in models if isinstance(m.get("size_mb"), (int, float))]
+    if not sized:
+        for m in models:
+            m["why_recommended"] = ""
+        return
+
+    smallest = min(sized, key=lambda m: m["size_mb"])
+    largest = max(sized, key=lambda m: m["size_mb"])
+    multiple = len(sized) > 1
+
+    for model in models:
+        size_mb = model.get("size_mb")
+        notes = []
+
+        if multiple and model is smallest:
+            notes.append("Smallest here - quickest to download and lightest to run.")
+        elif multiple and model is largest and model.get("estimated_device_fit") != "tight":
+            notes.append("Most capable of these that still fits.")
+
+        if model.get("estimated_device_fit") == "tight" and size_mb:
+            headroom = max_size_mb - size_mb
+            notes.append(
+                f"Only about {headroom:.0f} MB of headroom - close other apps "
+                "before running it."
+            )
+
+        model["why_recommended"] = " ".join(notes)
 
 
 # Bump whenever the wording, length, or markup handling of a description
@@ -3348,7 +3478,10 @@ def _compose_why_recommended(
 # any model that had already been described once, so the markup-dumping
 # descriptions kept being served from the database long after the code that
 # produced them was gone.
-DESCRIPTION_SCHEMA_VERSION = 2
+# v3: descriptions are capped at one sentence and packaging/marketing prose is
+# stripped, so every v2 row (which could still hold a full card paragraph) is
+# recomputed on next use.
+DESCRIPTION_SCHEMA_VERSION = 3
 
 
 async def _load_cached_descriptions(pool, model_ids: list) -> dict:
@@ -3480,13 +3613,22 @@ async def _describe_models(
         model["display_name"] = model.get("name") or model["id"].split("/")[-1]
         model["capability"] = model.get("task") or "unknown"
         model["description"] = description
-        model["why_recommended"] = _compose_why_recommended(
-            model, device, max_size_mb, fit
-        )
         model["estimated_device_fit"] = fit
         model["source"] = source
         model["source_url"] = source_url
         model["model_id"] = model["id"]
+        # Technical evidence belongs behind a Details disclosure, not repeated
+        # as prose under every card.
+        model["runtime"] = _FORMAT_RUNTIME.get(
+            (model.get("format") or "").lower(), "on-device runtime"
+        )
+        model["publisher"] = (
+            model["id"].split("/")[0] if "/" in model["id"] else "unknown"
+        )
+
+    # Notes that distinguish the candidates from EACH OTHER, computed once the
+    # whole set is known. Silent when there is nothing distinguishing to say.
+    _annotate_comparisons(models, max_size_mb)
 
     try:
         await _store_descriptions(pool, to_store)
@@ -3583,6 +3725,112 @@ def _strip_prompt_leakage(text: str) -> str:
     return cleaned
 
 
+# Messages that adjust the previous recommendation rather than starting a new
+# search. Deliberately narrow: a message naming a capability is a fresh
+# request even if it also contains "smaller".
+_REFINEMENT_RE = re.compile(
+    r"^\s*(?:no+|nah|nope)?[ ,.!-]*"
+    r"(?:i want |i need |give me |show me |make it |something |anything )?"
+    r"(?:a |an |the )?"
+    r"(?:much |bit |little |way )?"
+    r"(?:small|smaller|tiny|tinier|light|lighter|lightweight|compact|big|bigger|"
+    r"large|larger|heavier|better|faster|cheaper)"
+    r"(?:er)?"
+    r"(?:[ ,.!-]*(?:one|ones|model|models|option|options|please|than that|"
+    r"not big|not heavy|no heavy|nothing big))*[ ,.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_refinement(message: str) -> bool:
+    """True when the message only adjusts the previous recommendation."""
+    text = message.strip()
+    if len(text.split()) > 8:
+        return False
+    if _REFINEMENT_RE.match(text):
+        return True
+    # "small model not big" - a size word and no capability of its own, so it
+    # can only mean "the thing we were just discussing, but smaller".
+    # A message that names a capability ("a model for chat, small one") is a
+    # fresh request even though it also expresses a size.
+    lowered = text.lower()
+    has_size_word = extract_size_preference(lowered) != "any"
+    names_capability = any(
+        k in lowered
+        for _, keywords in _CAPABILITY_KEYWORDS for k in keywords
+    )
+    return has_size_word and not names_capability
+
+
+# "the second one", "number 2", "2." - a selection from the previous set.
+_ORDINALS = {
+    "first": 1, "1st": 1, "one": 1,
+    "second": 2, "2nd": 2, "two": 2,
+    "third": 3, "3rd": 3, "three": 3,
+    "fourth": 4, "4th": 4, "four": 4,
+    "fifth": 5, "5th": 5, "five": 5,
+    "last": -1,
+}
+_SELECTION_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:number\s+|option\s+|#)?"
+    r"(" + "|".join(_ORDINALS) + r"|\d+)"
+    r"\s*(?:one|option|model|please)?\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_candidate_selection(message: str) -> Optional[int]:
+    """1-based index of a candidate the user picked, or None.
+
+    Resolving a numbered choice from the stored candidate list is what makes
+    "second one" reliable; parsing it out of the assistant's prose would break
+    the moment the wording changed.
+    """
+    match = _SELECTION_RE.match(message.strip())
+    if not match:
+        return None
+    token = match.group(1).lower()
+    if token.isdigit():
+        value = int(token)
+        return value if 1 <= value <= 10 else None
+    return _ORDINALS.get(token)
+
+
+def select_from_previous(candidates: list, index: int) -> Optional[dict]:
+    """Resolve a 1-based (or -1 for last) selection against stored candidates."""
+    if not candidates:
+        return None
+    if index == -1:
+        return candidates[-1]
+    if 1 <= index <= len(candidates):
+        return candidates[index - 1]
+    return None
+
+
+def _previous_plan_from_history(history: list) -> list:
+    """Reconstruct the capability plan from the last user turn that had one.
+
+    Uses the deterministic keyword planner over prior user messages, so a
+    follow-up inherits the capability under discussion without another
+    provider round trip.
+    """
+    for turn in reversed(history or []):
+        if turn.get("role") != "user":
+            continue
+        content = str(turn.get("content") or "")
+        if _is_refinement(content):
+            continue
+        plan = classify_task_plan(content)
+        # classify_task_plan always returns something; only trust it when the
+        # message genuinely named a capability.
+        if any(
+            k in content.lower()
+            for _, keywords in _CAPABILITY_KEYWORDS for k in keywords
+        ):
+            return plan
+    return []
+
+
 def _drop_repeated_model_lines(prose: str) -> str:
     """Remove numbered items that name a model already named earlier.
 
@@ -3608,6 +3856,100 @@ def _drop_repeated_model_lines(prose: str) -> str:
             part = re.sub(r"^\s*\d+\.\s", f"{index}. ", part, count=1)
         kept.append(part)
     return "".join(kept).strip()
+
+
+def _recommendation_prompt(device: dict, candidates: list, requirements: list) -> str:
+    """Prompt for the single generation step, after the facts are decided.
+
+    The backend has already chosen and ordered the candidates. The model's only
+    job is to say, in its own words, what it is offering and why - it cannot
+    change the selection, so it cannot introduce a model, a size, or a
+    compatibility verdict.
+    """
+    phone = device.get("phone_model") or "the paired phone"
+    wants = ", ".join(
+        f"{r['capability']}"
+        + (f" ({r['size_preference']})" if r.get("size_preference", "any") != "any"
+           else "")
+        for r in requirements
+    ) or "a model"
+
+    facts = json.dumps([
+        {
+            "model_id": c["id"],
+            "size_mb": c.get("size_mb"),
+            "task": c.get("task"),
+            "device_fit": c.get("estimated_device_fit"),
+            "note": c.get("why_recommended") or None,
+        }
+        for c in candidates
+    ], indent=None)
+
+    return f"""You are Loki, talking to someone about their {phone}.
+
+They asked for: {wants}
+
+These are the models LokiAI has already verified and chosen for them, in the
+order they will appear on screen:
+{facts}
+
+Write 1 to 3 natural sentences introducing this set. Sound like a person who
+just looked something up, not like a product listing.
+
+Rules:
+- Do NOT list the models one by one. Each one already has its own card on
+  screen showing its name, size, task and fit.
+- Do NOT repeat sizes, budgets, RAM figures, file formats, or publisher names.
+  The cards show all of that.
+- Do NOT mention any model that is not in the list above.
+- Do NOT invent numbers.
+- If they asked for something small, say briefly how these answer that.
+- No bullet points, no numbering, no headings.
+- Do not end with instructions about pressing Deploy; the UI already says so.
+
+Reply with only this JSON: {{"response": "<your 1-3 sentences>"}}"""
+
+
+def _response_grounding_violation(text: str, candidates: list) -> Optional[str]:
+    """Return a reason when generated prose escapes the verified facts.
+
+    This is the hard stop on hallucination: a model id or a size that is not in
+    the candidate payload cannot reach the user, whatever the language model
+    produced.
+    """
+    if not text:
+        return "empty"
+
+    allowed_ids = {c["id"].lower() for c in candidates}
+    allowed_names = {c["id"].split("/")[-1].lower() for c in candidates}
+    allowed_orgs = {c["id"].split("/")[0].lower() for c in candidates if "/" in c["id"]}
+
+    # Any org/name token must be one of ours.
+    for match in re.findall(r"\b[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\b", text):
+        if match.lower() not in allowed_ids:
+            return f"named unknown repository {match!r}"
+
+    # Bare model names that look like known families but are not on offer.
+    for match in re.findall(r"\b(?:distil\w+|t5-\w+|bert\w*|gpt-\w+|mistral\w*|"
+                            r"phi-?\d\w*|gemma\w*)\b", text, re.IGNORECASE):
+        token = match.lower()
+        if token not in allowed_names and not any(
+                token in name for name in allowed_names):
+            return f"named unverified model {match!r}"
+
+    # Sizes must correspond to a real candidate size (within rounding).
+    real_sizes = [c.get("size_mb") for c in candidates
+                  if isinstance(c.get("size_mb"), (int, float))]
+    for raw in re.findall(r"(\d+(?:\.\d+)?)\s*(?:mb|gb)\b", text, re.IGNORECASE):
+        value = float(raw)
+        matches_mb = any(abs(value - s) <= max(1.0, s * 0.02) for s in real_sizes)
+        matches_gb = any(abs(value * 1024 - s) <= max(1.0, s * 0.05)
+                         for s in real_sizes)
+        if not (matches_mb or matches_gb):
+            return f"stated unverified size {raw!r}"
+
+    _ = allowed_orgs
+    return None
 
 
 def _selection_system_prompt(device: dict, max_size_mb: float, filtered_models: list) -> str:
@@ -3950,7 +4292,8 @@ async def assistant_chat(req: ChatRequest, request: Request, user_id: str = Depe
         await _set_run_status(pool, run["id"], "routing")
         try:
             payload = await asyncio.wait_for(
-                _assistant_turn(pool, req, user_id, correlation_id),
+                _assistant_turn(pool, req, user_id, correlation_id,
+                                run["conversation_id"]),
                 timeout=CHAT_TURN_DEADLINE_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -4038,8 +4381,31 @@ async def get_conversation_messages(conversation_id: str, request: Request,
     return [dict(r) for r in rows]
 
 
+async def _last_recommendation(pool, conversation_id) -> list:
+    """Candidates from the most recent completed recommendation in this thread.
+
+    Stored structured data, not parsed prose, so a numbered selection resolves
+    to exactly the model the user saw.
+    """
+    if conversation_id is None:
+        return []
+    async with pool.acquire() as conn:
+        row = await conn.fetchval(
+            """SELECT response FROM chat_runs
+                WHERE conversation_id = $1 AND status = 'completed'
+                  AND response IS NOT NULL
+                ORDER BY created_at DESC LIMIT 1""",
+            conversation_id,
+        )
+    if not row:
+        return []
+    payload = json.loads(row) if isinstance(row, str) else row
+    results = payload.get("search_results") or []
+    return [r for r in results if isinstance(r, dict) and r.get("id")]
+
+
 async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
-                          correlation_id: str) -> dict:
+                          correlation_id: str, conversation_id=None) -> dict:
     """Code filters, AI explains:
     1. Load the real paired device — 404 if not found, never guessed.
     2. One small NIM call classifies the message into every requested task,
@@ -4203,6 +4569,56 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
     # The deterministic keyword planner is the tie-breaker: if it sees a real
     # capability request, that outcome wins and the request goes to a real
     # HuggingFace search instead of to free-form prose.
+    # "second one" resolves against the stored candidate list from the previous
+    # recommendation, never by parsing the assistant's prose.
+    selection_index = parse_candidate_selection(req.message)
+    if selection_index is not None:
+        previous = await _last_recommendation(pool, conversation_id)
+        chosen = select_from_previous(previous, selection_index)
+        if chosen:
+            return {
+                "response": f"{chosen.get('display_name') or chosen['id']} it is - "
+                            "press Deploy on the card and the phone takes it from there.",
+                "action": "search_models",
+                "search_results": [chosen],
+                "grouped_results": [],
+                "task_failures": [],
+                "error_code": None,
+            }
+        if previous:
+            return {
+                "response": f"There were only {len(previous)} options in that "
+                            "list. Pick one of those, or ask me for different ones.",
+                "action": None, "search_results": previous,
+                "grouped_results": [], "task_failures": [], "error_code": None,
+            }
+
+    # A follow-up modifies the previous requirement rather than starting an
+    # unrelated search. "small model not big" after a chat recommendation must
+    # keep the chat capability and tighten the size, which is why it previously
+    # came back with the identical three options including a 1.9 GB one.
+    previous_plan = _previous_plan_from_history(history)
+    if previous_plan and _is_refinement(req.message):
+        preference = extract_size_preference(req.message)
+        refined = []
+        for task in (plan or previous_plan):
+            merged = dict(task)
+            if preference != "any":
+                merged["size_preference"] = preference
+            refined.append(merged)
+        # A bare refinement ("smaller", "not big") carries no capability of its
+        # own; inherit the one already under discussion.
+        if not plan:
+            refined = [
+                {**task, "size_preference": preference if preference != "any"
+                 else task.get("size_preference", "any")}
+                for task in previous_plan
+            ]
+        plan = refined
+        print(f"[assistant] refinement of previous plan -> "
+              f"{[(t['capability'], t.get('size_preference')) for t in plan]} "
+              f"corr={correlation_id}")
+
     if not plan and not explicit_model:
         keyword_plan = classify_task_plan(req.message)
         looks_like_request = any(
@@ -4259,13 +4675,25 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
     async with httpx.AsyncClient(timeout=60.0) as client:
         async def run_task(task: dict) -> dict:
             capability = task["capability"]
+            preference = task.get("size_preference", "any")
             search_tags = expand_vision_siblings([capability])
+            # Search the full device budget, then apply the user's stated size
+            # preference as a ceiling and as the ranking key. Searching only the
+            # reduced ceiling would starve the result set on a narrow request.
             found = await search_deployable_models(
                 client, search_tags, req.message, max_size_mb,
-                limit=max(6, task["quantity"] * 4),
+                limit=max(12, task["quantity"] * 6),
             )
-            return {"task": task, "models": _apply_task_constraints(
-                found, task["constraints"])}
+            found = _apply_task_constraints(found, task["constraints"])
+            ceiling = size_ceiling_for(preference, max_size_mb)
+            within = [m for m in found
+                      if (m.get("size_mb") or 0) <= ceiling] if preference in (
+                          "tiny", "small") else found
+            # If nothing meets the stricter ceiling, fall back to the full set
+            # rather than answering "nothing found" - but still rank by size so
+            # the smallest genuinely comes first.
+            return {"task": task,
+                    "models": rank_candidates(within or found, preference)}
 
         if plan:
             outcomes = await asyncio.gather(
@@ -4397,75 +4825,34 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
             pool, client, models_data, device, max_size_mb, verified=verified
         )
 
-    # ── Step 6: NIM ranks and explains, nothing more ─────────────────────
-    try:
-        sel = await openai_client.chat.completions.create(
-            model=NIM_SELECTOR_MODEL,
-            messages=[{"role": "system", "content": _selection_system_prompt(device, max_size_mb, models_data)},
-                      {"role": "user", "content": req.message}],
-            temperature=0.2,
-            max_tokens=700,
-            response_format={"type": "json_object"},
-        )
-        raw = sel.choices[0].message.content
-        if not (raw or "").strip():
-            raise AssistantError("NIM_EMPTY_RESPONSE", "empty completion")
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise AssistantError("NIM_SCHEMA_INVALID", "completion was not a JSON object")
-    except Exception as e:
-        # The selector only ranks and phrases — the candidate list is already
-        # decided. Its failure therefore degrades to the backend's own ranking
-        # rather than failing the request, but the reason is still surfaced as
-        # a typed code so the UI knows the wording is a fallback.
-        fallback_code = e.code if isinstance(e, AssistantError) else _classify_provider_error(e).code
-        print(f"[assistant] selector failed ({fallback_code}: {type(e).__name__}); "
-              f"returning backend-ranked results")
-        # The fallback carries the same described candidates and grouping as
-        # the primary path; only the prose is the backend's rather than the
-        # provider's.
-        fallback_message = ("Here are the best deployable matches I found. "
-                            "Press Deploy on one — the phone downloads it "
-                            "automatically, then open the LokiAI app.")
-        if task_failures:
-            fallback_message += " " + " ".join(f["message"] for f in task_failures)
-        return {"response": _drop_repeated_model_lines(fallback_message),
-                "action": "search_models",
-                "search_results": models_data[:6],
-                "grouped_results": grouped,
-                "task_failures": task_failures,
-                "error_code": fallback_code}
-
-    # ── Step 7: every returned model must exist in the real candidates ───
-    # The model's free-form output can never introduce a repository id, a size,
-    # a compatibility verdict, or a deploy target — it may only reorder and
-    # describe entries the backend already verified.
-    by_id = {m["id"]: m for m in models_data}
-    validated = []
+    # ── Step 6: the selection is the backend's; only the wording is generated ──
+    # The candidate set and its order are already decided from verified data.
+    # The model is no longer asked to return ids, so it has no mechanism to
+    # introduce one - the previous design handed it the whole candidate payload
+    # and asked for search_results back, which is what let it pad and repeat.
+    validated: list = []
     seen_result_ids: set = set()
-    for r in parsed.get("search_results") or []:
-        if not isinstance(r, dict):
-            continue
-        candidate_id = r.get("id")
-        # The selector routinely names the same model more than once when it
-        # has few candidates to rank; without this the dashboard rendered the
-        # identical card three times.
-        if candidate_id in by_id and candidate_id not in seen_result_ids:
-            seen_result_ids.add(candidate_id)
-            validated.append(by_id[candidate_id])
-    # A selector that drops entries must not silently discard a capability the
-    # user explicitly asked for; every grouped pick stays reachable.
     for entry in grouped:
         for model in entry["models"]:
             if model["id"] not in seen_result_ids:
                 seen_result_ids.add(model["id"])
                 validated.append(model)
+    for model in models_data:
+        if model["id"] not in seen_result_ids:
+            seen_result_ids.add(model["id"])
+            validated.append(model)
+    validated = validated[:MAX_RENDERED_CANDIDATES]
 
-    prose = _strip_prompt_leakage(str(parsed.get("response") or "").strip())
-    prose = _drop_repeated_model_lines(prose)
-    if not prose:
-        prose = ("Here are the best deployable matches I found. Press Deploy on one — "
-                 "the phone downloads it automatically, then open the LokiAI app.")
+    requirements = plan or [{
+        "capability": validated[0].get("task") or "text-generation",
+        "size_preference": "any",
+        "quantity": 1,
+    }]
+
+    prose, error_code = await _generate_recommendation_prose(
+        openai_client, req.message, device, validated, requirements,
+        history, correlation_id,
+    )
     if task_failures:
         prose += " " + " ".join(f["message"] for f in task_failures)
 
@@ -4474,7 +4861,78 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
             "search_results": validated,
             "grouped_results": grouped,
             "task_failures": task_failures,
-            "error_code": None}
+            "error_code": error_code}
+
+
+async def _generate_recommendation_prose(
+    openai_client, message: str, device: dict, candidates: list,
+    requirements: list, history: list, correlation_id: str,
+) -> tuple:
+    """One generation step, validated against the verified candidates.
+
+    Returns (prose, error_code). A response that names a model or a size the
+    backend did not verify is rejected and regenerated once; if the second
+    attempt is also ungrounded, or the provider fails, a minimal factual line
+    is used instead. An invalid response is never returned to the user.
+    """
+    prompt = _recommendation_prompt(device, candidates, requirements)
+
+    async def attempt(temperature: float) -> Optional[str]:
+        completion = await openai_client.chat.completions.create(
+            model=NIM_SELECTOR_MODEL,
+            messages=[{"role": "system", "content": prompt},
+                      *history[-4:],
+                      {"role": "user", "content": message}],
+            temperature=temperature,
+            max_tokens=220,
+            response_format={"type": "json_object"},
+        )
+        raw = completion.choices[0].message.content
+        if not (raw or "").strip():
+            return None
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return None
+        return _strip_prompt_leakage(str(parsed.get("response") or "").strip())
+
+    last_violation = None
+    for index, temperature in enumerate((0.7, 0.3)):
+        try:
+            text = await attempt(temperature)
+        except Exception as exc:
+            code = (exc.code if isinstance(exc, AssistantError)
+                    else _classify_provider_error(exc).code)
+            print(f"[assistant] prose generation failed ({code}: "
+                  f"{type(exc).__name__}) corr={correlation_id}")
+            return _deterministic_recommendation_line(candidates), code
+        if not text:
+            last_violation = "empty"
+            continue
+        text = _drop_repeated_model_lines(text)
+        violation = _response_grounding_violation(text, candidates)
+        if violation is None:
+            return text, None
+        last_violation = violation
+        print(f"[assistant] ungrounded response rejected (attempt {index + 1}): "
+              f"{violation} corr={correlation_id}")
+
+    print(f"[assistant] falling back to factual line after: {last_violation} "
+          f"corr={correlation_id}")
+    return _deterministic_recommendation_line(candidates), "RESPONSE_UNGROUNDED"
+
+
+def _deterministic_recommendation_line(candidates: list) -> str:
+    """Minimal factual sentence used only when generation cannot be trusted.
+
+    Deliberately states nothing the cards do not already show, so it cannot
+    become another piece of boilerplate that repeats their contents.
+    """
+    count = len(candidates)
+    if count == 0:
+        return "I couldn't find anything deployable that fits your phone."
+    if count == 1:
+        return "One model matches and fits your phone."
+    return f"{count} models match and fit your phone."
 
 
 # ------------------------------------------------------------------
