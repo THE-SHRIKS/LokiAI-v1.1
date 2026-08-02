@@ -74,7 +74,7 @@ const META: Record<PanelId, { label: string; icon: React.ComponentType<{ classNa
 function LockedPanel({ children }: { children: React.ReactNode }) {
   return (
     <div className="relative h-full overflow-hidden rounded border border-border">
-      <div className="pointer-events-none select-none blur-[3px] opacity-55">{children}</div>
+      <div className="locked-panel-content pointer-events-none select-none blur-[3px] opacity-55">{children}</div>
       <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/30 backdrop-blur-[1px]">
         <div className="flex items-center gap-2 rounded-sm border border-olive/40 bg-background/90 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.16em] text-olive-glow shadow-[0_0_22px_-8px_var(--olive-glow)]">
           <LockKeyhole className="h-3.5 w-3.5" />

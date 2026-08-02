@@ -2492,7 +2492,7 @@ def _classify_provider_error(exc: Exception) -> "AssistantError":
     if "timeout" in name.lower() or "timeout" in low or "timed out" in low:
         return AssistantError(
             "NIM_TIMEOUT",
-            "The AI provider took too long to respond. Try again — this is usually temporary.",
+            "I couldn't complete that response just now. Please try sending it again.",
             detail=text)
     if status is not None and 500 <= int(status) < 600:
         return AssistantError(

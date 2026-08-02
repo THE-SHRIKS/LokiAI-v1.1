@@ -138,6 +138,17 @@
   background: transparent;
 }
 
+/* Locked workspace panels are previews only. Hide nested scrollbars so none
+   show through the blurred access overlay. */
+.locked-panel-content,
+.locked-panel-content * {
+  scrollbar-width: none;
+}
+
+.locked-panel-content *::-webkit-scrollbar {
+  display: none;
+}
+
 @keyframes slide {
   0% { transform: translateX(-100%); opacity: 0; }
   20% { opacity: 1; }
