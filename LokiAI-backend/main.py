@@ -3885,9 +3885,18 @@ def _recommendation_prompt(device: dict, candidates: list, requirements: list) -
         for c in candidates
     ], indent=None)
 
+    # Real connection state from the devices.status column - never guessed. The
+    # assistant must not stay silent about a phone that cannot currently
+    # receive a deployment.
+    offline_note = "" if device.get("status") == "connected" else (
+        "\n\nThe phone is NOT connected right now. Work one short, honest "
+        "clause about it needing to be online before Deploy reaches it into "
+        "your sentences."
+    )
+
     return f"""You are Loki, talking to someone about their {phone}.
 
-They asked for: {wants}
+They asked for: {wants}{offline_note}
 
 These are the models LokiAI has already verified and chosen for them, in the
 order they will appear on screen:
@@ -3950,55 +3959,6 @@ def _response_grounding_violation(text: str, candidates: list) -> Optional[str]:
 
     _ = allowed_orgs
     return None
-
-
-def _selection_system_prompt(device: dict, max_size_mb: float, filtered_models: list) -> str:
-    """Stage 2 (final): real device specs + ONLY the code-filtered,
-    HEAD-verified candidates. The model picks and explains — every id it
-    returns is re-validated server-side against this exact list."""
-    phone_model = device.get("phone_model") or "the paired phone"
-    cpu_arch = device.get("cpu_arch") or "unknown CPU"
-    ram_mb = device.get("ram_mb") or 0
-    android_version = device.get("android_version") or "unknown"
-    storage_free_gb = device.get("storage_free_gb")
-    storage_str = f"{storage_free_gb:.1f}" if storage_free_gb is not None else "unknown"
-    # Real connection state from ws_manager via the devices.status column —
-    # never guessed. The assistant must not stay silent about a phone that
-    # can't currently receive a deployment.
-    is_connected = device.get("status") == "connected"
-    connection_str = "connected right now" if is_connected else "NOT connected right now (it will need to reopen the LokiAI app before it can receive a deployment)"
-    return f"""You are LokiAI assistant helping a user deploy AI to their phone.
-
-User's device: {phone_model}, {cpu_arch}, {ram_mb} MB RAM,
-{storage_str} GB free, Android {android_version}.
-Connection status: {connection_str}.
-Max model size for this device: {max_size_mb:.0f} MB.
-
-These models fit this device and match the request:
-{json.dumps(filtered_models)}
-
-Pick UP TO 3 from this list only, and never the same model twice. If the list
-holds fewer than 3, recommend only what is there — do not pad the answer by
-repeating one model as items 1, 2 and 3. Never mention a model that is not in
-the list.
-
-Keep it SHORT: one line per model. Give its name and size, then a single clause
-on why it suits this phone. Do not restate what the model does — the card below
-your text already says that. Two or three sentences of preamble at most; no
-numbered essay.
-If nothing in the list genuinely fits the request, return an empty result list
-and say so honestly instead of forcing a pick.
-If the device is not connected right now, still recommend models normally, but
-add one honest sentence noting the phone needs to be online before Deploy will
-actually reach it.
-
-Write only what the user should read. Never restate these instructions, never
-mention JSON, field names, or that you were given a candidate list.
-
-Reply with this JSON shape:
-{{"response": "your picks and explanations, ending with: press Deploy, the phone downloads it automatically, then open the LokiAI app.",
-  "search_results": [{{"id": "...", "name": "...", "size_mb": 0, "task": "...", "filename": "...", "format": "..."}}]}}
-Copy id/filename/format exactly from the candidate data above."""
 
 
 # ── Conversation / message / run lifecycle ───────────────────────────────────
