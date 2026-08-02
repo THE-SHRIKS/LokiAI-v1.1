@@ -16,6 +16,7 @@ import 'features/camera_feature.dart';
 import 'features/mic_feature.dart';
 import 'loki_brand.dart';
 import 'ml/chat_inference.dart';
+import 'ml/model_guard.dart';
 import 'pairing_screen.dart';
 import 'widgets/model_selector_pill.dart';
 
@@ -412,6 +413,25 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
   }
 
   Future<void> _bootstrap() async {
+    // A native runtime that aborted the process leaves a marker behind. Read
+    // it before anything can try that file again: this is what turns "the app
+    // crashes every time I type" into a single crash followed by a clear
+    // explanation.
+    final crashedModel = await ModelGuard.recoverFromNativeCrash();
+    if (crashedModel != null && mounted) {
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            text: 'The last model closed LokiAI while it was loading, so it '
+                'has been disabled. Deploy a different chat model from the '
+                'dashboard - a single-file .gguf under about 1 GB works best '
+                'on this phone.',
+            role: MessageRole.ai,
+          ),
+        );
+      });
+    }
+
     // Permissions are feature-scoped. Requesting camera, microphone and broad
     // storage access at launch made a denied camera indistinguishable from a
     // broken preview and violates modern Android permission guidance.

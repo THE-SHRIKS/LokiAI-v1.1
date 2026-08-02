@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:fllama/fllama.dart';
 
+import 'model_guard.dart';
+
 /// GGUF chat inference via fllama (llama.cpp FFI).
 ///
 /// Event schema (from the vendored fllama plugin's native side, see
@@ -27,15 +29,39 @@ class ChatInference {
   }
 
   Future<void> _doInitialize(String modelPath) async {
+    // llama.cpp aborts the process on a file it cannot use, so nothing below
+    // this point can be recovered by catching. Everything that CAN be decided
+    // in Dart is decided here, before native code ever sees the path.
+    if (await ModelGuard.isQuarantined(modelPath)) {
+      _initError = 'This model crashed the app the last time it was opened, '
+          'so LokiAI will not load it again. Deploy a different model from '
+          'the dashboard.';
+      // ignore: avoid_print
+      print('CHAT: refusing quarantined model: $modelPath');
+      return;
+    }
+
+    final rejection = await ModelGuard.validateGguf(modelPath);
+    if (rejection != null) {
+      _initError = rejection.message;
+      // ignore: avoid_print
+      print('CHAT: refusing model: $rejection');
+      return;
+    }
+
     try {
       // ignore: avoid_print
       print('CHAT: initializing GGUF model: $modelPath');
+      // If the process dies inside initContext, this marker survives and the
+      // next launch quarantines the file instead of crashing again.
+      await ModelGuard.beginLoad(modelPath);
       final result = await Fllama.instance()?.initContext(
         modelPath,
         // Conservative Android defaults reduce native startup memory pressure.
         nCtx: 256,
         nThreads: 2,
       );
+      await ModelGuard.endLoad();
       final rawId = result?['contextId'];
       if (rawId is num) {
         _contextId = rawId.toDouble();
@@ -49,6 +75,9 @@ class ChatInference {
         print('CHAT: init returned no contextId: $result');
       }
     } catch (e) {
+      // A Dart-level failure is recoverable, so the marker must not outlive it
+      // and quarantine a model that never actually crashed the process.
+      await ModelGuard.endLoad();
       _initError = 'Model failed to load: $e. '
           'Try a different model from the dashboard.';
       // ignore: avoid_print
