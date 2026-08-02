@@ -13,35 +13,63 @@
 // LokiAI-Desktop/stellar-dashboard-builder-main/api/send-email.ts sat unused
 // for that reason, and every request to /api/send-email fell through the
 // root vercel.json catch-all to the MARKETING service, which answered with
-// its own 404 HTML page. That page was what surfaced inside the signup form
-// as "Email relay returned 404: <!DOCTYPE html...".
+// its own 404 HTML page.
 //
-// This directory is registered as its own zero-config service in the root
-// vercel.json, with an `/api/(.*)` rewrite placed ahead of the catch-all so
-// requests actually reach it.
+// This directory is registered as its own service in the root vercel.json
+// (with an explicit entrypoint — Services doesn't reliably auto-scan a
+// nested service root's api/ folder the way a classic single project does),
+// with an `/api/(.*)` rewrite placed ahead of the catch-all so requests
+// actually reach it.
+//
+// req/res are handled with plain Node http methods only (res.end, not
+// res.status().json()) because the explicit-entrypoint build path hands the
+// function a raw http.ServerResponse, not the @vercel/node-augmented
+// VercelResponse that zero-config API routes get — calling the convenience
+// methods here threw "res.status is not a function" on every request,
+// including GET, which is what FUNCTION_INVOCATION_FAILED on the liveness
+// probe traced back to.
 import nodemailer from "nodemailer";
 import { randomUUID } from "node:crypto";
 
-// Vercel supplies req/res in the classic Node http-handler shape for functions
-// under /api; typed loosely here to avoid pulling in @vercel/node just for types.
+function sendJson(res: any, statusCode: number, payload: unknown): void {
+  const serialized = JSON.stringify(payload);
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(serialized);
+}
+
+async function readJsonBody(req: any): Promise<any> {
+  // Some runtimes pre-parse JSON onto req.body; others (a raw entrypoint
+  // build) hand back the untouched request stream. Handle both.
+  if (req.body !== undefined && req.body !== null && req.body !== "") {
+    return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  return raw ? JSON.parse(raw) : {};
+}
+
 export default async function handler(req: any, res: any) {
   // An unauthenticated GET is a liveness probe: it proves the function is
   // deployed and routed without sending anything or exposing configuration.
   // The backend's /admin/email/status uses this to tell "relay is missing"
   // apart from "relay is failing".
   if (req.method === "GET") {
-    res.status(200).json({ relay: "lokiai-email-relay", ok: true });
+    sendJson(res, 200, { relay: "lokiai-email-relay", ok: true });
     return;
   }
 
   if (req.method !== "POST") {
-    res.status(405).json({ error: "Method not allowed" });
+    sendJson(res, 405, { error: "Method not allowed" });
     return;
   }
 
   const relaySecret = process.env.EMAIL_RELAY_SECRET;
   if (!relaySecret) {
-    res.status(500).json({ error: "EMAIL_RELAY_SECRET is not set on the relay" });
+    sendJson(res, 500, { error: "EMAIL_RELAY_SECRET is not set on the relay" });
     return;
   }
   // The backend sends X-Relay-Secret; Authorization: Bearer is also accepted
@@ -52,28 +80,24 @@ export default async function handler(req: any, res: any) {
     : undefined;
   const suppliedSecret = req.headers["x-relay-secret"] ?? bearerSecret;
   if (suppliedSecret !== relaySecret) {
-    res.status(401).json({ error: "Unauthorized" });
+    sendJson(res, 401, { error: "Unauthorized" });
     return;
   }
 
-  // Vercel parses JSON bodies automatically, but a raw string can still arrive
-  // depending on content-type; accept both rather than failing on a 422.
-  let body = req.body ?? {};
-  if (typeof body === "string") {
-    try {
-      body = JSON.parse(body);
-    } catch {
-      res.status(400).json({ error: "Body is not valid JSON" });
-      return;
-    }
+  let body: any;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, { error: "Body is not valid JSON" });
+    return;
   }
 
   // replyTo carries the submitting account's address for feedback mail. From
   // stays the verified application sender; forging From is what gets a
   // domain's mail rejected or spam-filed.
-  const { to, subject, text, html, replyTo } = body;
+  const { to, subject, text, html, replyTo } = body ?? {};
   if (!to || !subject || !text) {
-    res.status(422).json({ error: "to, subject, and text are required" });
+    sendJson(res, 422, { error: "to, subject, and text are required" });
     return;
   }
 
@@ -87,9 +111,8 @@ export default async function handler(req: any, res: any) {
   const fromName = process.env.SMTP_FROM_NAME || "LokiAI";
 
   if (!host || !user || !pass) {
-    res.status(500).json({
-      error:
-        "SMTP is not configured on this relay (SMTP_HOST/SMTP_USER/SMTP_PASSWORD)",
+    sendJson(res, 500, {
+      error: "SMTP is not configured on this relay (SMTP_HOST/SMTP_USER/SMTP_PASSWORD)",
       correlationId,
     });
     return;
@@ -113,7 +136,7 @@ export default async function handler(req: any, res: any) {
     // messageId and the SMTP server's own response line are returned so the
     // caller can record what the transport actually said, rather than
     // inferring delivery from a bare 200.
-    res.status(200).json({
+    sendJson(res, 200, {
       sent: true,
       correlationId,
       messageId: info?.messageId ?? null,
@@ -124,7 +147,7 @@ export default async function handler(req: any, res: any) {
   } catch (err: any) {
     // The provider's error can name a host but must never echo credentials;
     // nodemailer's own error messages don't include the password.
-    res.status(502).json({
+    sendJson(res, 502, {
       error: `Email relay send failed: ${err?.message ?? String(err)}`,
       correlationId,
     });
