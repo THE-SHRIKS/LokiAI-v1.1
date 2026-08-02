@@ -11,7 +11,8 @@
     },
     "relay": {
       "root": "LokiAI-relay",
-      "entrypoint": "api/send-email.ts"
+      "entrypoint": "api/send-email.ts",
+      "installCommand": "npm install"
     }
   },
   "redirects": [
