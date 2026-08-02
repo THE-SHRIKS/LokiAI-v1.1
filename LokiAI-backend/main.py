@@ -1056,6 +1056,7 @@ def _validate_password_strength(password: str) -> None:
 
 import smtplib
 import hashlib
+import hmac
 import secrets as _secrets
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -1076,13 +1077,13 @@ FEEDBACK_TO_EMAIL = os.getenv("FEEDBACK_TO_EMAIL", SMTP_FROM_EMAIL)
 # route email through the Vercel-hosted relay function instead of
 # connecting to SMTP_HOST directly — Vercel's serverless functions have no
 # such block. See LokiAI-Desktop/stellar-dashboard-builder-main/api/send-email.ts.
-EMAIL_RELAY_URL = os.getenv("EMAIL_RELAY_URL")
+DEFAULT_EMAIL_RELAY_URL = "https://lokiai.theshriks.space/api/send-email"
+EMAIL_RELAY_URL = os.getenv("EMAIL_RELAY_URL") or DEFAULT_EMAIL_RELAY_URL
 EMAIL_RELAY_SECRET = os.getenv("EMAIL_RELAY_SECRET")
 # The relay is a separate Vercel service.  Keep a known-good production
 # endpoint as a recovery path: an old Render environment variable used to
 # point at the marketing site, which returns HTML/404 and prevented every
 # OTP, password-reset and feedback email from leaving Render.
-DEFAULT_EMAIL_RELAY_URL = "https://lokiai.theshriks.space/api/send-email"
 
 OTP_TTL_MINUTES = 10
 OTP_MAX_ATTEMPTS = 5
@@ -1144,11 +1145,21 @@ async def _send_email_via_relay(to_email: str, subject: str, text_body: str,
                "html": html_body}
     if reply_to:
         payload["replyTo"] = reply_to
+    # Render blocks SMTP egress.  The relay normally uses EMAIL_RELAY_SECRET,
+    # but older production environments only have the SMTP credentials.  A
+    # HMAC proves the caller has that same existing credential without sending
+    # the password itself across the network.
+    signature_payload = "\n".join((to_email, subject, text_body, html_body, reply_to or ""))
+    headers = {"X-Relay-Secret": EMAIL_RELAY_SECRET or ""}
+    if SMTP_PASSWORD:
+        headers["X-Relay-Signature"] = hmac.new(
+            SMTP_PASSWORD.encode(), signature_payload.encode(), hashlib.sha256
+        ).hexdigest()
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         resp = await client.post(
             relay_url or EMAIL_RELAY_URL,
             json=payload,
-            headers={"X-Relay-Secret": EMAIL_RELAY_SECRET},
+            headers=headers,
         )
     if resp.status_code == 200:
         return f"relay:{resp.status_code} {resp.text[:200]}"
@@ -1173,7 +1184,7 @@ async def _send_email_via_relay(to_email: str, subject: str, text_body: str,
 
 def email_delivery_path() -> str:
     """Which transport send_email will actually use. No secrets."""
-    if EMAIL_RELAY_URL and EMAIL_RELAY_SECRET:
+    if EMAIL_RELAY_URL and (EMAIL_RELAY_SECRET or SMTP_PASSWORD):
         return "relay"
     if EMAIL_RELAY_SECRET:
         return "relay (canonical fallback)"
@@ -1190,17 +1201,17 @@ async def send_email(to_email: str, subject: str, text_body: str, html_body: str
     it is configured; direct SMTP remains the local-dev path.
     """
     smtp_configured = bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
-    if EMAIL_RELAY_URL and EMAIL_RELAY_SECRET:
+    if EMAIL_RELAY_URL and (EMAIL_RELAY_SECRET or SMTP_PASSWORD):
         try:
             return await _send_email_via_relay(
                 to_email, subject, text_body, html_body, reply_to
             )
-        except EmailRelayMisconfigured as exc:
+        except Exception as exc:
             # A misconfigured relay must not take account creation down with
             # it. Direct SMTP is blocked on some hosts, but trying it is
             # strictly better than failing outright, and the misconfiguration
             # is logged loudly either way.
-            print(f"[email] RELAY MISCONFIGURED: {exc}")
+            print(f"[email] relay failed: {type(exc).__name__}: {exc}")
             # The app's relay is independently reachable at this stable URL.
             # Try it before SMTP: Render blocks SMTP egress, so falling
             # straight back to SMTP would make every mail-based flow fail.
@@ -1220,11 +1231,6 @@ async def send_email(to_email: str, subject: str, text_body: str, html_body: str
                 _send_email_sync, to_email, subject, text_body, html_body,
                 reply_to,
             )
-    if EMAIL_RELAY_SECRET and not EMAIL_RELAY_URL:
-        return await _send_email_via_relay(
-            to_email, subject, text_body, html_body, reply_to,
-            relay_url=DEFAULT_EMAIL_RELAY_URL,
-        )
     # Local dev fallback: direct SMTP (smtplib is synchronous — run off the event loop).
     return await asyncio.to_thread(
         _send_email_sync, to_email, subject, text_body, html_body, reply_to

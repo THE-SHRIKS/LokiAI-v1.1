@@ -29,7 +29,7 @@
 // including GET, which is what FUNCTION_INVOCATION_FAILED on the liveness
 // probe traced back to.
 import nodemailer from "nodemailer";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 function sendJson(res: any, statusCode: number, payload: unknown): void {
   const serialized = JSON.stringify(payload);
@@ -68,8 +68,9 @@ export default async function handler(req: any, res: any) {
   }
 
   const relaySecret = process.env.EMAIL_RELAY_SECRET;
-  if (!relaySecret) {
-    sendJson(res, 500, { error: "EMAIL_RELAY_SECRET is not set on the relay" });
+  const smtpPassword = process.env.SMTP_PASSWORD;
+  if (!relaySecret && !smtpPassword) {
+    sendJson(res, 500, { error: "Relay authentication is not configured" });
     return;
   }
   // The backend sends X-Relay-Secret; Authorization: Bearer is also accepted
@@ -79,10 +80,6 @@ export default async function handler(req: any, res: any) {
     ? authHeader.slice("Bearer ".length)
     : undefined;
   const suppliedSecret = req.headers["x-relay-secret"] ?? bearerSecret;
-  if (suppliedSecret !== relaySecret) {
-    sendJson(res, 401, { error: "Unauthorized" });
-    return;
-  }
 
   let body: any;
   try {
@@ -101,12 +98,25 @@ export default async function handler(req: any, res: any) {
     return;
   }
 
+  const suppliedSignature = req.headers["x-relay-signature"];
+  const signaturePayload = [to, subject, text, html ?? "", replyTo ?? ""].join("\n");
+  const expectedSignature = smtpPassword
+    ? createHmac("sha256", smtpPassword).update(signaturePayload).digest("hex")
+    : "";
+  const signatureMatches = typeof suppliedSignature === "string"
+    && expectedSignature.length === suppliedSignature.length
+    && timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(suppliedSignature));
+  if (suppliedSecret !== relaySecret && !signatureMatches) {
+    sendJson(res, 401, { error: "Unauthorized" });
+    return;
+  }
+
   const correlationId = randomUUID();
 
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
   const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASSWORD;
+  const pass = smtpPassword;
   const fromEmail = process.env.SMTP_FROM_EMAIL || user;
   const fromName = process.env.SMTP_FROM_NAME || "LokiAI";
 
