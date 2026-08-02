@@ -299,7 +299,8 @@ SHA-256 `2FA4ED7856252AA057D52362C5C35EC473447320DBFD8B469977219502F0E41B`.
 | Database migrations | ran during Render startup. `_run_migrations` is awaited un-guarded in `lifespan`, so a healthy service is proof they succeeded. All statements are additive (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`) — no existing column or row is altered. |
 | New routes verified live | `/assistant/runs/{id}`, `/assistant/conversations/{id}/messages`, `/admin/email/status`, `/admin/email/test` all return **401** unauthenticated, against **404** for a control path — the routes exist |
 | Vercel | **not verified.** `https://www.theshriks.space/` returns 200, but `/workspace/` answers 308 with no `Location` and `/api/send-email` returns 404 on that host. This routing behaviour predates this task (no routing file was touched) and I have no Vercel credentials in this environment to read the deployment status or the project's domain mapping. |
-| Public APK endpoint | `LokiAI-backend/apk/lokiai.apk` updated in the repository at the commit below; the serving check is listed under remaining risks because the Render service serves the file from its own checkout after the next deploy |
+| Public APK endpoint | **verified.** After the deploy of `7da5adf`, `GET /apk/info` returns `{"available":true,"size_mb":145.2,"filename":"lokiai.apk"}` and `GET /apk/download` was downloaded in full: 152,261,406 bytes, SHA-256 `0E5073AD4CFB8DAE2B618C173FD3D008B3361045DA86A2DA94116810A93DDB9B` — byte-identical to the built artefact |
+| Final deployed commit | `7da5adf` — `/health` returns `{"status":"ok","commit":"7da5adf...","branch":"main","service":"lokiai"}` |
 
 ---
 
@@ -563,11 +564,7 @@ back to its previous behaviour without erroring.
    `Location` header on `www.theshriks.space`. This predates this task and no
    routing file was touched, but it means neither the dashboard changes nor the
    relay change have been confirmed live.
-4. **Public APK endpoint.** `LokiAI-backend/apk/lokiai.apk` is updated in the
-   repository at `46dac8f`, but Render was already deployed from that commit
-   when the binary was committed afterwards; `GET /apk/download` will serve the
-   new checksum only after the next Render deploy completes.
-5. **Live provider behaviour untested.** Timeout, rate-limit and end-to-end
+4. **Live provider behaviour untested.** Timeout, rate-limit and end-to-end
    multi-intent behaviour depend on a real NVIDIA NIM key attached to a real
    account. The deterministic halves are covered; the provider-facing halves
    are not.
