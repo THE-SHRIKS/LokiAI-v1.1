@@ -6,4 +6,4 @@
 /// app_version_test.dart` asserts these stay in sync with pubspec.yaml, so the
 /// two cannot drift silently across a release.
 const String kAppVersionName = '1.0.8';
-const String kAppVersionCode = '9';
+const String kAppVersionCode = '10';
