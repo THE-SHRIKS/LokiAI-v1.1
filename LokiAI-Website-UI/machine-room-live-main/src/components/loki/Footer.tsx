@@ -25,6 +25,7 @@ const COLUMNS = [
     links: [
       { label: "About", to: "/company" as const },
       { label: "Contact", to: "/contact" as const },
+      { label: "Legal", to: "/legal" as const },
       { label: "Privacy", to: "/legal/privacy" as const },
       { label: "Terms", to: "/legal/terms" as const },
     ],
@@ -44,7 +45,7 @@ export function Footer() {
               An AI-native deployment and operations layer for Edge AI and IoT environments. Built by THE
               SHRIKS.
             </p>
-            <p className="mt-6 font-mono text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
+            <p className="hidden">
               Android agent available · more device classes in development
             </p>
           </div>
@@ -72,7 +73,7 @@ export function Footer() {
           <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
             © {new Date().getFullYear()} THE SHRIKS · LokiAI
           </p>
-          <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
+          <p className="hidden">
             Local inference · Verified artifacts · Device-scoped credentials
           </p>
         </div>
