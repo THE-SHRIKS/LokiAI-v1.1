@@ -10,6 +10,63 @@ Status keys used below are kept separate on purpose:
 
 ---
 
+## A0. The crash on typing — found after the first release (round 2)
+
+Reported symptom: "the model is deployed but when I just type anything it just
+crashes."
+
+**Root cause.** The deployed file was
+`GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf` — **one 9 MB shard of a nine-part
+model**, not a model. llama.cpp does not raise on a lone shard; it **aborts the
+process**. No Dart `try`/`catch`, and none of the three error boundaries added
+in round 1, can intercept a native abort — which is why the crash survived the
+first round of fixes.
+
+**How it got there.** Nothing anywhere excluded split shards.
+`search_deployable_models` took `matches[0]` (or the first `q4` match), and the
+CDN `HEAD` returned the size of *shard 1* — 8.99 MB. That passed the device
+budget and was presented to the user as a "comfortable fit" for a model that is
+actually tens of gigabytes. The size shown was real; it was just the size of
+the wrong thing.
+
+**Fix, in three layers:**
+
+1. **Backend selection** — `is_split_shard()` matches llama.cpp's
+   `-NNNNN-of-NNNNN.gguf` convention and is applied at every point a file can
+   be chosen: search selection, the post-`HEAD` size gate,
+   `_find_deployable_file`, `_resolve_explicit_repo`, and `resolve_model_file`
+   (the last gate before a file reaches a phone, reachable directly through
+   `POST /deployments` with any repo id). A repo whose only `.gguf` files are
+   shards is not deployable and says so.
+2. **Backend size floor** — `MIN_CHAT_MODEL_MB` (20). A `.gguf` under it is a
+   fragment, adapter, or vocab-only file however it is named.
+3. **Mobile, because prevention can never be complete** — `ModelGuard`
+   validates before native code sees the path (shard naming, a `split.count`
+   key in the header for a renamed shard, GGUF magic bytes, minimum size), and
+   wraps the native call in a marker persisted to `SharedPreferences`. If the
+   process dies inside `initContext` the marker survives, and the next launch
+   **quarantines that exact file** instead of loading it again. A bad model can
+   therefore kill the app at most once and can never make it impossible to
+   reopen.
+
+**Also fixed in this round, both user-reported:**
+
+- Descriptions rendered raw model-card markup (`<div> <p style=...`,
+  `[Run GLM-5.2 Guide!](...)`) and every card opened with the same two
+  boilerplate sentences. `_strip_markup` removes HTML, images and link URLs;
+  the limit drops 400 → 220 characters and cuts on a sentence boundary; a model
+  with real publisher prose gets a short clause ("Offline chat.") instead of
+  the full template.
+- The same model was listed three times — the selector names one model
+  repeatedly when it has few candidates to rank. Validation now dedupes by id.
+
+**Released as 1.0.7+8**, SHA-256
+`2920A60320DA2C9DEA86496A3826DDF39D72B611E760A21E09876B3AD113835D`,
+152,359,710 bytes. Backend `60ae60f` deployed and verified; the public APK
+endpoint was downloaded and hashed byte-for-byte.
+
+---
+
 ## A. Root causes
 
 ### A1. Startup — platform channel used before the binding existed
