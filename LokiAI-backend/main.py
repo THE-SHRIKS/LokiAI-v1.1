@@ -488,8 +488,9 @@ async def get_current_user(request: Request, credentials: HTTPAuthorizationCrede
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         blacklisted = await conn.fetchval("SELECT 1 FROM token_blacklist WHERE jti = $1", jti)
-    if blacklisted:
-        raise HTTPException(status_code=401, detail="Token has been revoked")
+        account_exists = await conn.fetchval("SELECT 1 FROM users WHERE id = $1::uuid", user_id)
+    if blacklisted or not account_exists:
+        raise HTTPException(status_code=401, detail="Token is no longer valid")
     return user_id
 
 
@@ -1084,8 +1085,9 @@ async def refresh_access_token(request: Request, response: Response):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         blacklisted = await conn.fetchval("SELECT 1 FROM token_blacklist WHERE jti = $1", jti)
-        if blacklisted:
-            raise HTTPException(status_code=401, detail="Refresh token has been revoked")
+        account_exists = await conn.fetchval("SELECT 1 FROM users WHERE id = $1::uuid", user_id)
+        if blacklisted or not account_exists:
+            raise HTTPException(status_code=401, detail="Refresh token is no longer valid")
         exp = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
         await _blacklist_jti(conn, jti, exp)
 
