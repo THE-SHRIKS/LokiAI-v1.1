@@ -536,6 +536,98 @@ def test_description_readability():
     )
 
 
+def test_no_repeated_model_lines():
+    print("\n== the selector cannot pad by repeating one model ==")
+
+    # The exact shape produced in production with a single candidate.
+    padded = (
+        "I recommend the following models for a small chat model:\n"
+        "1. hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF - 1259.88 MB - "
+        "This model generates text for on-device chat.\n"
+        "2. hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF - 1259.88 MB - "
+        "This model generates text for on-device chat.\n"
+        "3. hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF - 1259.88 MB - "
+        "This model generates text for on-device chat.\n"
+    )
+    cleaned = main._drop_repeated_model_lines(padded)
+    check(
+        cleaned.count("hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF") == 1,
+        "a model repeated as items 1-3 is listed once",
+        cleaned,
+    )
+    check("2." not in cleaned, "the duplicate numbering is gone", cleaned)
+
+    genuine = (
+        "Here are three options:\n"
+        "1. org/alpha - 400 MB - fits comfortably.\n"
+        "2. org/beta - 800 MB - more capable.\n"
+        "3. org/gamma - 1200 MB - best quality.\n"
+    )
+    kept = main._drop_repeated_model_lines(genuine)
+    for repo in ("org/alpha", "org/beta", "org/gamma"):
+        check(repo in kept, f"three genuinely distinct models keep {repo}")
+
+    check(
+        main._drop_repeated_model_lines("Just prose, no list.")
+        == "Just prose, no list.",
+        "plain prose is untouched",
+    )
+    check(main._drop_repeated_model_lines("") == "", "empty prose is safe")
+
+
+def test_options_and_cache_versioning():
+    print("\n== alternatives and cache invalidation ==")
+
+    check(
+        main.MIN_OPTIONS_PER_CAPABILITY >= 3,
+        "at least three alternatives are surfaced per capability",
+        str(main.MIN_OPTIONS_PER_CAPABILITY),
+    )
+    # "a small chat model" is quantity 1, but the user still needs a choice.
+    plan = main.classify_task_plan("i want a small chat model")
+    quantity = plan[0]["quantity"]
+    check(quantity == 1, "the parsed deploy count is still 1", str(quantity))
+    check(
+        max(quantity, main.MIN_OPTIONS_PER_CAPABILITY) >= 3,
+        "but at least 3 options are shown for it",
+    )
+    check(
+        main.DESCRIPTION_SCHEMA_VERSION >= 2,
+        "the description cache is versioned so old rows are rewritten",
+        str(main.DESCRIPTION_SCHEMA_VERSION),
+    )
+
+
+def test_conversational_path_cannot_invent_models():
+    print("\n== the free-form path must not name models ==")
+
+    prompt = main._assistant_system_prompt()
+    check(
+        "NEVER NAME A SPECIFIC MODEL" in prompt,
+        "the conversational prompt forbids naming a model outright",
+    )
+    check(
+        "NEVER STATE A SIZE" in prompt,
+        "the conversational prompt forbids stating sizes",
+    )
+
+    # "small chat models" previously fell through to free-form prose, which
+    # answered with invented DistilBERT / T5-Small entries.
+    for message in ("small chat models", "small model for chat",
+                    "i need a chat model", "show me camera models"):
+        plan = main.classify_task_plan(message)
+        check(
+            bool(plan) and plan[0]["capability"] in main.VALID_TASKS,
+            f"the keyword planner rescues {message!r} into a real search",
+            f"plan={plan}",
+        )
+    check(
+        "text-generation" in
+        [t["capability"] for t in main.classify_task_plan("small chat models")],
+        "'small chat models' maps to text-generation, not small talk",
+    )
+
+
 def test_card_paragraph_extraction():
     print("\n== model-card prose extraction ==")
 
@@ -630,6 +722,9 @@ if __name__ == "__main__":
     test_description_from_model_card()
     test_split_shard_exclusion()
     test_description_readability()
+    test_no_repeated_model_lines()
+    test_options_and_cache_versioning()
+    test_conversational_path_cannot_invent_models()
     test_card_paragraph_extraction()
     test_run_lifecycle_helpers()
     test_greeting_path_is_bounded()

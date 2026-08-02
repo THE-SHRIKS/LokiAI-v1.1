@@ -170,6 +170,14 @@ async def _run_migrations(pool: asyncpg.Pool):
                 updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # Rows written before the formatter was versioned default to 1 and are
+        # therefore ignored and rewritten on the next request. Without this a
+        # cached description outlived every improvement to the code that
+        # produced it.
+        await conn.execute(
+            "ALTER TABLE model_descriptions "
+            "ADD COLUMN IF NOT EXISTS schema_version INTEGER NOT NULL DEFAULT 1"
+        )
 
         # Conversation / message / run lifecycle.
         #
@@ -2109,6 +2117,10 @@ _SPLIT_SHARD_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
 # something llama.cpp can hold a conversation with.
 MIN_CHAT_MODEL_MB = float(os.getenv("MIN_CHAT_MODEL_MB", "20"))
 
+# How many real alternatives to surface per requested capability. A single
+# result is not a recommendation, it is a take-it-or-leave-it.
+MIN_OPTIONS_PER_CAPABILITY = int(os.getenv("MIN_OPTIONS_PER_CAPABILITY", "3"))
+
 
 def is_split_shard(filename: str) -> bool:
     return bool(_SPLIT_SHARD_RE.search(filename or ""))
@@ -2857,10 +2869,11 @@ def _assistant_system_prompt() -> str:
 A user pairs their Android phone by scanning a QR code — no cables, no ADB, no developer options. They tell you in plain English what they want their phone to do. You find real AI models that fit their phone. When they press Deploy, the phone downloads the model straight from the CDN and runs it 100% on-device, fully offline, forever. Camera models label live video; chat models converse; audio models classify sound.
 
 # Behavior policy (The Shriks standard — non-negotiable)
-1. REAL DATA ONLY. Never invent a model, size, capability, or benchmark.
-2. NO GUESSING. If nothing genuinely fits, say so and suggest rephrasing.
-3. Cloud-only models (ChatGPT, Claude, big server models) cannot run on a phone. If asked, say so in one sentence.
-4. The phone runs TFLite (camera/audio) and GGUF (chat) only.
+1. NEVER NAME A SPECIFIC MODEL. You are answering without having searched anything, so you have no real candidates and no real sizes. Naming one means inventing it. If the user wants a model, say you'll find one and ask what they want it to do — the system then runs a real search and shows real cards.
+2. NEVER STATE A SIZE, A FILE NAME, A REPOSITORY ID, OR A BENCHMARK. Every number the user sees must come from a real search, not from you.
+3. NO GUESSING. If you are unsure what they want, ask one short question.
+4. Cloud-only models (ChatGPT, Claude, big server models) cannot run on a phone. If asked, say so in one sentence.
+5. The phone runs TFLite (camera/audio) and GGUF (chat) only.
 
 # Output style
 Talk like a smart, friendly person — warm but not cheesy. Keep it conversational, the way you'd text a friend who asked for help. Use natural language, contractions, casual phrasing. Vary your sentence length. Match the user's energy — if they're excited, be excited back; if they're chill, keep it easy. Never say "Great question", "Certainly", "I'd be happy to", or other robotic filler."""
@@ -3328,14 +3341,25 @@ def _compose_why_recommended(
     return " ".join(reasons)
 
 
+# Bump whenever the wording, length, or markup handling of a description
+# changes. Cached rows written by an older formatter are ignored and rewritten.
+#
+# Without this the cache was permanent: improving the formatter had no effect on
+# any model that had already been described once, so the markup-dumping
+# descriptions kept being served from the database long after the code that
+# produced them was gone.
+DESCRIPTION_SCHEMA_VERSION = 2
+
+
 async def _load_cached_descriptions(pool, model_ids: list) -> dict:
     if not model_ids:
         return {}
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT model_id, description, source, source_url "
-            "FROM model_descriptions WHERE model_id = ANY($1::text[])",
-            model_ids,
+            "FROM model_descriptions "
+            "WHERE model_id = ANY($1::text[]) AND schema_version = $2",
+            model_ids, DESCRIPTION_SCHEMA_VERSION,
         )
     return {r["model_id"]: dict(r) for r in rows}
 
@@ -3346,14 +3370,16 @@ async def _store_descriptions(pool, entries: list) -> None:
     async with pool.acquire() as conn:
         await conn.executemany(
             """INSERT INTO model_descriptions
-                   (model_id, description, source, source_url, updated_at)
-               VALUES ($1, $2, $3, $4, NOW())
+                   (model_id, description, source, source_url, schema_version,
+                    updated_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())
                ON CONFLICT (model_id) DO UPDATE
                    SET description = EXCLUDED.description,
                        source = EXCLUDED.source,
                        source_url = EXCLUDED.source_url,
+                       schema_version = EXCLUDED.schema_version,
                        updated_at = NOW()""",
-            entries,
+            [(*e, DESCRIPTION_SCHEMA_VERSION) for e in entries],
         )
 
 
@@ -3557,6 +3583,33 @@ def _strip_prompt_leakage(text: str) -> str:
     return cleaned
 
 
+def _drop_repeated_model_lines(prose: str) -> str:
+    """Remove numbered items that name a model already named earlier.
+
+    Instructing the selector not to repeat itself is necessary but not
+    sufficient: with a single candidate it still padded to three by listing
+    that model as items 1, 2 and 3. This enforces the rule on the output.
+    """
+    if not prose:
+        return prose
+    # Split on "1. ", "2. " ... keeping the delimiter with its item.
+    parts = re.split(r"(?m)(?=^\s*\d+\.\s)", prose)
+    if len(parts) < 3:
+        return prose
+    seen_repos: set = set()
+    kept, index = [], 0
+    for part in parts:
+        repos = set(re.findall(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", part))
+        if repos and repos <= seen_repos:
+            continue  # every model named here was already listed above
+        seen_repos |= repos
+        if re.match(r"^\s*\d+\.\s", part):
+            index += 1
+            part = re.sub(r"^\s*\d+\.\s", f"{index}. ", part, count=1)
+        kept.append(part)
+    return "".join(kept).strip()
+
+
 def _selection_system_prompt(device: dict, max_size_mb: float, filtered_models: list) -> str:
     """Stage 2 (final): real device specs + ONLY the code-filtered,
     HEAD-verified candidates. The model picks and explains — every id it
@@ -3582,9 +3635,15 @@ Max model size for this device: {max_size_mb:.0f} MB.
 These models fit this device and match the request:
 {json.dumps(filtered_models)}
 
-Pick the best 3 from this list only. Never mention a model that is not in it.
-For each: name, size, one sentence on what it does, one sentence on why it
-suits this specific phone (mention the phone by name). Plain English.
+Pick UP TO 3 from this list only, and never the same model twice. If the list
+holds fewer than 3, recommend only what is there — do not pad the answer by
+repeating one model as items 1, 2 and 3. Never mention a model that is not in
+the list.
+
+Keep it SHORT: one line per model. Give its name and size, then a single clause
+on why it suits this phone. Do not restate what the model does — the card below
+your text already says that. Two or three sentences of preamble at most; no
+numbered essay.
 If nothing in the list genuinely fits the request, return an empty result list
 and say so honestly instead of forcing a pick.
 If the device is not connected right now, still recommend models normally, but
@@ -4135,6 +4194,28 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
             except Exception as e2:
                 raise _classify_provider_error(e2)
 
+    # The intent model returning an empty plan is not proof the user was making
+    # small talk. "small chat models" came back empty, fell through to the
+    # free-form conversational branch, and the language model answered by
+    # inventing DistilBERT, T5-Small and their sizes - models LokiAI had never
+    # searched for and cannot deploy.
+    #
+    # The deterministic keyword planner is the tie-breaker: if it sees a real
+    # capability request, that outcome wins and the request goes to a real
+    # HuggingFace search instead of to free-form prose.
+    if not plan and not explicit_model:
+        keyword_plan = classify_task_plan(req.message)
+        looks_like_request = any(
+            k in req.message.lower()
+            for k in ("model", "chat", "camera", "vision", "detect", "sound",
+                      "audio", "voice", "speech", "image", "photo", "deploy")
+        )
+        if keyword_plan and looks_like_request:
+            print(f"[assistant] intent model returned no tasks; using keyword "
+                  f"plan {[t['capability'] for t in keyword_plan]} "
+                  f"corr={correlation_id}")
+            plan = keyword_plan
+
     planned_tasks = [t["capability"] for t in plan]
 
     # If they gave a specific model link, we proceed even if task is None.
@@ -4207,8 +4288,14 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
                                    f"of that request: {detail}",
                     })
                     continue
+                # quantity is what the user asked to *deploy*, not how many to
+                # show. Honouring it literally meant "a small chat model"
+                # rendered exactly one card with nothing to compare it
+                # against - and left the selector padding its prose by naming
+                # that single model three times.
+                show = max(task["quantity"], MIN_OPTIONS_PER_CAPABILITY)
                 picked = [m for m in outcome["models"]
-                          if m["id"] not in seen][:task["quantity"]]
+                          if m["id"] not in seen][:show]
                 for m in picked:
                     seen.add(m["id"])
                     m["requested_capability"] = capability
@@ -4342,7 +4429,7 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
                             "automatically, then open the LokiAI app.")
         if task_failures:
             fallback_message += " " + " ".join(f["message"] for f in task_failures)
-        return {"response": fallback_message,
+        return {"response": _drop_repeated_model_lines(fallback_message),
                 "action": "search_models",
                 "search_results": models_data[:6],
                 "grouped_results": grouped,
@@ -4375,6 +4462,7 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
                 validated.append(model)
 
     prose = _strip_prompt_leakage(str(parsed.get("response") or "").strip())
+    prose = _drop_repeated_model_lines(prose)
     if not prose:
         prose = ("Here are the best deployable matches I found. Press Deploy on one — "
                  "the phone downloads it automatically, then open the LokiAI app.")
