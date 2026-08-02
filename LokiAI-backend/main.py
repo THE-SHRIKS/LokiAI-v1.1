@@ -2089,9 +2089,38 @@ def _find_deployable_file(siblings: list) -> Optional[str]:
     for ext in (".tflite", ".gguf"):
         for s in siblings:
             name = s.get("rfilename", "")
-            if name.endswith(ext):
+            if name.endswith(ext) and not is_split_shard(name):
                 return name
     return None
+
+
+# llama.cpp's split-model naming convention, e.g.
+# "GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf". A shard is NOT a model: its tensors
+# are spread across every part, and llama.cpp aborts the process - not raises,
+# aborts - when it is handed one alone. That is a native crash no Dart or
+# Python handler can intercept.
+#
+# This is exactly how a 9 MB "GLM-5.2" was recommended, passed the device
+# budget, deployed, and then killed the Android app on the first message: the
+# CDN HEAD returned the size of shard 1, not of the model.
+_SPLIT_SHARD_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+
+# A GGUF small enough to be a fragment, adapter, or vocab-only file rather than
+# something llama.cpp can hold a conversation with.
+MIN_CHAT_MODEL_MB = float(os.getenv("MIN_CHAT_MODEL_MB", "20"))
+
+
+def is_split_shard(filename: str) -> bool:
+    return bool(_SPLIT_SHARD_RE.search(filename or ""))
+
+
+def is_usable_chat_file(filename: str, size_mb: Optional[float]) -> bool:
+    """Whether a .gguf can actually be loaded on its own by the phone."""
+    if is_split_shard(filename):
+        return False
+    if size_mb is not None and size_mb < MIN_CHAT_MODEL_MB:
+        return False
+    return True
 
 
 # Publishers with a track record of solid, general-purpose on-device models.
@@ -2341,6 +2370,12 @@ async def search_deployable_models(
                 if not matches:
                     continue
                 if ext == ".gguf":
+                    # Split shards are excluded before anything else: one part
+                    # of a multi-part model is unloadable and crashes the
+                    # phone's native runtime.
+                    matches = [f for f in matches if not is_split_shard(f)]
+                    if not matches:
+                        continue
                     # Prefer q4 quantizations: the best size/quality tradeoff
                     # for phone-class RAM budgets.
                     q4 = [f for f in matches if "q4" in f.lower()]
@@ -2403,6 +2438,13 @@ async def search_deployable_models(
             continue
         m, fname, size_mb = item
         if not (0 < size_mb <= max_size_mb):
+            continue
+        # Second gate, now that the real size is known. A .gguf that is under
+        # the chat-model floor is a fragment however it was named, and
+        # deploying it crashes the phone's native runtime.
+        if fname.endswith(".gguf") and not is_usable_chat_file(fname, size_mb):
+            print(f"[search] skipping unusable chat file {m['id']}/{fname} "
+                  f"({size_mb:.2f} MB)")
             continue
         org = m["id"].split("/")[0].lower()
         results.append({
@@ -2980,8 +3022,11 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
     def _fname(s) -> str:
         return s.get("rfilename") or s.get("path") or ""
 
+    # A named repo gets the same shard exclusion as a searched one - a user
+    # pasting a link to a split model must not be handed a crash either.
     candidates = [_fname(s) for s in siblings
-                  if _fname(s).endswith((".tflite", ".gguf"))]
+                  if _fname(s).endswith((".tflite", ".gguf"))
+                  and not is_split_shard(_fname(s))]
     if not candidates:
         present = sorted({
             os.path.splitext(_fname(s))[1]
@@ -3028,6 +3073,24 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
         return {"ok": False, "code": "HF_UNAVAILABLE",
                 "message": f"I found “{repo_id}” but couldn’t read its file sizes "
                            "from the CDN just now. Try again in a moment."}
+
+    # A .gguf under the chat-model floor is a fragment or adapter, not a model
+    # llama.cpp can converse with; deploying one aborts the phone's runtime.
+    fragments = [(f, s) for f, s in sized
+                 if f.endswith(".gguf") and s < MIN_CHAT_MODEL_MB]
+    sized = [t for t in sized if t not in fragments]
+    if not sized and fragments:
+        result = {
+            "ok": False, "code": "MODEL_INCOMPATIBLE",
+            "message": (
+                f"“{repo_id}” only publishes .gguf files under "
+                f"{MIN_CHAT_MODEL_MB:.0f} MB, which are fragments rather than a "
+                "complete chat model. LokiAI runs single-file models only."
+            ),
+        }
+        if cacheable:
+            _hf_cache_put(cache_key, result)
+        return result
 
     fitting = [(f, s) for f, s in sized if 0 < s <= max_size_mb]
     if not fitting:
@@ -3084,34 +3147,34 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
 # Normalised results are cached in `model_descriptions` so the same card is not
 # downloaded on every request.
 
+# Two forms per capability: a full sentence used when the publisher supplied
+# no usable prose, and a short clause used to prefix real model-card text.
+# Repeating the full sentence in front of every card is what made the
+# recommendations read as generated boilerplate.
 _TASK_DESCRIPTIONS = {
     "image-classification": (
-        "Image classification model. It takes a single camera frame or photo "
-        "and returns the most likely labels for what the whole image shows, "
-        "with a confidence score for each.",
-        "labels whole images",
+        "Labels what the camera sees. Give it a frame or photo, get back the "
+        "most likely objects with a confidence score for each.",
+        "Labels photos and camera frames.",
     ),
     "object-detection": (
-        "Object detection model. It takes a camera frame or photo and returns "
-        "the objects it finds together with their locations in the frame and a "
-        "confidence score for each.",
-        "locates objects in a frame",
+        "Finds objects in the camera view and marks where each one is, with a "
+        "confidence score.",
+        "Finds and locates objects in view.",
     ),
     "text-generation": (
-        "Text generation model for on-device chat. It takes a conversation as "
-        "text and continues it, producing a written reply token by token.",
-        "answers in written text",
+        "An offline chatbot. Type a message and it writes a reply, entirely on "
+        "the phone with no network.",
+        "Offline chat.",
     ),
     "audio-classification": (
-        "Audio classification model. It takes a short window of microphone "
-        "audio and returns the sounds it recognises in it, with a confidence "
-        "score for each.",
-        "identifies sounds",
+        "Recognises sounds from the microphone and names what it hears, with a "
+        "confidence score.",
+        "Recognises sounds from the mic.",
     ),
     "automatic-speech-recognition": (
-        "Speech recognition model. It takes recorded speech audio and returns "
-        "the spoken words as text.",
-        "turns speech into text",
+        "Turns recorded speech into written text.",
+        "Speech to text.",
     ),
 }
 
@@ -3128,19 +3191,56 @@ _CARD_NOISE = re.compile(
 )
 
 
-def _first_card_paragraph(readme: str, limit: int = 400) -> Optional[str]:
-    """First substantive prose paragraph of a model card, or None."""
+def _strip_markup(text: str) -> str:
+    """Model-card markdown/HTML -> plain readable prose.
+
+    Cards are written for a web page, not for a phone-sized card: they open
+    with badge rows, raw <div> blocks and inline links. Passing that through
+    verbatim is what put "<div> <p style=..." and "[Run GLM-5.2 Guide!](...)"
+    into recommendations.
+    """
+    out = text
+    out = re.sub(r"<!--.*?-->", " ", out, flags=re.DOTALL)
+    out = re.sub(r"<[^>]+>", " ", out)          # HTML tags
+    out = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", out)  # images
+    out = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", out)  # links -> their text
+    out = re.sub(r"`{1,3}", "", out)            # code ticks
+    out = re.sub(r"[*_]{1,3}(?=\S)", "", out)   # bold/italic markers
+    out = out.replace("&nbsp;", " ").replace("&amp;", "&")
+    out = re.sub(r"\s+", " ", out)
+    return out.strip()
+
+
+def _first_card_paragraph(readme: str, limit: int = 220) -> Optional[str]:
+    """First substantive prose sentence(s) of a model card, or None.
+
+    Deliberately short: the card sits under a model name on a phone-width
+    panel, and a 400-character wall truncated mid-word reads worse than
+    nothing.
+    """
     if not readme:
         return None
     # Drop the YAML front matter, which is metadata rather than prose.
     body = re.sub(r"\A---\n.*?\n---\n", "", readme, flags=re.DOTALL)
     for block in re.split(r"\n\s*\n", body):
-        cleaned = _CARD_NOISE.sub("", block).strip()
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        # Skip badge rows, tables, and code fences.
-        if len(cleaned) < 40 or cleaned.startswith(("|", "```", ">")):
+        if block.lstrip().startswith(("|", "```", ">")):
             continue
-        return cleaned[:limit].rstrip() + ("..." if len(cleaned) > limit else "")
+        cleaned = _strip_markup(_CARD_NOISE.sub("", block))
+        if len(cleaned) < 40:
+            continue
+        # A block that was mostly markup leaves punctuation soup behind.
+        letters = sum(c.isalpha() or c.isspace() for c in cleaned)
+        if letters / len(cleaned) < 0.75:
+            continue
+        if len(cleaned) <= limit:
+            return cleaned
+        # Cut at the last sentence end inside the limit, else the last word.
+        window = cleaned[:limit]
+        cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
+        if cut >= 60:
+            return window[:cut + 1].strip()
+        cut = window.rfind(" ")
+        return (window[:cut] if cut >= 60 else window).strip() + "..."
     return None
 
 
@@ -3178,27 +3278,25 @@ def _compose_description(
     source: str,
 ) -> str:
     """Answers: what it does, what it takes, what it returns, what it is for."""
-    base, _ = _TASK_DESCRIPTIONS.get(
+    full, clause = _TASK_DESCRIPTIONS.get(
         capability,
         (
-            "On-device model. Its published metadata does not state a task "
-            "type, so LokiAI cannot describe its inputs or outputs precisely.",
-            "capability not stated by the publisher",
+            "LokiAI could not determine what this model does - its publisher "
+            "did not state a task type.",
+            "Task not stated by the publisher.",
         ),
     )
-    parts = [base]
+    # With real prose from the publisher, only a short clause is prepended.
+    # Prefixing the full sentence every time is what made every card open with
+    # the same two lines.
     if card_summary:
-        parts.append(card_summary)
-    elif card_data and isinstance(card_data.get("base_model"), str):
-        parts.append(
-            f"Published as a conversion of {card_data['base_model']}."
-        )
-    elif source == "fallback":
-        parts.append(
-            "This summary is derived from the model's task tag only - the "
-            "publisher supplied no model card text."
-        )
-    return " ".join(parts)
+        return f"{clause} {card_summary}"
+    if card_data and isinstance(card_data.get("base_model"), str):
+        return f"{full} Converted from {card_data['base_model']}."
+    if source == "fallback":
+        return (f"{full} (Summarised from its task tag - the "
+                "publisher supplied no model card text.)")
+    return full
 
 
 def _compose_why_recommended(
@@ -4257,14 +4355,23 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
     # describe entries the backend already verified.
     by_id = {m["id"]: m for m in models_data}
     validated = []
+    seen_result_ids: set = set()
     for r in parsed.get("search_results") or []:
-        if isinstance(r, dict) and r.get("id") in by_id:
-            validated.append(by_id[r["id"]])
+        if not isinstance(r, dict):
+            continue
+        candidate_id = r.get("id")
+        # The selector routinely names the same model more than once when it
+        # has few candidates to rank; without this the dashboard rendered the
+        # identical card three times.
+        if candidate_id in by_id and candidate_id not in seen_result_ids:
+            seen_result_ids.add(candidate_id)
+            validated.append(by_id[candidate_id])
     # A selector that drops entries must not silently discard a capability the
     # user explicitly asked for; every grouped pick stays reachable.
     for entry in grouped:
         for model in entry["models"]:
-            if model not in validated:
+            if model["id"] not in seen_result_ids:
+                seen_result_ids.add(model["id"])
                 validated.append(model)
 
     prose = _strip_prompt_leakage(str(parsed.get("response") or "").strip())
@@ -4647,8 +4754,24 @@ async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".
             raise HTTPException(status_code=502, detail=f"HuggingFace API error {resp.status_code} while listing files for '{hf_model_id}'")
 
         siblings = [s["rfilename"] for s in resp.json().get("siblings", [])]
-        candidates = [f for f in siblings if f.endswith(ext)]
+        # This is the last gate before a file is actually pushed to a phone, so
+        # the shard exclusion is repeated here rather than trusted from the
+        # search path: /deployments can be called directly with any repo id.
+        candidates = [f for f in siblings
+                      if f.endswith(ext) and not is_split_shard(f)]
         if not candidates:
+            shards = [f for f in siblings if is_split_shard(f)]
+            if shards:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"'{hf_model_id}' is published as a multi-part model "
+                        f"({len(shards)} {ext} shards). LokiAI runs single-file "
+                        "models only - one part cannot be loaded on its own and "
+                        "would crash the phone's runtime. Choose a single-file "
+                        "model instead."
+                    ),
+                )
             raise HTTPException(status_code=422, detail=f"No {ext} file found in HuggingFace repo '{hf_model_id}'. Files present: {siblings[:20]}")
 
         sized = []
@@ -4658,11 +4781,26 @@ async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".
             if cl:
                 sized.append((fname, int(cl) / (1024 * 1024)))
 
+        if ext == ".gguf":
+            too_small = [(f, s) for f, s in sized if s < MIN_CHAT_MODEL_MB]
+            sized = [(f, s) for f, s in sized if s >= MIN_CHAT_MODEL_MB]
+            if not sized and too_small:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"The only .gguf files in '{hf_model_id}' are under "
+                        f"{MIN_CHAT_MODEL_MB:.0f} MB "
+                        f"({[(f, round(s, 1)) for f, s in too_small][:5]}), which "
+                        "is too small to be a working chat model. They are most "
+                        "likely fragments or adapters, not a complete model."
+                    ),
+                )
+
         fitting = [(f, s) for f, s in sized if s <= max_size_mb]
         if not fitting:
             raise HTTPException(
                 status_code=422,
-                detail=f"No .tflite file in '{hf_model_id}' fits the device budget of {max_size_mb:.1f} MB. Candidates: {[(f, round(s,1)) for f, s in sized]}"
+                detail=f"No {ext} file in '{hf_model_id}' fits the device budget of {max_size_mb:.1f} MB. Candidates: {[(f, round(s,1)) for f, s in sized]}"
             )
         # Largest variant that fits = best quality within the device budget.
         fitting.sort(key=lambda t: t[1], reverse=True)

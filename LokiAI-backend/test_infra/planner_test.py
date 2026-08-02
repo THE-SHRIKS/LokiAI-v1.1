@@ -330,14 +330,16 @@ def test_descriptions():
         "descriptions are not identical boilerplate across models",
         f"{descriptions}",
     )
+    vision_words = ("camera", "photo", "image", "frame", "sees")
     check(
-        "image" in models[0]["description"].lower(),
+        any(w in models[0]["description"].lower() for w in vision_words),
         "the vision model's description describes vision",
         models[0]["description"],
     )
+    chat_words = ("chat", "message", "reply", "text")
     check(
-        "text" in models[1]["description"].lower(),
-        "the chat model's description describes text generation",
+        any(w in models[1]["description"].lower() for w in chat_words),
+        "the chat model's description describes chat",
         models[1]["description"],
     )
     check(
@@ -415,6 +417,122 @@ def test_description_from_model_card():
         "license" not in models[0]["description"].lower().split(".")[0],
         "YAML front matter is stripped rather than presented as prose",
         models[0]["description"],
+    )
+
+
+def test_split_shard_exclusion():
+    print("\n== split-GGUF shards are never deployable ==")
+
+    # The exact file that crashed the Android app in production.
+    crashed = "GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf"
+    check(main.is_split_shard(crashed), f"{crashed} is recognised as a shard")
+    check(
+        main.is_split_shard("model-00003-of-00012.gguf"),
+        "any -NNNNN-of-NNNNN.gguf is a shard",
+    )
+    check(
+        not main.is_split_shard("Llama-3.2-1B-Instruct-Q8_0.gguf"),
+        "an ordinary single-file model is not a shard",
+    )
+    check(
+        not main.is_split_shard("mobilenet_v2.tflite"),
+        "tflite files are unaffected",
+    )
+    check(
+        not main.is_split_shard("model-1-of-9.gguf"),
+        "the pattern requires llama.cpp's 5-digit convention, not any 'of'",
+    )
+
+    # The size gate: 8.99 MB was shard 1's size, and it sailed through the
+    # device budget because nothing checked whether it was a whole model.
+    check(
+        not main.is_usable_chat_file(crashed, 8.99),
+        "the crashed file is rejected as unusable",
+    )
+    check(
+        not main.is_usable_chat_file("tiny-fragment.gguf", 8.99),
+        "a sub-floor .gguf is rejected even with an innocent name",
+    )
+    check(
+        main.is_usable_chat_file("Llama-3.2-1B-Instruct-Q8_0.gguf", 1259.88),
+        "a real single-file chat model is accepted",
+    )
+    check(
+        main.is_usable_chat_file("model.gguf", None),
+        "an unknown size does not reject by itself",
+    )
+    check(
+        main.MIN_CHAT_MODEL_MB >= 20,
+        "the chat-model floor is meaningfully above fragment size",
+    )
+
+    # _find_deployable_file is the last gate before a file reaches a phone.
+    siblings = [
+        {"rfilename": "GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf"},
+        {"rfilename": "GLM-5.2-UD-IQ4_NL-00002-of-00009.gguf"},
+    ]
+    check(
+        main._find_deployable_file(siblings) is None,
+        "a repo of nothing but shards yields no deployable file",
+    )
+    check(
+        main._find_deployable_file(
+            siblings + [{"rfilename": "GLM-5.2-Q4_K_M.gguf"}]
+        ) == "GLM-5.2-Q4_K_M.gguf",
+        "the single-file sibling is chosen over the shards",
+    )
+
+
+def test_description_readability():
+    print("\n== descriptions are readable, not markup dumps ==")
+
+    # The real GLM-5.2 card opening that leaked into the UI verbatim.
+    card = (
+        "---\nlicense: mit\n---\n\n"
+        "Read our How to [Run GLM-5.2 Guide!](https://unsloth.ai/docs) "
+        "<div> <p style=\"margin: 0 0 0px 0;\"> <em>See "
+        "<a href=\"https://unsloth.ai\">Unsloth Dynamic 2.0 GGUFs</a> for our "
+        "quantization benchmarks.</em> </p> </div>\n\n"
+        "GLM-5.2 is a compact instruction-tuned language model designed for "
+        "efficient local inference on constrained hardware.\n"
+    )
+    summary = main._first_card_paragraph(card)
+    check(summary is not None, "a summary is still produced")
+    for bad in ("<div", "<p ", "style=", "](http", "<a href", "<em>"):
+        check(bad not in (summary or ""), f"summary contains no {bad!r}")
+    check(
+        len(summary or "") <= 225,
+        "the summary is short enough for a phone-width card",
+        f"len={len(summary or '')}",
+    )
+
+    check(
+        main._strip_markup("See [the docs](https://x.com) and `code`")
+        == "See the docs and code",
+        "links keep their text and lose their URL",
+    )
+    check(
+        main._strip_markup("<div><p>Hello</p></div>") == "Hello",
+        "HTML tags are removed",
+    )
+
+    # Two chat models must not open with the same two boilerplate sentences.
+    a = main._compose_description(
+        {}, "text-generation", "Qwen2.5 is a small instruction-tuned model.",
+        None, "huggingface_model_card")
+    b = main._compose_description(
+        {}, "text-generation", "Llama 3.2 1B is tuned for dialogue.",
+        None, "huggingface_model_card")
+    check(a != b, "two chat models get genuinely different descriptions")
+    check(
+        len(a) < 160 and len(b) < 160,
+        "a described model gets a short card, not a paragraph of template",
+        f"{len(a)} / {len(b)}",
+    )
+    check(
+        a.startswith("Offline chat."),
+        "the capability clause is one short phrase, not a full paragraph",
+        a,
     )
 
 
@@ -510,6 +628,8 @@ if __name__ == "__main__":
     test_vision_sibling_expansion()
     test_descriptions()
     test_description_from_model_card()
+    test_split_shard_exclusion()
+    test_description_readability()
     test_card_paragraph_extraction()
     test_run_lifecycle_helpers()
     test_greeting_path_is_bounded()
