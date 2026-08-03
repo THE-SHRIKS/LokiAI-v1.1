@@ -147,7 +147,9 @@ class ChatInference {
     } catch (error, stackTrace) {
       await ModelGuard.endLoad();
       _record('load', error, stackTrace);
-      _fail('Model failed to load. Try a smaller compatible GGUF model.');
+      _fail(
+        'This chat model is not ready on this device yet. Select another downloaded chat model or redeploy it from the dashboard.',
+      );
     }
   }
 

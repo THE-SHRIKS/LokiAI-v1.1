@@ -4,20 +4,20 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
 const String kConfigPath = '/sdcard/edgemind/config.json';
-const String kModelsDir  = '/sdcard/edgemind/models/';
+const String kModelsDir = '/sdcard/edgemind/models/';
 
 /// Parsed representation of /sdcard/edgemind/config.json
 class AppConfig {
   final String modelName;
   final String modelPath;
-  final String inferenceMode; // "camera" | "chat" | "voice"
-  final String format;        // "tflite" | "gguf"
+  final String inferenceMode; // "camera" | "chat" | "voice"/audio aliases
+  final String format; // "tflite" | "gguf"
   final double confidenceThreshold;
   final String deploymentId;
   // Written by the v3 wireless downloader; 0/empty for legacy v2 configs.
   final int modelSizeBytes;
   final String modelSha256;
-  
+
   // Added fields for dual model support
   final String? llmModel;
   final String? llmPath;
@@ -38,25 +38,39 @@ class AppConfig {
   factory AppConfig.fromJson(Map<String, dynamic> j) {
     final name = j['model_name'] as String? ?? '';
     return AppConfig(
-      modelName:           name,
-      modelPath:           j['model_path'] as String? ?? '$kModelsDir$name',
-      inferenceMode:       j['inference_mode'] as String? ?? 'chat',
-      format:              j['format'] as String? ?? 'tflite',
-      confidenceThreshold: (j['confidence_threshold'] as num?)?.toDouble() ?? 0.55,
-      deploymentId:        j['deployment_id'] as String? ?? '',
-      modelSizeBytes:      (j['model_size_bytes'] as num?)?.toInt() ?? 0,
-      modelSha256:         j['model_sha256'] as String? ?? '',
-      llmModel:            j['llm_model'] as String?,
-      llmPath:             j['llm_path'] as String?,
+      modelName: name,
+      modelPath: j['model_path'] as String? ?? '$kModelsDir$name',
+      inferenceMode: j['inference_mode'] as String? ?? 'chat',
+      format: j['format'] as String? ?? 'tflite',
+      confidenceThreshold:
+          (j['confidence_threshold'] as num?)?.toDouble() ?? 0.55,
+      deploymentId: j['deployment_id'] as String? ?? '',
+      modelSizeBytes: (j['model_size_bytes'] as num?)?.toInt() ?? 0,
+      modelSha256: j['model_sha256'] as String? ?? '',
+      llmModel: j['llm_model'] as String?,
+      llmPath: j['llm_path'] as String?,
     );
   }
 
   String get displayMode {
     switch (inferenceMode) {
-      case 'camera': return 'Vision';
-      case 'voice':  return 'Voice';
-      case 'chat':   return 'Chat';
-      default:       return inferenceMode;
+      case 'camera':
+        return 'Vision';
+      case 'image-classification':
+      case 'object-detection':
+        return 'Vision';
+      case 'voice':
+        return 'Voice';
+      case 'audio':
+      case 'audio-classification':
+      case 'automatic-speech-recognition':
+        return 'Voice';
+      case 'chat':
+        return 'Chat';
+      case 'text-generation':
+        return 'Chat';
+      default:
+        return inferenceMode;
     }
   }
 
@@ -68,17 +82,17 @@ class AppConfig {
   }
 
   Map<String, dynamic> toJson() => {
-        'model_name': modelName,
-        'model_path': modelPath,
-        'inference_mode': inferenceMode,
-        'format': format,
-        'confidence_threshold': confidenceThreshold,
-        'deployment_id': deploymentId,
-        'model_size_bytes': modelSizeBytes,
-        'model_sha256': modelSha256,
-        if (llmModel != null) 'llm_model': llmModel,
-        if (llmPath != null) 'llm_path': llmPath,
-      };
+    'model_name': modelName,
+    'model_path': modelPath,
+    'inference_mode': inferenceMode,
+    'format': format,
+    'confidence_threshold': confidenceThreshold,
+    'deployment_id': deploymentId,
+    'model_size_bytes': modelSizeBytes,
+    'model_sha256': modelSha256,
+    if (llmModel != null) 'llm_model': llmModel,
+    if (llmPath != null) 'llm_path': llmPath,
+  };
 }
 
 /// Result returned by ConfigReader.load()
@@ -110,7 +124,8 @@ class ConfigReader {
       for (final item in decoded) {
         if (item is! Map) continue;
         final config = AppConfig.fromJson(Map<String, dynamic>.from(item));
-        if (config.modelPath.isNotEmpty && await File(config.modelPath).exists()) {
+        if (config.modelPath.isNotEmpty &&
+            await File(config.modelPath).exists()) {
           installed.add(config);
         }
       }
@@ -123,7 +138,9 @@ class ConfigReader {
 
   static Future<void> activate(AppConfig config) async {
     final docs = await getApplicationDocumentsDirectory();
-    await File('${docs.path}/config.json').writeAsString(jsonEncode(config.toJson()));
+    await File(
+      '${docs.path}/config.json',
+    ).writeAsString(jsonEncode(config.toJson()));
   }
 
   static Future<ConfigResult> load() async {
@@ -147,17 +164,21 @@ class ConfigReader {
     return _parse(legacy, defaultModelsDir: kModelsDir);
   }
 
-  static Future<ConfigResult> _parse(File configFile,
-      {required String defaultModelsDir}) async {
+  static Future<ConfigResult> _parse(
+    File configFile, {
+    required String defaultModelsDir,
+  }) async {
     try {
-      final raw    = await configFile.readAsString();
-      final json   = jsonDecode(raw) as Map<String, dynamic>;
+      final raw = await configFile.readAsString();
+      final json = jsonDecode(raw) as Map<String, dynamic>;
       final config = AppConfig.fromJson(json);
 
       // Verify model file exists
-      final modelFile = File(config.modelPath.isNotEmpty
-          ? config.modelPath
-          : '$defaultModelsDir${config.modelName}');
+      final modelFile = File(
+        config.modelPath.isNotEmpty
+            ? config.modelPath
+            : '$defaultModelsDir${config.modelName}',
+      );
 
       if (!await modelFile.exists()) {
         final msg = 'model_not_found: ${config.modelName}';
@@ -171,7 +192,8 @@ class ConfigReader {
       if (config.modelSizeBytes > 0) {
         final actualSize = await modelFile.length();
         if (actualSize != config.modelSizeBytes) {
-          final msg = 'model_corrupt: ${config.modelName} '
+          final msg =
+              'model_corrupt: ${config.modelName} '
               '($actualSize of ${config.modelSizeBytes} bytes). '
               'Re-deploy the model from the dashboard.';
           print('VERIFICATION: config_reader -> $msg');
@@ -179,7 +201,9 @@ class ConfigReader {
         }
       }
 
-      print('VERIFICATION: config_reader -> mode=${config.inferenceMode} model=${config.modelName}');
+      print(
+        'VERIFICATION: config_reader -> mode=${config.inferenceMode} model=${config.modelName}',
+      );
       return ConfigResult(config: config);
     } catch (e) {
       print('VERIFICATION: config_reader -> parse_error: $e');

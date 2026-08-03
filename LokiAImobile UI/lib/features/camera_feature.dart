@@ -77,7 +77,8 @@ class CameraFeatureController extends ChangeNotifier {
 
   /// True while the camera surface should be shown at all.
   bool get isOpen =>
-      _state != CameraFeatureState.idle && _state != CameraFeatureState.disposed;
+      _state != CameraFeatureState.idle &&
+      _state != CameraFeatureState.disposed;
 
   /// Recognition is optional: the preview works without a vision model.
   bool get recognitionAvailable => _engine?.isReady == true;
@@ -132,10 +133,7 @@ class CameraFeatureController extends ChangeNotifier {
 
     // 1. Capability check before asking for anything.
     List<CameraDescription> cameras;
-    _set(
-      CameraFeatureState.initializing,
-      message: 'Checking for a camera…',
-    );
+    _set(CameraFeatureState.initializing, message: 'Checking for a camera…');
     try {
       cameras = await availableCameras();
     } catch (e) {
@@ -149,7 +147,8 @@ class CameraFeatureController extends ChangeNotifier {
       );
       _set(
         CameraFeatureState.failed,
-        message: 'This device did not report a usable camera '
+        message:
+            'This device did not report a usable camera '
             '(${e is CameraException ? e.code : e.runtimeType}).',
       );
       return;
@@ -217,7 +216,8 @@ class CameraFeatureController extends ChangeNotifier {
         error: e,
         correlationId: _correlationId,
       );
-      final busy = e.code == 'CameraAccessDenied' ||
+      final busy =
+          e.code == 'CameraAccessDenied' ||
           e.code.contains('InUse') ||
           e.code == 'cameraPermission';
       _set(
@@ -235,12 +235,7 @@ class CameraFeatureController extends ChangeNotifier {
       return;
     }
 
-    _set(
-      CameraFeatureState.ready,
-      message: modelPath == null
-          ? 'Camera ready. Deploy a vision model to label what it sees.'
-          : 'Camera ready.',
-    );
+    _set(CameraFeatureState.ready, message: 'Camera ready.');
 
     // 4. Recognition is started separately and is allowed to fail.
     if (modelPath != null) {
@@ -333,12 +328,7 @@ class CameraFeatureController extends ChangeNotifier {
       final engine = _engine;
       if (engine == null || !engine.isReady) {
         _lastResult = null;
-        _set(
-          CameraFeatureState.ready,
-          message:
-              'Photo captured, but no vision model is deployed to read it. '
-              'Deploy one from the dashboard.',
-        );
+        _set(CameraFeatureState.ready, message: 'Camera ready.');
         return;
       }
 

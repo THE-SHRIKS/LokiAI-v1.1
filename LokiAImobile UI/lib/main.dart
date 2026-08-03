@@ -528,15 +528,30 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
   /// model is still preferred; the rest of the registry is the fallback, so
   /// camera and mic work alongside chat.
   String? _modelPathFor(String inferenceMode) {
+    bool modeMatches(AppConfig model) {
+      switch (inferenceMode) {
+        case 'camera':
+          return model.inferenceMode == 'camera' ||
+              model.inferenceMode == 'image-classification' ||
+              model.inferenceMode == 'object-detection';
+        case 'voice':
+          return model.inferenceMode == 'voice' ||
+              model.inferenceMode == 'audio' ||
+              model.inferenceMode == 'audio-classification' ||
+              model.inferenceMode == 'automatic-speech-recognition';
+        default:
+          return model.inferenceMode == inferenceMode;
+      }
+    }
+
     final active = _configResult?.config;
     if (active != null &&
-        active.inferenceMode == inferenceMode &&
+        modeMatches(active) &&
         active.modelPath.endsWith('.tflite')) {
       return active.modelPath;
     }
-    for (final model in _installed) {
-      if (model.inferenceMode == inferenceMode &&
-          model.modelPath.endsWith('.tflite')) {
+    for (final model in _installed.reversed) {
+      if (modeMatches(model) && model.modelPath.endsWith('.tflite')) {
         return model.modelPath;
       }
     }
@@ -548,20 +563,25 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
   /// Same rule as [_modelPathFor], and for the same reason: only one model can
   /// be active at a time, so looking solely at the active one made chat go
   /// dead whenever a camera or voice model was deployed.
-  String? _chatModelPath() {
+  List<String> _chatModelPaths() {
     bool isChat(AppConfig c) =>
         c.llmPath != null ||
-        (c.inferenceMode == 'chat' &&
+        ((c.inferenceMode == 'chat' || c.inferenceMode == 'text-generation') &&
             (c.modelPath.endsWith('.gguf') || c.modelPath.endsWith('.bin')));
+
+    final paths = <String>[];
+    void addPath(String path) {
+      if (!paths.contains(path)) paths.add(path);
+    }
 
     final active = _configResult?.config;
     if (active != null && isChat(active)) {
-      return active.llmPath ?? active.modelPath;
+      addPath(active.llmPath ?? active.modelPath);
     }
-    for (final model in _installed) {
-      if (isChat(model)) return model.llmPath ?? model.modelPath;
+    for (final model in _installed.reversed) {
+      if (isChat(model)) addPath(model.llmPath ?? model.modelPath);
     }
-    return null;
+    return paths;
   }
 
   Future<void> _toggleCamera() async {
@@ -645,9 +665,8 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
 
     try {
       if (_chatInference == null) {
-        final chatPath = _chatModelPath();
-        if (chatPath == null ||
-            !(chatPath.endsWith('.gguf') || chatPath.endsWith('.bin'))) {
+        final chatPaths = _chatModelPaths();
+        if (chatPaths.isEmpty) {
           finish(
             'No chat model is deployed on this phone yet. '
             'Deploy a GGUF chat model from the LokiAI dashboard.',
@@ -657,9 +676,24 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
         // Native loading is explicit and only happens after the app is fully
         // interactive. ChatInference converts ordinary load errors into a
         // visible reply instead of terminating the UI.
-        final chat = ChatInference();
-        _chatInference = chat;
-        await chat.initialize(chatPath);
+        for (final chatPath in chatPaths) {
+          if (!(chatPath.endsWith('.gguf') || chatPath.endsWith('.bin'))) {
+            continue;
+          }
+          final chat = ChatInference();
+          await chat.initialize(chatPath);
+          if (chat.isReady) {
+            _chatInference = chat;
+            break;
+          }
+          await chat.dispose();
+        }
+        if (_chatInference == null) {
+          finish(
+            'No downloaded chat model is ready on this phone yet. Select another chat model or redeploy it from the dashboard.',
+          );
+          return;
+        }
       }
 
       final chat = _chatInference;
@@ -975,9 +1009,6 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
 
   Widget _cameraSurface() {
     final controller = _camera.previewController;
-    final busy =
-        _camera.state == CameraFeatureState.capturing ||
-        _camera.state == CameraFeatureState.processing;
     return Container(
       margin: const EdgeInsets.only(bottom: 24),
       height: 320,
@@ -1031,65 +1062,28 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
               ),
             ),
             Positioned(
-              bottom: 16,
+              bottom: 18,
               left: 16,
               right: 16,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: _camera.fireDetected
-                          ? LokiColors.accent.withValues(alpha: 0.85)
-                          : Colors.black54,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      _camera.lastResult ?? _camera.statusMessage,
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: _camera.fireDetected
+                      ? LokiColors.accent.withValues(alpha: 0.85)
+                      : Colors.black54,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  _camera.lastResult ?? _camera.statusMessage,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
                   ),
-                  const SizedBox(height: 12),
-                  // Still capture ?' validation ?' recognition. Disabled while a
-                  // capture is already running, so repeated taps cannot start
-                  // two takePicture() calls on one controller.
-                  GestureDetector(
-                    onTap: _camera.canCapture
-                        ? () => unawaited(_camera.capture())
-                        : null,
-                    child: Container(
-                      width: 56,
-                      height: 56,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: _camera.canCapture
-                            ? Colors.white
-                            : Colors.white24,
-                        border: Border.all(color: Colors.white70, width: 2),
-                      ),
-                      child: busy
-                          ? const Padding(
-                              padding: EdgeInsets.all(16),
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: LokiColors.baseBlack,
-                              ),
-                            )
-                          : const Icon(
-                              Icons.camera,
-                              color: LokiColors.baseBlack,
-                            ),
-                    ),
-                  ),
-                ],
+                  textAlign: TextAlign.center,
+                ),
               ),
             ),
           ],
