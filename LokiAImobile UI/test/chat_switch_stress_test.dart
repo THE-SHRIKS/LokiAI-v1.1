@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:fllama/fllama_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -15,6 +14,11 @@ class _HoldingFllama extends FllamaPlatform with MockPlatformInterfaceMixin {
 
   @override
   Stream<Map<Object?, dynamic>>? get onTokenStream => const Stream.empty();
+
+  @override
+  Future<Map<Object?, dynamic>?> getCpuInfo() async => <Object?, dynamic>{
+    'cpuCount': 2,
+  };
 
   @override
   Future<Map<Object?, dynamic>?> initContext(
@@ -79,6 +83,13 @@ class _HoldingFllama extends FllamaPlatform with MockPlatformInterfaceMixin {
   }
 
   @override
+  Future<Map<Object?, dynamic>?> tokenize(double contextId, {
+    required String text,
+  }) async => <Object?, dynamic>{
+    'tokens': List<int>.filled(16, 1),
+  };
+
+  @override
   Future<void> releaseContext(double contextId) async {
     events.add('release:$contextId');
   }
@@ -141,4 +152,31 @@ void main() {
       }
     },
   );
+
+  test('rapid prompts never overlap on one native context', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final previous = FllamaPlatform.instance;
+    final fake = _HoldingFllama();
+    FllamaPlatform.instance = fake;
+    final root = await Directory.systemTemp.createTemp('loki_rapid_prompt');
+    addTearDown(() async {
+      FllamaPlatform.instance = previous;
+      await root.delete(recursive: true);
+    });
+
+    final model = await _modelFile(root, 1);
+    final chat = ChatInference();
+    await chat.initialize(model.path);
+    final first = chat.generateText('first').listen((_) {});
+    final second = chat.generateText('second').listen((_) {});
+    await Future<void>.delayed(Duration.zero);
+
+    // The second prompt is queued in Dart and cannot reach native code while
+    // the first completion owns this context.
+    expect(fake.events.where((event) => event.startsWith('completion:')),
+        hasLength(1));
+    await chat.dispose();
+    await first.cancel();
+    await second.cancel();
+  });
 }

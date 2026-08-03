@@ -412,6 +412,11 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
         // foreground. Releasing them explicitly is what makes reopening work.
         unawaited(_camera.handleAppPaused());
         unawaited(_mic.handleAppPaused());
+        // The native chat context stays owned by ChatInference, but an active
+        // completion must not keep running while Android backgrounds us.
+        // cancel() is idempotent and waits for llama.cpp before a later model
+        // switch can release its memory.
+        unawaited(_chatInference?.cancel() ?? Future<void>.value());
       case AppLifecycleState.resumed:
         unawaited(_camera.handleAppResumed());
     }

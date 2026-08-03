@@ -23,6 +23,11 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // fllama supplies native libraries only for these 64-bit targets.
+        // Do not advertise arm32 and let Android load a missing JNI library.
+        ndk {
+            abiFilters += setOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -32,6 +37,15 @@ android {
             isMinifyEnabled = false
             isShrinkResources = false
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    // Some transitive plugins bundle arm32 helpers even when Flutter targets
+    // only arm64/x64. Excluding the directory prevents the APK from
+    // advertising arm32, where fllama has no corresponding JNI runtime.
+    packaging {
+        jniLibs {
+            excludes += "**/armeabi-v7a/**"
         }
     }
 }
