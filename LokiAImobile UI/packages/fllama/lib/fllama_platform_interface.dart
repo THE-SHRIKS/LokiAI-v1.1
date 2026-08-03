@@ -130,12 +130,12 @@ abstract class FllamaPlatform extends PlatformInterface {
         "Method bench({required double contextId,required double pp,required double tg,required double pl,required double nr}) has not been implemented.");
   }
 
-  Future<void> releaseContext(double contextId) {
+  Future<Map<Object?, dynamic>?> releaseContext(double contextId) {
     throw UnimplementedError(
         "Method releaseContext({required double contextId}) has not been implemented.");
   }
 
-  Future<void> releaseAllContexts() {
+  Future<Map<Object?, dynamic>?> releaseAllContexts() {
     throw UnimplementedError(
         "Method releaseAllContexts() has not been implemented.");
   }

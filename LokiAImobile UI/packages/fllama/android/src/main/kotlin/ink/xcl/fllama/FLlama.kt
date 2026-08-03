@@ -7,10 +7,12 @@ import io.flutter.plugin.common.MethodChannel.Result
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Random
+import java.util.concurrent.Executors
 import kotlin.math.abs
 
 class FLlama(private val fContext: Context) {
@@ -18,6 +20,10 @@ class FLlama(private val fContext: Context) {
     private val tasks = HashMap<Job, String>()
 
     private val contexts = HashMap<Int, LlamaContext>()
+    private val engineDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "FllamaNativeCommand").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
+    private val engineScope = CoroutineScope(engineDispatcher)
 
     fun getFileSHA256(call: MethodCall, res: Result) {
         try {
@@ -26,7 +32,7 @@ class FLlama(private val fContext: Context) {
                 throw Exception("Params can't be Null")
             } else {
                 val fPath: String = map["filePath"] as String
-                CoroutineScope(Dispatchers.IO).launch {
+                engineScope.launch {
                     var exception: Exception? = null
                     var result: String? = null
                     try {
@@ -40,7 +46,7 @@ class FLlama(private val fContext: Context) {
                         } else {
                             res.success(result)
                         }
-                        tasks.remove(this@launch.coroutineContext)
+                        tasks.remove(coroutineContext[Job])
                     }
                 }
             }
@@ -51,7 +57,7 @@ class FLlama(private val fContext: Context) {
 
     fun getCpuInfo(res: Result) {
         try {
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var exception: Exception? = null
                 val result: Any? = try {
                     val result: HashMap<String, Any> = HashMap()
@@ -72,7 +78,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }
         } catch (e: Exception) {
@@ -85,12 +91,15 @@ class FLlama(private val fContext: Context) {
     fun initContext(call: MethodCall, res: Result, eventSend: (HashMap<String, Any>) -> Unit) {
         try {
             val map = call.arguments<HashMap<String, Any>>()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var exception: Exception? = null
                 val result: Any? = try {
                     if (map == null) {
                         throw Exception("Params can't be Null")
                     } else {
+                        if (contexts.isNotEmpty()) {
+                            throw Exception("A native model is already loaded")
+                        }
                         val id = abs(Random().nextInt().toDouble()).toInt()
                         val llamaContext =
                             LlamaContext(id, map){
@@ -119,7 +128,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "initContext"
@@ -140,7 +149,7 @@ class FLlama(private val fContext: Context) {
                 map["messages"] as Array<HashMap<String, Any>?>
             val chatTemplate: String? = map["chatTemplate"] as String?
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var result: Any? = null
                 var exception: Exception? = null
                 try {
@@ -155,7 +164,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "getFormattedChat-$contextId"
@@ -171,7 +180,7 @@ class FLlama(private val fContext: Context) {
             val id: Double = map?.get("contextId") as Double
             val path: String = map["path"] as String
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var result: Any? = null
                 var exception: Exception? = null
                 try {
@@ -186,7 +195,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "loadSession-$contextId"
@@ -203,7 +212,7 @@ class FLlama(private val fContext: Context) {
             val path: String = map["path"] as String
             val size: Double = map["size"] as Double
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var result: Any? = null
                 var exception: Exception? = null
                 try {
@@ -218,7 +227,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "saveSession-$contextId"
@@ -235,7 +244,7 @@ class FLlama(private val fContext: Context) {
             val id: Double = map?.get("contextId") as Double
             val params: HashMap<String, Any> = map["params"] as HashMap<String, Any>
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var result: Any? = null
                 var exception: Exception? = null
                 try {
@@ -258,7 +267,7 @@ class FLlama(private val fContext: Context) {
                         FLog.d("result Done")
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "completion-$contextId"
@@ -278,7 +287,7 @@ class FLlama(private val fContext: Context) {
                 try {
                     val context = contexts[contextId] ?: throw Exception("Context $id not found")
                     context.stopCompletion()
-                    for (task in tasks.keys) {
+                    for (task in tasks.keys.toList()) {
                         if (tasks[task] == "completion-$contextId") {
                             task.join()
                             break
@@ -293,7 +302,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(null)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "stopCompletion-$contextId"
@@ -309,7 +318,7 @@ class FLlama(private val fContext: Context) {
             val id: Double = map?.get("contextId") as Double
             val text: String = map["text"] as String
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var result: Any? = null
                 var exception: Exception? = null
                 try {
@@ -324,7 +333,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "tokenize-$contextId"
@@ -340,7 +349,7 @@ class FLlama(private val fContext: Context) {
             val id: Double = map?.get("contextId") as Double
             val tokens: IntArray = map["tokens"] as IntArray
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var result: Any? = null
                 var exception: Exception? = null
                 try {
@@ -355,7 +364,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "detokenize-$contextId"
@@ -374,7 +383,7 @@ class FLlama(private val fContext: Context) {
             val pl: Double = map["pl"] as Double
             val nr: Double = map["nr"] as Double
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var result: Any? = null
                 var exception: Exception? = null
                 try {
@@ -389,7 +398,7 @@ class FLlama(private val fContext: Context) {
                     } else {
                         res.success(result)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "bench-$contextId"
@@ -404,19 +413,33 @@ class FLlama(private val fContext: Context) {
             val map = call.arguments<HashMap<String, Any>>()
             val id: Double = map?.get("contextId") as Double
             val contextId = id.toInt()
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var exception: Exception? = null
+                var unloadResult: HashMap<String, Any>? = null
                 try {
                     val context = contexts[contextId] ?: throw Exception("Context $id not found")
                     context.stopCompletion()
-                    for (task in tasks.keys) {
+                    var generationStopped = true
+                    for (task in tasks.keys.toList()) {
                         if (tasks[task] == "completion-$contextId") {
-                            task.join()
+                            try {
+                                task.join()
+                            } catch (_: Exception) {
+                                generationStopped = false
+                            }
                             break
                         }
                     }
                     context.release()
                     contexts.remove(contextId)
+                    unloadResult = HashMap<String, Any>().apply {
+                        put("generationStopped", generationStopped)
+                        put("contextDestroyed", true)
+                        put("modelDestroyed", true)
+                        put("callbacksDetached", true)
+                        put("epoch", System.currentTimeMillis())
+                        put("operationResult", "released")
+                    }
                 } catch (e: Exception) {
                     exception = e
                 }
@@ -424,9 +447,9 @@ class FLlama(private val fContext: Context) {
                     if (exception != null) {
                         res.error("500", exception.localizedMessage, exception)
                     } else {
-                        res.success(null)
+                        res.success(unloadResult)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "releaseContext-$contextId"
@@ -438,10 +461,19 @@ class FLlama(private val fContext: Context) {
 
     fun releaseAllContexts(res: Result) {
         try {
-            CoroutineScope(Dispatchers.IO).launch {
+            engineScope.launch {
                 var exception: Exception? = null
+                var releaseResult: HashMap<String, Any>? = null
                 try {
                     onDestroy()
+                    releaseResult = HashMap<String, Any>().apply {
+                        put("generationStopped", true)
+                        put("contextDestroyed", true)
+                        put("modelDestroyed", true)
+                        put("callbacksDetached", true)
+                        put("epoch", System.currentTimeMillis())
+                        put("operationResult", "released_all")
+                    }
                 } catch (e: Exception) {
                     exception = e
                 }
@@ -449,9 +481,9 @@ class FLlama(private val fContext: Context) {
                     if (exception != null) {
                         res.error("500", exception.localizedMessage, exception)
                     } else {
-                        res.success(null)
+                        res.success(releaseResult)
                     }
-                    tasks.remove(this@launch.coroutineContext)
+                    tasks.remove(coroutineContext[Job])
                 }
             }.let { task ->
                 tasks[task] = "releaseAllContexts"
@@ -466,7 +498,7 @@ class FLlama(private val fContext: Context) {
             for (context in contexts.values) {
                 context.stopCompletion()
             }
-            for (task in tasks.keys) {
+            for (task in tasks.keys.toList()) {
                 try {
                     task.join()
                 } catch (e: Exception) {

@@ -83,15 +83,21 @@ class _HoldingFllama extends FllamaPlatform with MockPlatformInterfaceMixin {
   }
 
   @override
-  Future<Map<Object?, dynamic>?> tokenize(double contextId, {
+  Future<Map<Object?, dynamic>?> tokenize(
+    double contextId, {
     required String text,
-  }) async => <Object?, dynamic>{
-    'tokens': List<int>.filled(16, 1),
-  };
+  }) async => <Object?, dynamic>{'tokens': List<int>.filled(16, 1)};
 
   @override
-  Future<void> releaseContext(double contextId) async {
+  Future<Map<Object?, dynamic>?> releaseContext(double contextId) async {
     events.add('release:$contextId');
+    return <Object?, dynamic>{
+      'generationStopped': true,
+      'contextDestroyed': true,
+      'modelDestroyed': true,
+      'callbacksDetached': true,
+      'operationResult': 'released',
+    };
   }
 }
 
@@ -173,8 +179,10 @@ void main() {
 
     // The second prompt is queued in Dart and cannot reach native code while
     // the first completion owns this context.
-    expect(fake.events.where((event) => event.startsWith('completion:')),
-        hasLength(1));
+    expect(
+      fake.events.where((event) => event.startsWith('completion:')),
+      hasLength(1),
+    );
     await chat.dispose();
     await first.cancel();
     await second.cancel();

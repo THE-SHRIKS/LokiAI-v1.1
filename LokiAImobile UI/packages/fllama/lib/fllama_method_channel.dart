@@ -183,13 +183,14 @@ class MethodChannelFllama extends FllamaPlatform {
   }
 
   @override
-  Future<void> releaseContext(double contextId) async {
-    await methodChannel
-        .invokeMethod("releaseContext", {"contextId": contextId});
+  Future<Map<Object?, dynamic>?> releaseContext(double contextId) async {
+    return await methodChannel.invokeMethod<Map<Object?, dynamic>>(
+        "releaseContext", {"contextId": contextId});
   }
 
   @override
-  Future<void> releaseAllContexts() async {
-    await methodChannel.invokeMethod("releaseAllContexts");
+  Future<Map<Object?, dynamic>?> releaseAllContexts() async {
+    return await methodChannel
+        .invokeMethod<Map<Object?, dynamic>>("releaseAllContexts");
   }
 }

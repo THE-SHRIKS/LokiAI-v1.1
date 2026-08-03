@@ -14,6 +14,7 @@
             android:enabled="true"
             android:exported="false"
             android:hardwareAccelerated="true"
+            android:process=":inference"
             android:foregroundServiceType="dataSync"
             />
     </application>

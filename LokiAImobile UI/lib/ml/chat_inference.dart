@@ -82,8 +82,11 @@ class ChatInference {
       _modelPath = null;
       if (contextId != null) {
         try {
-          await Fllama.instance()!.releaseContext(contextId);
-          _log('release', 'completed');
+          final release = await Fllama.instance()!.releaseContext(contextId);
+          _log(
+            'release',
+            release?['operationResult']?.toString() ?? 'completed',
+          );
         } catch (error, stackTrace) {
           _record('release', error, stackTrace);
         }
@@ -98,7 +101,9 @@ class ChatInference {
     }
     if (_state == ChatRuntimeState.ready && _modelPath == path) return;
     if (_contextId != null) {
-      throw StateError('A chat context is already active; dispose it before loading another model.');
+      throw StateError(
+        'A chat context is already active; dispose it before loading another model.',
+      );
     }
     _state = ChatRuntimeState.loading;
     _epoch++;
@@ -107,7 +112,9 @@ class ChatInference {
     _failure = null;
 
     if (await ModelGuard.isQuarantined(path)) {
-      return _fail('This model was quarantined after a native loading crash. Deploy a different model.');
+      return _fail(
+        'This model was quarantined after a native loading crash. Deploy a different model.',
+      );
     }
     final rejection = await ModelGuard.validateGguf(path);
     if (rejection != null) return _fail(rejection.message);
@@ -132,7 +139,8 @@ class ChatInference {
         if (id is num) await Fllama.instance()!.releaseContext(id.toDouble());
         return;
       }
-      if (id is! num) return _fail('Model initialization returned no native context.');
+      if (id is! num)
+        return _fail('Model initialization returned no native context.');
       _contextId = id.toDouble();
       _state = ChatRuntimeState.ready;
       _log('load', 'ready');
@@ -143,11 +151,18 @@ class ChatInference {
     }
   }
 
-  Future<void> _startGeneration(String prompt, StreamController<String> output) async {
+  Future<void> _startGeneration(
+    String prompt,
+    StreamController<String> output,
+  ) async {
     final clean = prompt.trim();
-    if (clean.isEmpty) return _closeWith(output, 'Please enter a message before sending.');
+    if (clean.isEmpty)
+      return _closeWith(output, 'Please enter a message before sending.');
     if (_state != ChatRuntimeState.ready || _contextId == null) {
-      return _closeWith(output, _failure ?? 'The selected chat model is not ready yet.');
+      return _closeWith(
+        output,
+        _failure ?? 'The selected chat model is not ready yet.',
+      );
     }
     final contextId = _contextId!;
     final epoch = _epoch;
@@ -158,53 +173,81 @@ class ChatInference {
     _state = ChatRuntimeState.generating;
     final formatted = _format(clean);
     try {
-      final tokenResult = await Fllama.instance()!.tokenize(contextId, text: formatted);
+      final tokenResult = await Fllama.instance()!.tokenize(
+        contextId,
+        text: formatted,
+      );
       final tokenCount = (tokenResult?['tokens'] as List?)?.length;
-      if (tokenCount == null || tokenCount + _reservedOutputTokens > _contextTokens) {
+      if (tokenCount == null ||
+          tokenCount + _reservedOutputTokens > _contextTokens) {
         _state = ChatRuntimeState.ready;
         _invalidateRequest();
-        return _closeWith(output, 'That message is too long for this model. Please shorten it and try again.');
+        return _closeWith(
+          output,
+          'That message is too long for this model. Please shorten it and try again.',
+        );
       }
     } catch (error, stackTrace) {
       _record('tokenize', error, stackTrace, request: request);
       _state = ChatRuntimeState.ready;
       _invalidateRequest();
-      return _closeWith(output, 'The prompt could not be prepared for this model.');
+      return _closeWith(
+        output,
+        'The prompt could not be prepared for this model.',
+      );
     }
 
     // A switch may have arrived while tokenization was running. Tokenization
     // does not generate, but starting completion after that switch would use
     // a context the switch is about to release.
-    if (_epoch != epoch || _state != ChatRuntimeState.generating || _activeRequest != request) {
-      return _closeWith(output, 'The model changed before this message could start. Please send it again.');
+    if (_epoch != epoch ||
+        _state != ChatRuntimeState.generating ||
+        _activeRequest != request) {
+      return _closeWith(
+        output,
+        'The model changed before this message could start. Please send it again.',
+      );
     }
 
-    _tokens = Fllama.instance()!.onTokenStream?.listen((event) {
-      final eventId = event['contextId'];
-      final belongsToContext = eventId == null || eventId.toString() == contextId.toInt().toString();
-      if (_epoch != epoch || _activeRequest != request || !belongsToContext) return;
-      if (event['function'] != 'completion') return;
-      final result = event['result'];
-      final token = result is Map ? result['token'] : null;
-      if (token is String && token.isNotEmpty && !output.isClosed) {
-        _receivedToken = true;
-        output.add(token);
-      }
-    }, onError: (Object error, StackTrace stackTrace) {
-      _record('stream', error, stackTrace, request: request);
-    });
+    _tokens = Fllama.instance()!.onTokenStream?.listen(
+      (event) {
+        final eventId = event['contextId'];
+        final belongsToContext =
+            eventId == null ||
+            eventId.toString() == contextId.toInt().toString();
+        if (_epoch != epoch || _activeRequest != request || !belongsToContext)
+          return;
+        if (event['function'] != 'completion') return;
+        final result = event['result'];
+        final token = result is Map ? result['token'] : null;
+        if (token is String && token.isNotEmpty && !output.isClosed) {
+          _receivedToken = true;
+          output.add(token);
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        _record('stream', error, stackTrace, request: request);
+      },
+    );
 
     final completion = _complete(contextId, formatted, epoch, request, output);
     _generationDone = completion;
     await completion;
   }
 
-  Future<void> _complete(double contextId, String prompt, int epoch, int request, StreamController<String> output) async {
+  Future<void> _complete(
+    double contextId,
+    String prompt,
+    int epoch,
+    int request,
+    StreamController<String> output,
+  ) async {
     final tokenTap = _tokens;
     // A delayed callback is filtered above. The watchdog only requests a
     // native stop; it never frees the context itself.
     _watchdog = Timer(_firstTokenTimeout, () {
-      if (_epoch == epoch && _activeRequest == request && !_receivedToken) unawaited(cancel());
+      if (_epoch == epoch && _activeRequest == request && !_receivedToken)
+        unawaited(cancel());
     });
     try {
       await Fllama.instance()!.completion(
@@ -220,7 +263,8 @@ class ChatInference {
     } catch (error, stackTrace) {
       if (_epoch == epoch && _activeRequest == request) {
         _record('completion', error, stackTrace, request: request);
-        if (!output.isClosed) output.add('Generation failed. Please try again.');
+        if (!output.isClosed)
+          output.add('Generation failed. Please try again.');
       }
     } finally {
       _watchdog?.cancel();
@@ -244,7 +288,9 @@ class ChatInference {
     await running;
   }
 
-  Future<void> _detachTokens({StreamSubscription<Map<Object?, dynamic>>? subscription}) async {
+  Future<void> _detachTokens({
+    StreamSubscription<Map<Object?, dynamic>>? subscription,
+  }) async {
     final sub = subscription ?? _tokens;
     if (identical(sub, _tokens)) _tokens = null;
     await sub?.cancel();
@@ -255,12 +301,16 @@ class ChatInference {
     _controller = null;
   }
 
-  Future<void> _closeWith(StreamController<String> controller, String message) async {
+  Future<void> _closeWith(
+    StreamController<String> controller,
+    String message,
+  ) async {
     if (!controller.isClosed) controller.add(message);
     await controller.close();
   }
 
-  String _format(String prompt) => '<|im_start|>system\nYou are Loki, a highly logical and factual AI assistant. Keep responses concise.<|im_end|>\n<|im_start|>user\n$prompt<|im_end|>\n<|im_start|>assistant\n';
+  String _format(String prompt) =>
+      '<|im_start|>system\nYou are Loki, a highly logical and factual AI assistant. Keep responses concise.<|im_end|>\n<|im_start|>user\n$prompt<|im_end|>\n<|im_start|>assistant\n';
 
   void _fail(String message) {
     _failure = message;
@@ -274,10 +324,22 @@ class ChatInference {
     return next;
   }
 
-  void _log(String operation, String result) => debugPrint('LOKI_RUNTIME op=$operation result=$result state=${_state.name} epoch=$_epoch model=${_modelPath?.split('/').last ?? 'none'} request=${_activeRequest ?? 'none'}');
+  void _log(String operation, String result) => debugPrint(
+    'LOKI_RUNTIME op=$operation result=$result state=${_state.name} epoch=$_epoch model=${_modelPath?.split('/').last ?? 'none'} request=${_activeRequest ?? 'none'}',
+  );
 
-  void _record(String operation, Object error, StackTrace stackTrace, {int? request}) {
+  void _record(
+    String operation,
+    Object error,
+    StackTrace stackTrace, {
+    int? request,
+  }) {
     _log(operation, 'failed');
-    Diagnostics.capture(feature: 'chat.$operation', error: error, stackTrace: stackTrace, correlationId: request == null ? null : 'r$request');
+    Diagnostics.capture(
+      feature: 'chat.$operation',
+      error: error,
+      stackTrace: stackTrace,
+      correlationId: request == null ? null : 'r$request',
+    );
   }
 }

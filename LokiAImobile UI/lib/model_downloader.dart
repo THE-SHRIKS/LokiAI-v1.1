@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 /// WebSocket, and writes config.json (v3 wireless deployment, Tasks 2.5/2.6).
 class ModelDownloader {
   static const int maxAttempts = 3;
+  static const int maxInstalledModels = 10;
   static final Set<String> _cancelledDeployments = <String>{};
   static final Map<String, HttpClient> _activeClients = <String, HttpClient>{};
 
@@ -29,7 +30,8 @@ class ModelDownloader {
   static String sanitizeFilename(String raw) {
     // Take the last path segment only — kills ../, absolute paths, and both
     // separator styles in one step.
-    var name = raw.split(RegExp(r'[/\\]')).where((s) => s.isNotEmpty).lastOrNull ?? '';
+    var name =
+        raw.split(RegExp(r'[/\\]')).where((s) => s.isNotEmpty).lastOrNull ?? '';
     name = name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
     // '.'/'..' survive the character filter but are not usable filenames.
     while (name.startsWith('.')) {
@@ -73,14 +75,32 @@ class ModelDownloader {
       return;
     }
 
+    final limitError = await _deploymentLimitError(deploymentId);
+    if (limitError != null) {
+      send({
+        'deployment_id': deploymentId,
+        'status': 'failed',
+        'progress_percent': 0,
+        'error_message': limitError,
+      });
+      return;
+    }
+
     String lastError = 'unknown error';
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         // ignore: avoid_print
-        print('VERIFICATION: download -> attempt $attempt/$maxAttempts '
-            'url=$modelUrl');
+        print(
+          'VERIFICATION: download -> attempt $attempt/$maxAttempts '
+          'url=$modelUrl',
+        );
         final saved = await _download(
-            modelUrl, modelName, deploymentId, expectedSha, send);
+          modelUrl,
+          modelName,
+          deploymentId,
+          expectedSha,
+          send,
+        );
         if (_cancelledDeployments.remove(deploymentId)) {
           send({
             'deployment_id': deploymentId,
@@ -92,8 +112,14 @@ class ModelDownloader {
         }
         // Record the sanitized name that was actually written to disk, so
         // config.json can never disagree with the real file.
-        final savedConfig = await _saveConfig(sanitizeFilename(modelName), saved.path, config,
-            deploymentId, saved.bytes, saved.sha256);
+        final savedConfig = await _saveConfig(
+          sanitizeFilename(modelName),
+          saved.path,
+          config,
+          deploymentId,
+          saved.bytes,
+          saved.sha256,
+        );
         await _recordInstalledModel(savedConfig);
         send({
           'deployment_id': deploymentId,
@@ -105,8 +131,10 @@ class ModelDownloader {
           'model_path': saved.path,
         });
         // ignore: avoid_print
-        print('VERIFICATION: download -> COMPLETE path=${saved.path} '
-            'bytes=${saved.bytes} sha256=${saved.sha256}');
+        print(
+          'VERIFICATION: download -> COMPLETE path=${saved.path} '
+          'bytes=${saved.bytes} sha256=${saved.sha256}',
+        );
         return;
       } catch (e) {
         if (_cancelledDeployments.remove(deploymentId)) {
@@ -164,7 +192,8 @@ class ModelDownloader {
       final response = await request.close();
       if (response.statusCode != 200) {
         throw HttpException(
-            'HuggingFace CDN returned ${response.statusCode} for $url');
+          'HuggingFace CDN returned ${response.statusCode} for $url',
+        );
       }
 
       final totalBytes = response.contentLength;
@@ -174,8 +203,9 @@ class ModelDownloader {
 
       final sink = partFile.openWrite();
       try {
-        await for (final chunk in response
-            .timeout(const Duration(seconds: 60))) {
+        await for (final chunk in response.timeout(
+          const Duration(seconds: 60),
+        )) {
           if (_cancelledDeployments.contains(deploymentId)) {
             throw const HttpException('Download cancelled by user');
           }
@@ -194,8 +224,10 @@ class ModelDownloader {
                 'error_message': null,
               });
               // ignore: avoid_print
-              print('VERIFICATION: download -> $pct% '
-                  '($receivedBytes/$totalBytes bytes)');
+              print(
+                'VERIFICATION: download -> $pct% '
+                '($receivedBytes/$totalBytes bytes)',
+              );
             }
           }
         }
@@ -206,15 +238,19 @@ class ModelDownloader {
 
       final actualSha = shaSink.digestHex();
       // ignore: avoid_print
-      print('VERIFICATION: download -> saved ${partFile.path} '
-          'bytes=$receivedBytes sha256=$actualSha expected=$expectedSha');
+      print(
+        'VERIFICATION: download -> saved ${partFile.path} '
+        'bytes=$receivedBytes sha256=$actualSha expected=$expectedSha',
+      );
 
-      if (expectedSha != null && expectedSha.isNotEmpty &&
+      if (expectedSha != null &&
+          expectedSha.isNotEmpty &&
           actualSha.toLowerCase() != expectedSha.toLowerCase()) {
         await partFile.delete();
         throw Exception(
-            'SHA-256 mismatch: expected $expectedSha got $actualSha '
-            '(corrupt file deleted)');
+          'SHA-256 mismatch: expected $expectedSha got $actualSha '
+          '(corrupt file deleted)',
+        );
       }
 
       await partFile.rename(file.path);
@@ -264,8 +300,10 @@ class ModelDownloader {
     };
     await configFile.writeAsString(jsonEncode(json));
     // ignore: avoid_print
-    print('VERIFICATION: config_receiver -> saved ${configFile.path}: '
-        '${jsonEncode(json)}');
+    print(
+      'VERIFICATION: config_receiver -> saved ${configFile.path}: '
+      '${jsonEncode(json)}',
+    );
     return json;
   }
 
@@ -281,10 +319,43 @@ class ModelDownloader {
         if (decoded is List) registry = decoded;
       } catch (_) {}
     }
-    registry.removeWhere((item) => item is Map &&
-        item['deployment_id'] == config['deployment_id']);
+    registry.removeWhere(
+      (item) => item is Map && item['deployment_id'] == config['deployment_id'],
+    );
     registry.add(config);
     await registryFile.writeAsString(jsonEncode(registry));
+  }
+
+  static Future<String?> _deploymentLimitError(String deploymentId) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final registryFile = File('${docs.path}/model-registry.json');
+    if (!await registryFile.exists()) return null;
+    List<dynamic> registry = const [];
+    try {
+      final decoded = jsonDecode(await registryFile.readAsString());
+      if (decoded is List) registry = decoded;
+    } catch (_) {
+      return null;
+    }
+
+    var readyCount = 0;
+    var replacingExisting = false;
+    for (final item in registry) {
+      if (item is! Map) continue;
+      if (item['deployment_id'] == deploymentId) {
+        replacingExisting = true;
+        continue;
+      }
+      final path = item['model_path'] as String?;
+      if (path == null || path.isEmpty || path.endsWith('.part')) continue;
+      final file = File(path);
+      if (await file.exists()) readyCount++;
+    }
+    if (!replacingExisting && readyCount >= maxInstalledModels) {
+      return 'This phone already has $maxInstalledModels downloaded models. '
+          'Remove an old model before deploying another one.';
+    }
+    return null;
   }
 }
 
@@ -304,8 +375,6 @@ class _Sha256Accumulator {
 
   String digestHex() {
     _input.close();
-    return _digestBytes
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join();
+    return _digestBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }
 }

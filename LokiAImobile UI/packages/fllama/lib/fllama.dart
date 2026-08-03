@@ -143,11 +143,11 @@ class Fllama {
         .bench(contextId, pp: pp, tg: tg, pl: pl, nr: nr);
   }
 
-  Future<void> releaseContext(double contextId) {
+  Future<Map<Object?, dynamic>?> releaseContext(double contextId) {
     return FllamaPlatform.instance.releaseContext(contextId);
   }
 
-  Future<void> releaseAllContexts() {
+  Future<Map<Object?, dynamic>?> releaseAllContexts() {
     return FllamaPlatform.instance.releaseAllContexts();
   }
 }
