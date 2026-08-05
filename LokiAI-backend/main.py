@@ -6638,7 +6638,8 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         )
 
     # One model per phone (PRD): never run parallel downloads on one device.
-    # Stale rows (e.g. app killed mid-download) auto-expire after 15 minutes.
+    # Stale rows auto-expire — 15 minutes for an in-progress download,
+    # 90 seconds for a stalled validation (see below for why they differ).
     async with pool.acquire() as conn:
         # Cleanup runs BEFORE the blocking check, not after: a deployment that
         # has gone silent for 15 minutes is dead and must not cost the user an
@@ -6649,20 +6650,40 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         # genuinely slow-but-still-progressing download the moment it passed
         # 15 minutes old, while a deployment that died instantly still got a
         # full 15-minute grace period before it stopped blocking new ones.
+        #
+        # The timeout itself is status-aware, not one blanket number: a large
+        # file transfer (queued/downloading) can legitimately run for many
+        # minutes on a slow connection, but validation (downloaded/
+        # validating) is a single bounded local operation — one chat
+        # generation or one TFLite invoke — that either finishes in seconds
+        # or has died (native crash, dropped connection, unhandled hang).
+        # Giving that phase the same 15-minute grace period as a genuine
+        # download is exactly what left a crashed validation blocking every
+        # other deployment on the device for a quarter of an hour.
         await conn.execute(
             """UPDATE deployments SET status = 'failed',
                    error_message = 'Timed out: phone stopped reporting progress',
                    updated_at = NOW()
                WHERE device_id = $1::uuid
-                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
-                 AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '15 minutes'""",
+                 AND (
+                   (status IN ('queued', 'downloading')
+                    AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '15 minutes')
+                   OR
+                   (status IN ('downloaded', 'validating')
+                    AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '90 seconds')
+                 )""",
             req.device_id
         )
         active = await conn.fetchrow(
             """SELECT id, status, progress FROM deployments
                WHERE device_id = $1::uuid
-                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
-                 AND COALESCE(updated_at, deployed_at) > NOW() - INTERVAL '15 minutes'
+                 AND (
+                   (status IN ('queued', 'downloading')
+                    AND COALESCE(updated_at, deployed_at) > NOW() - INTERVAL '15 minutes')
+                   OR
+                   (status IN ('downloaded', 'validating')
+                    AND COALESCE(updated_at, deployed_at) > NOW() - INTERVAL '90 seconds')
+                 )
                ORDER BY deployed_at DESC LIMIT 1""",
             req.device_id
         )

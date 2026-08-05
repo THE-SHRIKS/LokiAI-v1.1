@@ -14,6 +14,13 @@ import 'ml/model_guard.dart';
 class ModelDownloader {
   static const int maxAttempts = 3;
   static const int maxInstalledModels = 10;
+  // Validation is one bounded local operation (one chat generation or one
+  // TFLite invoke) — it either finishes in seconds or has hung/crashed.
+  // Bounding it here catches a Dart-level hang; a genuine native crash
+  // still kills the process outright (nothing in Dart can catch that), but
+  // the backend's own status-aware staleness timeout is the backstop for
+  // that case, and it no longer waits 15 minutes to notice.
+  static const Duration _validationTimeout = Duration(seconds: 60);
   static final Set<String> _cancelledDeployments = <String>{};
   static final Map<String, HttpClient> _activeClients = <String, HttpClient>{};
 
@@ -90,7 +97,19 @@ class ModelDownloader {
       return;
     }
 
+    // Only the download itself is retried. A transient network blip is
+    // exactly what maxAttempts exists for; a validation failure is not —
+    // re-downloading the identical bytes and smoke-testing them again would
+    // only reproduce the same failure, and previously it silently did
+    // exactly that: a validation exception was caught by the SAME retry
+    // block as download failures, so the backend never learned validation
+    // had failed until all attempts were burned re-downloading a file that
+    // was never the problem — or, if the process died natively mid-
+    // validation instead of throwing a catchable Dart exception, no
+    // terminal status was ever sent at all and the deployment sat at
+    // "downloaded" forever, blocking every later deployment on the device.
     String lastError = 'unknown error';
+    ({String path, int bytes, String sha256})? saved;
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         // ignore: avoid_print
@@ -98,13 +117,7 @@ class ModelDownloader {
           'VERIFICATION: download -> attempt $attempt/$maxAttempts '
           'url=$modelUrl',
         );
-        final saved = await _download(
-          modelUrl,
-          modelName,
-          deploymentId,
-          expectedSha,
-          send,
-        );
+        saved = await _download(modelUrl, modelName, deploymentId, expectedSha, send);
         if (_cancelledDeployments.remove(deploymentId)) {
           send({
             'deployment_id': deploymentId,
@@ -114,68 +127,7 @@ class ModelDownloader {
           });
           return;
         }
-        // Record the sanitized name that was actually written to disk, so
-        // config.json can never disagree with the real file.
-        final savedConfig = await _saveConfig(
-          sanitizeFilename(modelName),
-          saved.path,
-          config,
-          deploymentId,
-          saved.bytes,
-          saved.sha256,
-        );
-        await _recordInstalledModel(savedConfig);
-        send({
-          'deployment_id': deploymentId,
-          'status': 'downloaded',
-          'progress_percent': 100,
-          'error_message': null,
-          'downloaded_bytes': saved.bytes,
-          'sha256': saved.sha256,
-          'model_path': saved.path,
-        });
-        send({
-          'deployment_id': deploymentId,
-          'status': 'validating',
-          'progress_percent': 100,
-          'error_message': null,
-        });
-        final validation = await _validateRuntimeArtifact(
-          saved.path,
-          savedConfig,
-          data,
-        );
-        send(validation.runtimeEvent);
-        if (!validation.success) {
-          send({
-            'deployment_id': deploymentId,
-            'status': 'failed',
-            'progress_percent': 100,
-            'error_message': validation.errorDetail,
-            'error_code': validation.errorCode,
-            'error_detail': validation.errorDetail,
-          });
-          return;
-        }
-        send({
-          'deployment_id': deploymentId,
-          'status': 'complete',
-          'progress_percent': 100,
-          'error_message': null,
-          'runtime_verified': true,
-          'smoke_test_success': true,
-          'validation_result': validation.runtimeEvent,
-          'smoke_test_result': validation.runtimeEvent,
-          'downloaded_bytes': saved.bytes,
-          'sha256': saved.sha256,
-          'model_path': saved.path,
-        });
-        // ignore: avoid_print
-        print(
-          'VERIFICATION: download -> COMPLETE path=${saved.path} '
-          'bytes=${saved.bytes} sha256=${saved.sha256}',
-        );
-        return;
+        break;
       } catch (e) {
         if (_cancelledDeployments.remove(deploymentId)) {
           send({
@@ -192,13 +144,119 @@ class ModelDownloader {
       }
     }
 
-    send({
-      'deployment_id': deploymentId,
-      'status': 'failed',
-      'progress_percent': 0,
-      'error_message':
-          'Download failed after $maxAttempts attempts: $lastError',
-    });
+    if (saved == null) {
+      send({
+        'deployment_id': deploymentId,
+        'status': 'failed',
+        'progress_percent': 0,
+        'error_message':
+            'Download failed after $maxAttempts attempts: $lastError',
+      });
+      return;
+    }
+
+    // Validation runs exactly once, with a hard ceiling: whatever happens
+    // inside it — a Dart exception, an unexpected hang, a timeout — this
+    // block guarantees exactly one terminal status reaches the backend, so
+    // "downloaded"/"validating" can never again be the last thing the
+    // backend hears about a deployment that has actually stopped.
+    try {
+      final savedConfig = await _saveConfig(
+        sanitizeFilename(modelName),
+        saved.path,
+        config,
+        deploymentId,
+        saved.bytes,
+        saved.sha256,
+      );
+      await _recordInstalledModel(savedConfig);
+      send({
+        'deployment_id': deploymentId,
+        'status': 'downloaded',
+        'progress_percent': 100,
+        'error_message': null,
+        'downloaded_bytes': saved.bytes,
+        'sha256': saved.sha256,
+        'model_path': saved.path,
+      });
+      send({
+        'deployment_id': deploymentId,
+        'status': 'validating',
+        'progress_percent': 100,
+        'error_message': null,
+      });
+      final validation = await _validateRuntimeArtifact(
+        saved.path,
+        savedConfig,
+        data,
+      ).timeout(
+        _validationTimeout,
+        onTimeout: () => _RuntimeValidationResult(
+          success: false,
+          errorCode: 'MODEL_SMOKE_TEST_TIMEOUT',
+          errorDetail: 'Runtime validation did not finish within '
+              '${_validationTimeout.inSeconds}s.',
+          runtimeEvent: {
+            'type': 'runtime_event',
+            'event_id': '$deploymentId:validation-timeout:${saved!.sha256}',
+            'schema_version': 1,
+            'deployment_id': deploymentId,
+            'model_id': savedConfig['model_name'],
+            'adapter_id': savedConfig['adapter_id'],
+            'adapter_version': savedConfig['adapter_version'],
+            'runtime_version': 'lokiai_android_runtime_1',
+            'operation': 'deployment_validation',
+            'event_type': 'runtime_validation',
+            'success': false,
+            'error_code': 'MODEL_SMOKE_TEST_TIMEOUT',
+            'error_detail': 'Runtime validation did not finish within '
+                '${_validationTimeout.inSeconds}s.',
+            'occurred_at': DateTime.now().toUtc().toIso8601String(),
+          },
+        ),
+      );
+      send(validation.runtimeEvent);
+      if (!validation.success) {
+        send({
+          'deployment_id': deploymentId,
+          'status': 'failed',
+          'progress_percent': 100,
+          'error_message': validation.errorDetail,
+          'error_code': validation.errorCode,
+          'error_detail': validation.errorDetail,
+        });
+        return;
+      }
+      send({
+        'deployment_id': deploymentId,
+        'status': 'complete',
+        'progress_percent': 100,
+        'error_message': null,
+        'runtime_verified': true,
+        'smoke_test_success': true,
+        'validation_result': validation.runtimeEvent,
+        'smoke_test_result': validation.runtimeEvent,
+        'downloaded_bytes': saved.bytes,
+        'sha256': saved.sha256,
+        'model_path': saved.path,
+      });
+      // ignore: avoid_print
+      print(
+        'VERIFICATION: download -> COMPLETE path=${saved.path} '
+        'bytes=${saved.bytes} sha256=${saved.sha256}',
+      );
+    } catch (e) {
+      // ignore: avoid_print
+      print('VERIFICATION: validation -> failed: $e');
+      send({
+        'deployment_id': deploymentId,
+        'status': 'failed',
+        'progress_percent': 100,
+        'error_message': 'Runtime validation failed: $e',
+        'error_code': 'MODEL_SMOKE_TEST_FAILED',
+        'error_detail': e.toString(),
+      });
+    }
   }
 
   static Future<({String path, int bytes, String sha256})> _download(
