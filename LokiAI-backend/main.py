@@ -196,6 +196,14 @@ async def _run_migrations(pool: asyncpg.Pool):
                 updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # Explicit structured search state per conversation — shown/rejected
+        # candidate ids, the active capability, and a show-more cursor — so
+        # repetition prevention and task-change handling read a real record
+        # instead of re-deriving it from raw chat history on every turn.
+        await conn.execute(
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS "
+            "search_state JSONB NOT NULL DEFAULT '{}'::jsonb"
+        )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS conversations_user_idx "
             "ON conversations (user_id, updated_at DESC)"
@@ -2756,26 +2764,130 @@ def size_ceiling_for(preference: str, max_size_mb: float) -> float:
     return max_size_mb * _SIZE_PREFERENCE_CEILING.get(preference, 1.0)
 
 
-_MIN_SIZE_RE = re.compile(
-    r"(?:greater than|more than|over|at least|minimum|min)\s+(\d+(?:\.\d+)?)\s*(gb|gib|mb|mib)\b",
+_SIZE_UNIT_TO_MB = {
+    "gb": 1024.0, "gib": 1024.0,
+    "mb": 1.0, "mib": 1.0,
+    "kb": 1.0 / 1024.0, "kib": 1.0 / 1024.0,
+}
+_SIZE_UNIT_RE = r"(gb|gib|mb|mib|kb|kib)"
+
+_BETWEEN_SIZE_RE = re.compile(
+    rf"between\s+(\d+(?:\.\d+)?)\s*{_SIZE_UNIT_RE}\s+and\s+(\d+(?:\.\d+)?)\s*{_SIZE_UNIT_RE}\b",
     re.IGNORECASE,
 )
+_MIN_SIZE_RE = re.compile(
+    rf"(?:greater than|more than|over|at least|minimum|min)\s+(\d+(?:\.\d+)?)\s*{_SIZE_UNIT_RE}\b",
+    re.IGNORECASE,
+)
+_MAX_SIZE_RE = re.compile(
+    rf"(?:less than|under|below|at most|no more than|maximum|max)\s+(\d+(?:\.\d+)?)\s*{_SIZE_UNIT_RE}\b",
+    re.IGNORECASE,
+)
+
 _PARAM_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*b\b|\b(\d+(?:\.\d+)?)\s*billion\b", re.IGNORECASE)
+_PARAM_MILLION_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(?:m|million)\b(?!\s*(?:b|billion)\b)", re.IGNORECASE)
+_PARAM_BETWEEN_RE = re.compile(
+    r"between\s+(\d+(?:\.\d+)?)\s*b(?:illion)?\s+and\s+(\d+(?:\.\d+)?)\s*b(?:illion)?\b",
+    re.IGNORECASE,
+)
+_PARAM_MIN_RE = re.compile(
+    r"(?:greater than|more than|over|at least|minimum|min)\s+(\d+(?:\.\d+)?)\s*b(?:illion)?\b",
+    re.IGNORECASE,
+)
+_PARAM_MAX_RE = re.compile(
+    r"(?:less than|under|below|at most|no more than|maximum|max)\s+(\d+(?:\.\d+)?)\s*b(?:illion)?\b",
+    re.IGNORECASE,
+)
+_FILENAME_PARAM_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)[\s_-]?[Bb](?![a-zA-Z0-9])")
+
+
+def _size_to_mb(value: float, unit: str) -> float:
+    return value * _SIZE_UNIT_TO_MB.get(unit.lower(), 1.0)
 
 
 def extract_hard_constraints(message: str) -> Dict[str, Any]:
+    """Deterministic numeric constraint extraction, never left to NIM alone.
+
+    Handles KB/MB/GB (and *iB equivalents), parameter counts in millions or
+    billions, "between X and Y" ranges, and greater/less/at-least/at-most
+    phrasing for both size and parameter count. Returns only what the message
+    actually states — nothing here is a guess.
+    """
     msg = message or ""
     constraints: Dict[str, Any] = {}
-    min_match = _MIN_SIZE_RE.search(msg)
-    if min_match:
-        value = float(min_match.group(1))
-        unit = min_match.group(2).lower()
-        constraints["min_size_mb"] = value * 1024 if unit.startswith("g") else value
-    param_match = _PARAM_RE.search(msg)
-    if param_match:
-        value = float(param_match.group(1) or param_match.group(2))
-        constraints["parameter_b"] = value
+
+    between_size = _BETWEEN_SIZE_RE.search(msg)
+    if between_size:
+        lo = _size_to_mb(float(between_size.group(1)), between_size.group(2))
+        hi = _size_to_mb(float(between_size.group(3)), between_size.group(4))
+        constraints["min_size_mb"] = min(lo, hi)
+        constraints["max_size_mb"] = max(lo, hi)
+    else:
+        min_match = _MIN_SIZE_RE.search(msg)
+        if min_match:
+            constraints["min_size_mb"] = _size_to_mb(float(min_match.group(1)), min_match.group(2))
+        max_match = _MAX_SIZE_RE.search(msg)
+        if max_match:
+            constraints["max_size_mb"] = _size_to_mb(float(max_match.group(1)), max_match.group(2))
+
+    between_param = _PARAM_BETWEEN_RE.search(msg)
+    if between_param:
+        lo, hi = float(between_param.group(1)), float(between_param.group(2))
+        constraints["min_parameter_b"] = min(lo, hi)
+        constraints["max_parameter_b"] = max(lo, hi)
+    else:
+        param_min = _PARAM_MIN_RE.search(msg)
+        if param_min:
+            constraints["min_parameter_b"] = float(param_min.group(1))
+        param_max = _PARAM_MAX_RE.search(msg)
+        if param_max:
+            constraints["max_parameter_b"] = float(param_max.group(1))
+        if not param_min and not param_max:
+            param_match = _PARAM_RE.search(msg)
+            if param_match:
+                constraints["parameter_b"] = float(param_match.group(1) or param_match.group(2))
+            else:
+                million_match = _PARAM_MILLION_RE.search(msg)
+                if million_match:
+                    constraints["parameter_b"] = float(million_match.group(1)) / 1000.0
     return constraints
+
+
+def describe_hard_constraints(constraints: Dict[str, Any]) -> str:
+    """Human-readable form of a constraint dict, for honest failure messages
+    ("I could not find a model matching <this>") rather than a generic
+    budget line that omits what the user actually asked for."""
+    parts = []
+    if "min_size_mb" in constraints and "max_size_mb" in constraints:
+        parts.append(f"between {constraints['min_size_mb']/1024:.1f} GB and "
+                      f"{constraints['max_size_mb']/1024:.1f} GB")
+    elif "min_size_mb" in constraints:
+        parts.append(f"at least {constraints['min_size_mb']/1024:.1f} GB")
+    elif "max_size_mb" in constraints:
+        parts.append(f"under {constraints['max_size_mb']/1024:.1f} GB")
+    if "min_parameter_b" in constraints and "max_parameter_b" in constraints:
+        parts.append(f"between {constraints['min_parameter_b']:g}B and "
+                      f"{constraints['max_parameter_b']:g}B parameters")
+    elif "min_parameter_b" in constraints:
+        parts.append(f"at least {constraints['min_parameter_b']:g}B parameters")
+    elif "max_parameter_b" in constraints:
+        parts.append(f"under {constraints['max_parameter_b']:g}B parameters")
+    elif "parameter_b" in constraints:
+        parts.append(f"{constraints['parameter_b']:g}B parameters specifically")
+    return " and ".join(parts)
+
+
+def _extract_parameter_b_from_text(text: str) -> Optional[float]:
+    """Best-effort parameter count in billions parsed from a model id or
+    filename, e.g. 'Qwen2.5-7B-Instruct' -> 7.0. None when no such token
+    exists — callers must not guess when this happens."""
+    match = _FILENAME_PARAM_RE.search(text)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def _filename_matches_parameter_constraint(filename: str, model_id: str,
@@ -2790,6 +2902,25 @@ def _filename_matches_parameter_constraint(filename: str, model_id: str,
         rf"(?<!\d){re.escape(str(target))}\s*billion\b",
     ]
     return any(re.search(p, text) for p in patterns)
+
+
+def _filename_matches_parameter_range(filename: str, model_id: str,
+                                      min_parameter_b: Optional[float],
+                                      max_parameter_b: Optional[float]) -> bool:
+    """Enforces 'between 3B and 8B' / 'at least Nb' / 'under Nb' style
+    constraints. A candidate whose parameter count cannot be verified from
+    its id/filename is excluded rather than assumed to pass — never display
+    a candidate that violates a hard constraint, including by omission."""
+    if min_parameter_b is None and max_parameter_b is None:
+        return True
+    value = _extract_parameter_b_from_text(f"{model_id} {filename}")
+    if value is None:
+        return False
+    if min_parameter_b is not None and value < min_parameter_b:
+        return False
+    if max_parameter_b is not None and value > max_parameter_b:
+        return False
+    return True
 
 
 def rank_candidates(models: list, size_preference: str) -> list:
@@ -2814,6 +2945,38 @@ def rank_candidates(models: list, size_preference: str) -> list:
         models,
         key=lambda m: (not m.get("reputable", False), -(m.get("downloads") or 0)),
     )
+
+
+def _ranking_reasons(model: dict, size_preference: str) -> list:
+    """Structured evidence for why a candidate ranked where it did — NIM may
+    explain this in prose, but the ranking and its reasons are computed here,
+    deterministically, from verified fields only."""
+    reasons = []
+    if model.get("adapter_id"):
+        reasons.append(f"Runtime adapter {model['adapter_id']} implemented and tested")
+    if model.get("reputable"):
+        reasons.append("Published by a reputable organization")
+    if size_preference in ("small", "tiny") and model.get("size_mb"):
+        reasons.append(f"Matches the requested {size_preference} size preference")
+    elif size_preference == "large" and model.get("size_mb"):
+        reasons.append("Larger download matching the requested preference")
+    memory = model.get("memory_estimate") or {}
+    if memory.get("safe"):
+        reasons.append("Estimated to fit this device's memory budget")
+    if model.get("previously_failed_on_device"):
+        reasons.append("Previously failed on this device — shown only because a retry was requested")
+    return reasons
+
+
+def attach_ranking_evidence(models: list, size_preference: str) -> list:
+    """Attaches rank/score/reasons to already-ordered candidates, additive to
+    the existing dict shape so current frontend clients are unaffected."""
+    total = max(len(models), 1)
+    for index, model in enumerate(models):
+        model["rank"] = index + 1
+        model["ranking_score"] = round(1.0 - (index / total) * 0.6, 3)
+        model["ranking_reasons"] = _ranking_reasons(model, size_preference)
+    return models
 
 
 def classify_task_plan(message: str) -> list:
@@ -2862,12 +3025,74 @@ def classify_tasks(message: str) -> list:
     return [task["capability"] for task in classify_task_plan(message)]
 
 
+# Shared failure-language alternation so every area recognizes the same
+# vocabulary — a prior version required "voice" for microphone reports but
+# only matched the contraction "doesn't", not "does not"/"did not", which is
+# exactly why "the chat model loaded but does not answer" and "the sound
+# model gave an error" (both drawn from real reported failures) previously
+# fell through to search instead of diagnosis.
+_FAILURE_LANGUAGE = (
+    r"nothing|failed?|error|not work(?:ing)?|didn'?t|doesn'?t|does not|did not|"
+    r"do not|silent|crash\w*|black|closed|not run|stuck|gave an error"
+)
+
 _TROUBLESHOOT_PATTERNS = [
-    ("microphone", re.compile(r"\b(mic|microphone|recording|voice)\b.*\b(nothing|failed|error|not work|didn'?t|doesn'?t|silent)\b|\b(nothing|failed|error)\b.*\b(mic|microphone|recording|voice)\b", re.I)),
-    ("camera", re.compile(r"\b(camera|photo|preview|vision)\b.*\b(crash\w*|failed|error|not work|black|closed)\b|\b(crash\w*|failed|error)\b.*\b(camera|photo|preview|vision)\b", re.I)),
-    ("chat", re.compile(r"\b(chat|message|reply|respond|generation|inference)\b.*\b(failed|error|not work|didn'?t|doesn'?t|crash|stuck)\b", re.I)),
-    ("deployment", re.compile(r"\b(deploy(?:ed|ment)?|download(?:ed)?)\b.*\b(failed|error|not run|didn'?t run|doesn'?t run|complete|ready)\b|\b(model loaded|loaded but|downloaded but)\b", re.I)),
+    # "voice"/"sound"/"audio" route here too: the app's single mic button is
+    # what runs whichever audio-classification model is deployed, so a sound
+    # model's failure is reported through the same UI entry point.
+    ("microphone", re.compile(
+        rf"\b(mic|microphone|recording|voice|sound|audio)\b.*\b({_FAILURE_LANGUAGE})\b|"
+        rf"\b({_FAILURE_LANGUAGE})\b.*\b(mic|microphone|recording|voice|sound|audio)\b", re.I)),
+    ("camera", re.compile(
+        rf"\b(camera|photo|preview|vision)\b.*\b({_FAILURE_LANGUAGE})\b|"
+        rf"\b({_FAILURE_LANGUAGE})\b.*\b(camera|photo|preview|vision)\b", re.I)),
+    ("chat", re.compile(
+        rf"\b(chat|message|reply|respond|generation|inference|answer)\b.*\b({_FAILURE_LANGUAGE})\b", re.I)),
+    ("deployment", re.compile(
+        rf"\b(deploy(?:ed|ment)?|download(?:ed)?)\b.*\b({_FAILURE_LANGUAGE}|complete|ready)\b|"
+        r"\b(model loaded|loaded but|downloaded but)\b", re.I)),
 ]
+
+# Part 10: deterministic error-code -> human explanation. The exact runtime
+# error_detail from the phone is always preferred when present; this is the
+# fallback so a bare error code is never surfaced to the user unexplained,
+# and so the explanation itself can never drift model-to-model or session-
+# to-session the way a freshly-generated NIM sentence could.
+ERROR_CODE_EXPLANATIONS: Dict[str, str] = {
+    "MODEL_BUNDLE_INCOMPLETE": "The deployment is missing one or more required model artifacts.",
+    "MODEL_FORMAT_INVALID": "The downloaded file is not a valid supported model artifact.",
+    "MODEL_ARCHITECTURE_UNSUPPORTED": "LokiAI's installed runtime does not support this model architecture.",
+    "MODEL_MEMORY_ESTIMATE_EXCEEDED": "This specific model configuration is estimated to exceed the safe runtime memory budget.",
+    "MODEL_INTERPRETER_INIT_FAILED": "The model file downloaded, but the phone could not initialize its runtime.",
+    "MODEL_SMOKE_TEST_FAILED": "The model initialized but failed LokiAI's readiness inference.",
+    "MODEL_TOO_SMALL": "This file is too small to be a complete model — likely a fragment, adapter, or shard.",
+    "MODEL_IS_SPLIT_SHARD": "This file is one part of a multi-part model; LokiAI can only run single-file models.",
+    "MODEL_NOT_GGUF": "This file is not a GGUF model, so the chat runtime cannot load it.",
+    "MODEL_FILE_MISSING": "The deployed model file is missing from the phone's storage.",
+    "AUDIO_PERMISSION_DENIED": "Microphone permission is not available.",
+    "AUDIO_MODEL_BUNDLE_INCOMPLETE": "The audio model requires additional artifacts that were not deployed.",
+    "AUDIO_MODEL_NOT_TFLITE": "The deployed audio file is not a valid TFLite model.",
+    "AUDIO_MODEL_REQUIRES_EDGE_TPU": "This audio model requires Coral Edge TPU hardware this phone does not have.",
+    "AUDIO_PREPROCESSOR_UNSUPPORTED": "LokiAI does not currently implement the preprocessing required by this model.",
+    "AUDIO_TENSOR_CONTRACT_MISMATCH": "The model's expected audio input does not match LokiAI's runtime adapter.",
+    "AUDIO_INTERPRETER_INIT_FAILED": "The audio model file downloaded, but the phone could not initialize its TFLite interpreter.",
+    "AUDIO_INFERENCE_FAILED": "The audio model loaded, but a live inference call failed.",
+    "CAMERA_ALREADY_IN_USE": "Another camera session is still active.",
+    "CAMERA_CONTROLLER_DISPOSED": "The camera callback belongs to a closed camera session.",
+    "VISION_MODEL_NOT_TFLITE": "The deployed vision file is not a valid TFLite model.",
+    "VISION_INPUT_CONTRACT_MISMATCH": "The model's expected image input does not match LokiAI's runtime adapter.",
+    "VISION_OUTPUT_CONTRACT_MISMATCH": "The model initialized, but its output format is not supported by the selected vision adapter.",
+    "VISION_PREPROCESSING_FAILED": "The camera frame could not be prepared for this model.",
+    "VISION_INFERENCE_FAILED": "The vision model loaded, but a live inference call failed.",
+    "CHAT_MODEL_FILE_MISSING": "The deployed chat model file is missing from the phone's storage.",
+    "CHAT_MODEL_FORMAT_INVALID": "The deployed chat file is not a valid GGUF model.",
+    "CHAT_CONTEXT_CREATE_FAILED": "The GGUF file passed download validation but the chat runtime could not create a native context.",
+    "CHAT_GENERATION_FAILED": "The chat model's context opened, but it failed to generate a reply.",
+    "CHAT_PROMPT_TOO_LARGE": "The current conversation exceeds this model's configured context capacity.",
+    "MODEL_NATIVE_PROCESS_DIED": "The native model runtime process stopped unexpectedly.",
+    "RUNTIME_ADAPTER_UNSUPPORTED": "This Android build does not implement a runtime adapter for this model.",
+    "RUNTIME_VALIDATION_PENDING": "The model has not finished runtime validation on the phone yet.",
+}
 
 
 def detect_troubleshooting_intent(message: str) -> Optional[str]:
@@ -2900,47 +3125,62 @@ async def build_troubleshooting_reply(pool, user_id: str, device_id: str, area: 
             device_id, deployment["id"] if deployment else None,
         )
 
+    def _reply(response: str, error_code: str, last_stage: str, next_action: str) -> dict:
+        # New structured fields are additive: existing keys keep their exact
+        # prior meaning so current frontend clients are unaffected.
+        return {
+            "response": response,
+            "action": None,
+            "operation": f"troubleshoot_{area}",
+            "search_results": [],
+            "error_code": error_code,
+            "troubleshooting": {
+                "failure_domain": area,
+                "model_id": deployment["hf_model_id"] if deployment else None,
+                "deployment_id": str(deployment["id"]) if deployment else None,
+                "adapter_id": (deployment["adapter_id"] if deployment else None) or (event["adapter_id"] if event else None),
+                "error_code": error_code,
+                "last_successful_stage": last_stage,
+                "next_action": next_action,
+            },
+        }
+
     if event and event["error_code"]:
         model_name = deployment["model_name"] if deployment else "the selected model"
-        return {
-            "response": (
-                f"The latest {area} failure is {event['error_code']} while "
-                f"{event['operation'] or event['event_type']} ran for {model_name}. "
-                f"{event['error_detail'] or 'Retry the same action once so the phone can send a fresh runtime event.'}"
-            ),
-            "action": None,
-            "search_results": [],
-            "error_code": event["error_code"],
-        }
+        detail = (
+            event["error_detail"]
+            or ERROR_CODE_EXPLANATIONS.get(event["error_code"])
+            or "Retry the same action once so the phone can send a fresh runtime event."
+        )
+        return _reply(
+            f"The latest {area} failure is {event['error_code']} while "
+            f"{event['operation'] or event['event_type']} ran for {model_name}. {detail}",
+            event["error_code"], event["event_type"], "retry_same_action",
+        )
     if deployment and deployment["failure_code"]:
-        return {
-            "response": (
-                f"The latest deployment failed with {deployment['failure_code']}: "
-                f"{deployment['failure_details'] or deployment['error_message'] or 'no further detail was reported'}."
-            ),
-            "action": None,
-            "search_results": [],
-            "error_code": deployment["failure_code"],
-        }
+        detail = (
+            deployment["failure_details"]
+            or deployment["error_message"]
+            or ERROR_CODE_EXPLANATIONS.get(deployment["failure_code"])
+            or "no further detail was reported"
+        )
+        return _reply(
+            f"The latest deployment failed with {deployment['failure_code']}: {detail}.",
+            deployment["failure_code"], "deployment_failed", "remove_and_redeploy_supported_bundle",
+        )
     if deployment and deployment["status"] in ("queued", "downloading", "downloaded", "validating"):
-        return {
-            "response": (
-                f"The model is currently {deployment['status']}, not runtime-ready yet. "
-                "Open the LokiAI phone app and retry the same action once so it can send the validation or smoke-test result."
-            ),
-            "action": None,
-            "search_results": [],
-            "error_code": "RUNTIME_VALIDATION_PENDING",
-        }
-    return {
-        "response": (
-            f"I do not yet have a structured {area} runtime error from the phone. "
-            "Retry that exact action once in the Android app so LokiAI can capture the validation, initialization, or inference event."
-        ),
-        "action": None,
-        "search_results": [],
-        "error_code": "RUNTIME_TELEMETRY_MISSING",
-    }
+        return _reply(
+            f"The model is currently {deployment['status']}, not runtime-ready yet. "
+            "Open the LokiAI phone app and retry the same action once so it can send the validation or smoke-test result.",
+            "RUNTIME_VALIDATION_PENDING", deployment["status"], "wait_for_runtime_validation",
+        )
+    return _reply(
+        f"I do not yet have a structured {area} runtime error from the phone. "
+        "Retry that exact action once in the Android app so LokiAI can capture the validation, initialization, or inference event.",
+        "RUNTIME_TELEMETRY_MISSING",
+        deployment["status"] if deployment else None,
+        "retry_action_to_capture_telemetry",
+    )
 
 
 def expand_vision_siblings(capabilities: list) -> list:
@@ -3119,8 +3359,17 @@ async def search_deployable_models(
             continue
         if size_mb < hard_constraints.get("min_size_mb", 0):
             continue
+        constraint_max_size = hard_constraints.get("max_size_mb")
+        if constraint_max_size and size_mb > constraint_max_size:
+            continue
         if not _filename_matches_parameter_constraint(
             fname, m["id"], hard_constraints.get("parameter_b")
+        ):
+            continue
+        if not _filename_matches_parameter_range(
+            fname, m["id"],
+            hard_constraints.get("min_parameter_b"),
+            hard_constraints.get("max_parameter_b"),
         ):
             continue
         # Second gate, now that the real size is known. A .gguf that is under
@@ -3405,7 +3654,37 @@ _DETERMINISTIC_GREETING = (
 )
 
 VALID_TASKS = ["object-detection", "image-classification", "text-generation",
-               "audio-classification", "automatic-speech-recognition"]
+               "audio-classification", "automatic-speech-recognition",
+               "keyword-spotting", "voice-activity-detection"]
+
+# "Voice model" is not a capability by itself — it's at least four different
+# runtime adapters (transcription, wake-word/keyword detection, activity
+# detection, general sound classification), and confusing them is bug #7
+# from the audit: a wake-word request answered with a YAMNet sound
+# classifier is not a match, it's a different task wearing the same label.
+_VOICE_DISAMBIGUATION_RE = re.compile(
+    r"transcri|speech.{0,3}to.{0,3}text|dictat|wake.?word|hot.?word|"
+    r"keyword.?spot|activity.?detect|voice.?activity|"
+    r"(?:is\s+(?:someone|anyone|there)\s+(?:talking|speaking))|"
+    r"classify.{0,15}sound|identify.{0,15}sound|recogni[sz]e.{0,15}sound|"
+    r"environment(?:al)?.{0,15}sound|sound.?classif|what.{0,10}sound|"
+    r"kind of sound|type of sound",
+    re.IGNORECASE,
+)
+_GENERIC_VOICE_TERM_RE = re.compile(
+    r"\bvoice model\b|\bsound model\b|\baudio model\b|\bvoice ai\b",
+    re.IGNORECASE,
+)
+
+
+def voice_request_needs_clarification(message: str) -> bool:
+    """True when the message asks for a voice/sound/audio model in generic
+    terms without saying whether it means speech-to-text, wake-word/keyword
+    detection, voice-activity detection, or general sound classification."""
+    msg = message or ""
+    if not _GENERIC_VOICE_TERM_RE.search(msg):
+        return False
+    return not _VOICE_DISAMBIGUATION_RE.search(msg)
 
 # The Android runtime currently runs sound classification TFLite models, but
 # not multi-file speech-to-text stacks such as Whisper or Moonshine. Keeping
@@ -3431,7 +3710,11 @@ Map the message to every applicable task type from this fixed list:
 - image-classification — labeling/identifying/recognizing what's in a photo or camera frame ("classify", "recognize", "identify", "is there a cat in this photo")
 - text-generation — any chatbot, chat, assistant, or conversational text model the user wants ON their phone ("give me a chatbot", "I want to talk to an AI", "offline assistant", "something to chat with")
 - automatic-speech-recognition — transcribing spoken audio to text ("transcribe", "speech to text", "voice notes", "dictation")
-- audio-classification — identifying/classifying non-speech sounds ("what sound is that", "classify sounds", "identify noises")
+- audio-classification — identifying/classifying non-speech environmental sounds ("what sound is that", "classify sounds", "identify noises", "environment sound recognition")
+- keyword-spotting — detecting one specific spoken wake word/hotword ("wake word", "hotword", "keyword detection", "listen for a specific word")
+- voice-activity-detection — detecting only whether speech is present, not what it says ("is someone talking", "detect voice activity", "know when speech starts")
+
+These four are frequently confused by users saying only "voice model", "sound model", or "audio model" with no further detail — do not guess between them. If the message names one of the distinguishing phrases above, use that capability. If it only says "voice"/"sound"/"audio" model with nothing else, still classify with your best guess (the backend runs a separate deterministic check for genuinely ambiguous phrasing and asks the user directly when needed — your job is single-message classification, not the disambiguation policy).
 
 If the user explicitly asks about a specific HuggingFace model by its repository ID (e.g., "prithivMLmods/Fire-Detection-Siglip2" or a huggingface.co link), extract that ID as `explicit_model`.
 If the message is a greeting, thanks, small talk, or a question about LokiAI itself — anything that is NOT a request for a device capability — tasks is an empty array.
@@ -4465,6 +4748,97 @@ def _previous_plan_from_history(history: list) -> list:
     return []
 
 
+_MAX_TRACKED_CANDIDATE_IDS = 200
+_RETRY_INTENT_RE = re.compile(r"\bretry\b|\btry (?:it |that |this )?again\b|\bonce more\b|\bre-?deploy\b", re.IGNORECASE)
+
+
+def is_retry_requested(message: str) -> bool:
+    return bool(_RETRY_INTENT_RE.search(message or ""))
+
+
+async def _load_search_state(pool, conversation_id) -> Dict[str, Any]:
+    """Explicit per-conversation state — not re-derived from raw history on
+    every turn. Missing/corrupt state is treated as a fresh conversation
+    rather than failing the turn."""
+    if not conversation_id:
+        return {}
+    try:
+        async with pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT search_state FROM conversations WHERE id = $1::uuid",
+                conversation_id,
+            )
+        if not raw:
+            return {}
+        return json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (asyncpg.PostgresError, ValueError, TypeError):
+        return {}
+
+
+async def _save_search_state(pool, conversation_id, state: Dict[str, Any]) -> None:
+    if not conversation_id:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE conversations SET search_state = $2::jsonb WHERE id = $1::uuid",
+                conversation_id, json.dumps(state),
+            )
+    except (asyncpg.PostgresError, ValueError, TypeError):
+        pass
+
+
+def _apply_task_change_to_state(state: Dict[str, Any], new_capability: Optional[str]) -> Dict[str, Any]:
+    """Clears obsolete task-specific state when the requested capability
+    changes ("I want large models for chat" after an object-detection
+    conversation must not keep applying detection-era exclusions/
+    constraints), while cross-task memory — what failed on this device,
+    what's already deployed — survives the switch."""
+    if not new_capability:
+        return state
+    if state.get("active_capability") == new_capability:
+        return state
+    return {
+        "active_capability": new_capability,
+        "hard_constraints": {},
+        "shown_candidate_ids": [],
+        "rejected_candidate_ids": [],
+        "search_cursor": 0,
+        "last_operation": state.get("last_operation"),
+        "failed_candidate_keys": state.get("failed_candidate_keys", []),
+        "deployed_candidate_ids": state.get("deployed_candidate_ids", []),
+    }
+
+
+def _record_shown_candidates(state: Dict[str, Any], candidate_ids: list) -> Dict[str, Any]:
+    shown = list(state.get("shown_candidate_ids") or [])
+    for cid in candidate_ids:
+        if cid and cid not in shown:
+            shown.append(cid)
+    state["shown_candidate_ids"] = shown[-_MAX_TRACKED_CANDIDATE_IDS:]
+    return state
+
+
+async def _recently_failed_model_ids(pool, device_id: str, limit: int = 30) -> set:
+    """HuggingFace model ids that failed on THIS exact device recently, so
+    they are not silently re-recommended as if nothing had happened."""
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT DISTINCT m.hf_model_id
+                   FROM deployments d
+                   JOIN models m ON m.id = d.model_id
+                   WHERE d.device_id = $1::uuid AND d.status = 'failed'
+                     AND m.hf_model_id IS NOT NULL
+                   ORDER BY m.hf_model_id
+                   LIMIT $2""",
+                device_id, limit,
+            )
+        return {r["hf_model_id"] for r in rows}
+    except (asyncpg.PostgresError, ValueError):
+        return set()
+
+
 def _drop_repeated_model_lines(prose: str) -> str:
     """Remove numbered items that name a model already named earlier.
 
@@ -5046,6 +5420,17 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
 
     device = dict(device_row)
     max_size_mb = device_artifact_size_budget_mb(device)
+    # Deterministic, not NIM-dependent: "greater than 2 GB", "7B", "between
+    # 3B and 8B" are enforced in Python against every candidate, and any
+    # empty result honestly names the constraint that eliminated everything
+    # rather than falling back to "nothing fits your phone."
+    hard_constraints = extract_hard_constraints(req.message)
+    # Explicit, persisted per-conversation state (not re-derived from raw
+    # history every turn): what capability is active, what's already been
+    # shown, what failed, what's deployed.
+    search_state = await _load_search_state(pool, conversation_id)
+    retry_requested = is_retry_requested(req.message)
+    failed_model_ids = await _recently_failed_model_ids(pool, req.device_id)
 
     troubleshooting_area = detect_troubleshooting_intent(req.message)
     if troubleshooting_area:
@@ -5235,10 +5620,48 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
 
     planned_tasks = [t["capability"] for t in plan]
 
+    if planned_tasks:
+        search_state = _apply_task_change_to_state(search_state, planned_tasks[0])
+        search_state["last_operation"] = "search_for_model"
+        await _save_search_state(pool, conversation_id, search_state)
+
+    # Four different audio-family capabilities (transcription, wake-word
+    # detection, voice-activity detection, general sound classification) are
+    # all commonly described as just "a voice model." Silently picking one
+    # is how a wake-word request previously got answered with a YAMNet sound
+    # classifier — ask once, deterministically, instead of guessing.
+    if (
+        any(t in ("audio-classification", "automatic-speech-recognition",
+                   "keyword-spotting", "voice-activity-detection")
+            for t in planned_tasks)
+        and voice_request_needs_clarification(req.message)
+    ):
+        return {
+            "response": "Do you want speech-to-text (transcription), wake-word/keyword "
+                        "detection, voice-activity detection (just knowing when someone "
+                        "is speaking), or general sound classification (identifying what "
+                        "kind of sound it is)?",
+            "action": None,
+            "search_results": [],
+            "error_code": None,
+        }
+
     # If they gave a specific model link, we proceed even if task is None.
     if planned_tasks and not any(t in RUNTIME_SUPPORTED_TASKS for t in planned_tasks) and not explicit_model:
+        unsupported = next((t for t in planned_tasks if t not in RUNTIME_SUPPORTED_TASKS), planned_tasks[0])
+        unsupported_explanations = {
+            "automatic-speech-recognition": "speech-to-text models such as Whisper or Moonshine",
+            "keyword-spotting": "wake-word/keyword-spotting models — this needs a matched "
+                                 "frontend-plus-classification-head artifact pair the Android "
+                                 "runtime does not yet implement",
+            "voice-activity-detection": "voice-activity-detection models",
+        }
+        detail = unsupported_explanations.get(unsupported, f"{unsupported} models")
         return {
-            "response": "LokiAI can currently run on-device sound classification, but its Android runtime does not yet support speech-to-text models such as Whisper or Moonshine. I won't recommend a file that the phone cannot initialise.",
+            "response": f"LokiAI can currently run on-device sound classification, image "
+                        f"classification, object detection, and chat, but its Android "
+                        f"runtime does not yet support {detail}. I won't recommend a file "
+                        f"that the phone cannot initialise.",
             "action": None,
             "search_results": [],
             "error_code": "RUNTIME_UNSUPPORTED_TASK",
@@ -5287,6 +5710,14 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
                 limit=max(12, task["quantity"] * 6),
             )
             found = _apply_task_constraints(found, task["constraints"])
+            # Repetition/failure exclusion: a candidate already shown in this
+            # conversation, or that failed on this exact device, is dropped
+            # rather than re-offered as if nothing had happened. A genuinely
+            # exhausted pool returns fewer results, never duplicates.
+            shown_ids = set(search_state.get("shown_candidate_ids") or [])
+            found = [m for m in found if m["id"] not in shown_ids]
+            if not retry_requested:
+                found = [m for m in found if m["id"] not in failed_model_ids]
             ceiling = size_ceiling_for(preference, max_size_mb)
             within = [m for m in found
                       if (m.get("size_mb") or 0) <= ceiling] if preference in (
@@ -5337,11 +5768,23 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
                     })
                     models_data.extend(picked)
                 else:
+                    constraint_desc = describe_hard_constraints(hard_constraints)
+                    if constraint_desc:
+                        message = (
+                            f"I could not find a runtime-compatible {capability} "
+                            f"model that satisfies {constraint_desc} on this "
+                            f"device. I have not included a smaller or larger "
+                            f"alternative because you requested that specifically."
+                        )
+                    else:
+                        message = (
+                            f"Nothing deployable for {capability} fits "
+                            f"this phone's {max_size_mb:.0f} MB budget."
+                        )
                     task_failures.append({
                         "capability": capability,
                         "error_code": "NO_DEPLOYABLE_MODEL",
-                        "message": f"Nothing deployable for {capability} fits "
-                                   f"this phone's {max_size_mb:.0f} MB budget.",
+                        "message": message,
                     })
 
         # A user naming a specific repo bypasses keyword search entirely. The
@@ -5434,6 +5877,12 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
         await _describe_models(
             pool, client, models_data, device, max_size_mb, verified=verified
         )
+    # A separate, per-request field — never baked into the cached description
+    # text, which is shared across devices. Only ever true here when the user
+    # explicitly asked to retry (otherwise these candidates were excluded
+    # above), so a retried candidate is still honestly labeled.
+    for model in models_data:
+        model["previously_failed_on_device"] = model["id"] in failed_model_ids
 
     # ── Step 6: the selection is the backend's; only the wording is generated ──
     # The candidate set and its order are already decided from verified data.
@@ -5452,6 +5901,8 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
             seen_result_ids.add(model["id"])
             validated.append(model)
     validated = validated[:MAX_RENDERED_CANDIDATES]
+    overall_preference = plan[0].get("size_preference", "any") if plan else "any"
+    attach_ranking_evidence(validated, overall_preference)
 
     requirements = plan or [{
         "capability": validated[0].get("task") or "text-generation",
@@ -5466,11 +5917,23 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
     if task_failures:
         prose += " " + " ".join(f["message"] for f in task_failures)
 
+    search_state = _record_shown_candidates(search_state, [m["id"] for m in validated])
+    await _save_search_state(pool, conversation_id, search_state)
+
+    # Additive structured metadata (Part 11): every field an existing client
+    # already reads (response/action/search_results/grouped_results/
+    # task_failures/error_code) keeps its exact prior meaning; these are new
+    # keys only, so old clients that ignore unknown fields are unaffected.
     return {"response": prose,
             "action": "search_models",
+            "operation": "search_for_model",
             "search_results": validated,
             "grouped_results": grouped,
             "task_failures": task_failures,
+            "constraints_applied": hard_constraints,
+            "excluded_result_count": len(search_state.get("shown_candidate_ids", [])) - len(validated)
+            if search_state.get("shown_candidate_ids") else 0,
+            "troubleshooting": None,
             "error_code": error_code}
 
 
