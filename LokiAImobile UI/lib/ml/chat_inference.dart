@@ -30,6 +30,7 @@ class ChatInference {
   ChatRuntimeState _state = ChatRuntimeState.uninitialized;
   ChatRuntimeState get state => _state;
   bool get isReady => _state == ChatRuntimeState.ready;
+  String? get failureMessage => _failure;
 
   double? _contextId;
   String? _modelPath;
@@ -113,7 +114,9 @@ class ChatInference {
 
     if (await ModelGuard.isQuarantined(path)) {
       return _fail(
-        'This model was quarantined after a native loading crash. Deploy a different model.',
+        'This model crashed LokiAI on two separate attempts to load it, so '
+        "it has been disabled. Deploy a different model, or redeploy this "
+        'one if you believe the file has changed.',
       );
     }
     final rejection = await ModelGuard.validateGguf(path);
@@ -133,7 +136,7 @@ class ChatInference {
         useMlock: false,
         useMmap: true,
       );
-      await ModelGuard.endLoad();
+      await ModelGuard.endLoad(path);
       final id = result?['contextId'];
       if (_epoch != epoch || _state != ChatRuntimeState.loading) {
         if (id is num) await Fllama.instance()!.releaseContext(id.toDouble());
@@ -145,7 +148,7 @@ class ChatInference {
       _state = ChatRuntimeState.ready;
       _log('load', 'ready');
     } catch (error, stackTrace) {
-      await ModelGuard.endLoad();
+      await ModelGuard.endLoad(path);
       _record('load', error, stackTrace);
       _fail(
         'This chat model is not ready on this device yet. Select another downloaded chat model or redeploy it from the dashboard.',

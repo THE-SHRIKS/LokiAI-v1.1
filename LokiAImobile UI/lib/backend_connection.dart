@@ -317,7 +317,7 @@ class BackendConnection {
         'deployment_id': cfg?.deploymentId,
         'model_name': cfg?.modelName,
         'inference_mode': cfg?.inferenceMode,
-        'status': cfg == null ? 'none' : 'complete',
+        'status': cfg == null ? 'none' : 'downloaded',
         // Distinguishes "nothing deployed" from "a deployment exists but its
         // config is unreadable", so the backend does not silently treat a
         // broken install as a clean one.

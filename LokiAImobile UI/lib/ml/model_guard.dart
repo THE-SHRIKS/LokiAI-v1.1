@@ -31,9 +31,15 @@ class ModelRejection {
 ///     chat model.
 ///  2. [beginLoad] / [endLoad] wrap the native call in a persisted marker. If
 ///     the process dies inside native code the marker survives, and the next
-///     launch quarantines that exact file instead of loading it again. A bad
-///     model can therefore take the app down at most once, and can never make
-///     it impossible to reopen.
+///     launch records a strike against that exact file. One interruption is
+///     not proof of a bad model — Android can kill the process for unrelated
+///     reasons (OOM, update, force-stop) — so a single strike only marks the
+///     file "temporarily failed" and a retry is still allowed. A SECOND
+///     consecutive interruption of the same file, with no successful load in
+///     between, quarantines it: [isQuarantined] then refuses to hand it to
+///     native code again until [clearQuarantine] is called (e.g. after a
+///     fresh re-deploy). A bad model can therefore take the app down at most
+///     twice, never more, and is never impossible to reopen.
 class ModelGuard {
   ModelGuard._();
 
@@ -51,6 +57,7 @@ class ModelGuard {
 
   static const String _pendingKey = 'loki_model_load_pending_v1';
   static const String _quarantineKey = 'loki_model_quarantine_v1';
+  static const String _healthKey = 'loki_model_health_v2';
 
   static bool isShard(String path) => _shardPattern.hasMatch(path);
 
@@ -187,6 +194,60 @@ class ModelGuard {
     return null;
   }
 
+  /// Validates the subset of TFLite vision models this app can safely hand to
+  /// the bundled TensorFlow Lite runtime. Exact tensor contracts are checked by
+  /// VisionEngine when the interpreter opens; this gate prevents obvious
+  /// corrupt/unsupported artifacts from becoming "ready" after download.
+  static Future<ModelRejection?> validateVisionTflite(String path) async {
+    final file = File(path);
+    final lowerPath = path.toLowerCase();
+    if (lowerPath.contains('coral') ||
+        lowerPath.contains('edgetpu') ||
+        lowerPath.contains('edge_tpu') ||
+        lowerPath.contains('edge-tpu')) {
+      return const ModelRejection(
+        'VISION_MODEL_REQUIRES_EDGE_TPU',
+        'This vision model requires Coral Edge TPU hardware. Deploy a standard CPU TFLite model instead.',
+      );
+    }
+    if (!await file.exists()) {
+      return const ModelRejection(
+        'VISION_MODEL_FILE_MISSING',
+        'The deployed vision model file is missing. Re-deploy it from the dashboard.',
+      );
+    }
+    try {
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in file.openRead(0, 128 * 1024)) {
+        builder.add(chunk);
+      }
+      final bytes = builder.toBytes();
+      if (bytes.length < 8 ||
+          bytes[4] != 0x54 ||
+          bytes[5] != 0x46 ||
+          bytes[6] != 0x4c ||
+          bytes[7] != 0x33) {
+        return const ModelRejection(
+          'VISION_MODEL_NOT_TFLITE',
+          'The deployed vision file is not a valid TFLite model. Re-deploy it from the dashboard.',
+        );
+      }
+      if (_containsAsciiIgnoreCase(bytes, 'edgetpu') ||
+          _containsAsciiIgnoreCase(bytes, 'coral')) {
+        return const ModelRejection(
+          'VISION_MODEL_REQUIRES_EDGE_TPU',
+          'This vision model requires Coral Edge TPU hardware. Deploy a standard CPU TFLite model instead.',
+        );
+      }
+    } catch (e) {
+      return ModelRejection(
+        'VISION_MODEL_UNREADABLE',
+        'The deployed vision model could not be inspected ($e). Re-deploy it.',
+      );
+    }
+    return null;
+  }
+
   static bool _hasGgufMagic(Uint8List header) =>
       header.length >= 4 &&
       header[0] == 0x47 && // G
@@ -220,33 +281,77 @@ class ModelGuard {
     return false;
   }
 
-  /// True when [path] previously killed the process during a native load.
-  static Future<bool> isQuarantined(String path) async {
+  static const String _healthStatusQuarantined = 'quarantined';
+  static const String _healthStatusTemporarilyFailed = 'temporarily_failed';
+
+  /// The current health entry for [path], or null when it has none.
+  static Future<_HealthEntry?> _healthFor(String path) async {
     final prefs = await SharedPreferences.getInstance();
-    return (prefs.getStringList(_quarantineKey) ?? const []).contains(path);
+    final health = prefs.getStringList(_healthKey) ?? const <String>[];
+    for (final entry in health) {
+      final parts = entry.split('|');
+      if (parts.length >= 2 && parts[0] == path) {
+        return _HealthEntry(path, parts[1], parts.length > 2 ? parts[2] : '');
+      }
+    }
+    return null;
   }
 
-  /// Called once at startup. If a load marker survived, the process died
-  /// inside native code loading that file, so it is quarantined permanently.
-  /// Returns the quarantined path when a crash was detected.
+  static Future<void> _setHealth(String path, String status, String reason) async {
+    final prefs = await SharedPreferences.getInstance();
+    final health = prefs.getStringList(_healthKey) ?? <String>[];
+    health.removeWhere((entry) => entry.startsWith('$path|'));
+    health.add('$path|$status|$reason');
+    await prefs.setStringList(_healthKey, health);
+  }
+
+  /// True when [path] crashed the process on two consecutive load attempts
+  /// with no successful load in between. Native code must never be handed a
+  /// quarantined file again until [clearQuarantine] runs.
+  static Future<bool> isQuarantined(String path) async {
+    if (path.isEmpty) return false;
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.containsKey(_quarantineKey)) {
+      // Migrate away the old permanent-on-first-crash key; the new
+      // strike-based health entries are the only source of truth below.
+      await prefs.remove(_quarantineKey);
+    }
+    final entry = await _healthFor(path);
+    return entry?.status == _healthStatusQuarantined;
+  }
+
+  /// Called once at startup. A surviving load marker means the previous run
+  /// ended while a native load was in progress. One interruption alone is not
+  /// proof of model corruption (the process can die for unrelated reasons),
+  /// so the first strike only records `temporarily_failed` and a retry is
+  /// still allowed. A second consecutive interruption of the same file
+  /// escalates it to `quarantined`. Returns the path a marker was found for,
+  /// regardless of which state it lands in — callers should check
+  /// [isQuarantined] afterward to know whether a retry is still allowed.
   static Future<String?> recoverFromNativeCrash() async {
     final prefs = await SharedPreferences.getInstance();
     final pending = prefs.getString(_pendingKey);
     if (pending == null || pending.isEmpty) return null;
 
-    final quarantined = prefs.getStringList(_quarantineKey) ?? <String>[];
-    if (!quarantined.contains(pending)) {
-      quarantined.add(pending);
-      await prefs.setStringList(_quarantineKey, quarantined);
-    }
+    final previous = await _healthFor(pending);
+    final alreadyFailedOnce = previous?.status == _healthStatusTemporarilyFailed;
+    final nextStatus = alreadyFailedOnce
+        ? _healthStatusQuarantined
+        : _healthStatusTemporarilyFailed;
+    await _setHealth(pending, nextStatus, 'interrupted_load');
+    await prefs.remove(_quarantineKey);
     await prefs.remove(_pendingKey);
 
     Diagnostics.capture(
-      feature: 'model.native_crash_recovered',
-      error: 'Process died loading $pending; it is now quarantined.',
+      feature: nextStatus == _healthStatusQuarantined
+          ? 'model.quarantined_after_repeated_crash'
+          : 'model.interrupted_load_recovered',
+      error: nextStatus == _healthStatusQuarantined
+          ? 'Process died loading $pending on two consecutive attempts; it is now quarantined.'
+          : 'Previous run ended while loading $pending; marked temporarily_failed pending revalidation.',
       fatalToProcess: true,
     );
-    debugPrint('MODEL: quarantined after native crash: $pending');
+    debugPrint('MODEL: recoverFromNativeCrash $pending -> $nextStatus');
     return pending;
   }
 
@@ -256,16 +361,42 @@ class ModelGuard {
     await prefs.setString(_pendingKey, path);
   }
 
-  /// Clears the marker after the native load returned control to Dart.
-  static Future<void> endLoad() async {
+  /// Clears the marker and resets the strike count after a native load
+  /// returned control to Dart — proof this file is not what killed the
+  /// process last time.
+  static Future<void> endLoad(String path) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_pendingKey);
+    final health = prefs.getStringList(_healthKey);
+    if (health == null) return;
+    final filtered = health.where((entry) => !entry.startsWith('$path|')).toList();
+    if (filtered.length != health.length) {
+      await prefs.setStringList(_healthKey, filtered);
+    }
   }
 
   /// Lets a user retry a model they believe is now fine (e.g. re-downloaded).
-  static Future<void> clearQuarantine() async {
+  /// Clears every tracked file's health when [path] is omitted.
+  static Future<void> clearQuarantine([String? path]) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_quarantineKey);
     await prefs.remove(_pendingKey);
+    if (path == null) {
+      await prefs.remove(_healthKey);
+      return;
+    }
+    final health = prefs.getStringList(_healthKey);
+    if (health == null) return;
+    final filtered = health.where((entry) => !entry.startsWith('$path|')).toList();
+    if (filtered.length != health.length) {
+      await prefs.setStringList(_healthKey, filtered);
+    }
   }
+}
+
+class _HealthEntry {
+  final String path;
+  final String status;
+  final String reason;
+  const _HealthEntry(this.path, this.status, this.reason);
 }

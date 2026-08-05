@@ -429,14 +429,21 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
     // explanation.
     final crashedModel = await ModelGuard.recoverFromNativeCrash();
     if (crashedModel != null && mounted) {
+      // A single interruption is not disabled — it's one strike, and the
+      // model may load fine this time. Only say "disabled" when it actually
+      // is: two consecutive interruptions with no successful load between.
+      final disabled = await ModelGuard.isQuarantined(crashedModel);
       setState(() {
         _messages.add(
           ChatMessage(
-            text:
-                'The last model closed LokiAI while it was loading, so it '
-                'has been disabled. Deploy a different chat model from the '
-                'dashboard - a single-file .gguf under about 1 GB works best '
-                'on this phone.',
+            text: disabled
+                ? 'The last model closed LokiAI while loading on two separate '
+                      'attempts, so it has been disabled. Deploy a different '
+                      'chat model from the dashboard - a single-file .gguf '
+                      'under about 1 GB works best on this phone.'
+                : 'The last model closed LokiAI while it was loading. '
+                      'Retrying it once — if this happens again it will be '
+                      'disabled automatically.',
             role: MessageRole.ai,
           ),
         );

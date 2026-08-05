@@ -164,12 +164,12 @@ void main() {
     );
   });
 
-  group('native crash quarantine', () {
+  group('native interrupted load recovery', () {
     test('a clean start quarantines nothing', () async {
       expect(await ModelGuard.recoverFromNativeCrash(), isNull);
     });
 
-    test('a load that never ended is quarantined on the next start', () async {
+    test('a single interruption is a strike, not a quarantine', () async {
       const path = '/data/models/killer.gguf';
       // Simulates the process dying inside native code: beginLoad ran, endLoad
       // never did, because llama.cpp aborted the process.
@@ -178,44 +178,90 @@ void main() {
       final recovered = await ModelGuard.recoverFromNativeCrash();
 
       expect(recovered, path);
-      expect(await ModelGuard.isQuarantined(path), isTrue);
-      // The crash is recorded, not silently swallowed.
+      // One interruption alone must not disable the file — Android can kill
+      // the process for reasons that have nothing to do with the model.
+      expect(await ModelGuard.isQuarantined(path), isFalse);
       expect(
         Diagnostics.recent.map((r) => r.feature),
-        contains('model.native_crash_recovered'),
+        contains('model.interrupted_load_recovered'),
       );
     });
+
+    test(
+      'a second consecutive interruption of the same file quarantines it',
+      () async {
+        const path = '/data/models/killer.gguf';
+        await ModelGuard.beginLoad(path);
+        await ModelGuard.recoverFromNativeCrash(); // strike 1: temporarily_failed
+        expect(await ModelGuard.isQuarantined(path), isFalse);
+
+        // Second launch attempts the same file again and it dies again.
+        await ModelGuard.beginLoad(path);
+        final recovered = await ModelGuard.recoverFromNativeCrash();
+
+        expect(recovered, path);
+        expect(await ModelGuard.isQuarantined(path), isTrue);
+        expect(
+          Diagnostics.recent.map((r) => r.feature),
+          contains('model.quarantined_after_repeated_crash'),
+        );
+      },
+    );
 
     test('a completed load leaves no marker behind', () async {
       const path = '/data/models/fine.gguf';
       await ModelGuard.beginLoad(path);
-      await ModelGuard.endLoad();
+      await ModelGuard.endLoad(path);
 
       expect(await ModelGuard.recoverFromNativeCrash(), isNull);
       expect(await ModelGuard.isQuarantined(path), isFalse);
     });
+
+    test(
+      'a successful load between two interruptions resets the strike count',
+      () async {
+        const path = '/data/models/flaky.gguf';
+        await ModelGuard.beginLoad(path);
+        await ModelGuard.recoverFromNativeCrash(); // strike 1
+        expect(await ModelGuard.isQuarantined(path), isFalse);
+
+        // This launch's load actually succeeds.
+        await ModelGuard.beginLoad(path);
+        await ModelGuard.endLoad(path);
+        expect(await ModelGuard.recoverFromNativeCrash(), isNull);
+
+        // A third, later interruption is a fresh first strike, not quarantine.
+        await ModelGuard.beginLoad(path);
+        await ModelGuard.recoverFromNativeCrash();
+        expect(await ModelGuard.isQuarantined(path), isFalse);
+      },
+    );
 
     test('recovery is idempotent across repeated launches', () async {
       const path = '/data/models/killer.gguf';
       await ModelGuard.beginLoad(path);
 
       expect(await ModelGuard.recoverFromNativeCrash(), path);
-      // Second launch: still quarantined, but no longer reported as a new crash.
+      // Second launch: no stale marker remains, so no new recovery is reported.
       expect(await ModelGuard.recoverFromNativeCrash(), isNull);
-      expect(await ModelGuard.isQuarantined(path), isTrue);
+      expect(await ModelGuard.isQuarantined(path), isFalse);
     });
 
     test('quarantine can be cleared for a re-downloaded model', () async {
       const path = '/data/models/killer.gguf';
       await ModelGuard.beginLoad(path);
       await ModelGuard.recoverFromNativeCrash();
+      await ModelGuard.beginLoad(path);
+      await ModelGuard.recoverFromNativeCrash();
       expect(await ModelGuard.isQuarantined(path), isTrue);
 
-      await ModelGuard.clearQuarantine();
+      await ModelGuard.clearQuarantine(path);
       expect(await ModelGuard.isQuarantined(path), isFalse);
     });
 
     test('quarantine is per-file, not global', () async {
+      await ModelGuard.beginLoad('/data/models/bad.gguf');
+      await ModelGuard.recoverFromNativeCrash();
       await ModelGuard.beginLoad('/data/models/bad.gguf');
       await ModelGuard.recoverFromNativeCrash();
 

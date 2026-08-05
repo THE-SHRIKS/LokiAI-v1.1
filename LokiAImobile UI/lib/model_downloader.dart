@@ -3,6 +3,10 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+
+import 'ml/chat_inference.dart';
+import 'ml/model_guard.dart';
 
 /// Downloads deployed models straight from the HuggingFace CDN into the
 /// app's internal storage, verifies SHA-256, reports progress over the
@@ -123,9 +127,45 @@ class ModelDownloader {
         await _recordInstalledModel(savedConfig);
         send({
           'deployment_id': deploymentId,
+          'status': 'downloaded',
+          'progress_percent': 100,
+          'error_message': null,
+          'downloaded_bytes': saved.bytes,
+          'sha256': saved.sha256,
+          'model_path': saved.path,
+        });
+        send({
+          'deployment_id': deploymentId,
+          'status': 'validating',
+          'progress_percent': 100,
+          'error_message': null,
+        });
+        final validation = await _validateRuntimeArtifact(
+          saved.path,
+          savedConfig,
+          data,
+        );
+        send(validation.runtimeEvent);
+        if (!validation.success) {
+          send({
+            'deployment_id': deploymentId,
+            'status': 'failed',
+            'progress_percent': 100,
+            'error_message': validation.errorDetail,
+            'error_code': validation.errorCode,
+            'error_detail': validation.errorDetail,
+          });
+          return;
+        }
+        send({
+          'deployment_id': deploymentId,
           'status': 'complete',
           'progress_percent': 100,
           'error_message': null,
+          'runtime_verified': true,
+          'smoke_test_success': true,
+          'validation_result': validation.runtimeEvent,
+          'smoke_test_result': validation.runtimeEvent,
           'downloaded_bytes': saved.bytes,
           'sha256': saved.sha256,
           'model_path': saved.path,
@@ -293,6 +333,9 @@ class ModelDownloader {
       'format': format,
       'confidence_threshold':
           (config['confidence_threshold'] as num?)?.toDouble() ?? 0.75,
+      'adapter_id': config['adapter_id'],
+      'adapter_version': config['adapter_version'],
+      'compatibility': config['compatibility'],
       'deployed_at': DateTime.now().toUtc().toIso8601String(),
       'deployment_id': deploymentId,
       'model_size_bytes': sizeBytes,
@@ -357,6 +400,186 @@ class ModelDownloader {
     }
     return null;
   }
+
+  static Future<_RuntimeValidationResult> _validateRuntimeArtifact(
+    String modelPath,
+    Map<String, dynamic> config,
+    Map<String, dynamic> instruction,
+  ) async {
+    final deploymentId = config['deployment_id'] as String? ?? '';
+    final adapterId =
+        (instruction['adapter_id'] as String?) ??
+        (config['adapter_id'] as String?) ??
+        ((config['format'] == 'gguf')
+            ? 'llama_cpp_gguf_chat_v1'
+            : 'unknown');
+    final adapterVersion =
+        (instruction['adapter_version'] as String?) ??
+        (config['adapter_version'] as String?) ??
+        '1';
+    final now = DateTime.now().toUtc().toIso8601String();
+    // Structural checks alone (extension/header/size) prove a file COULD be
+    // handed to native code, not that native code can run it. Every branch
+    // below performs an actual bounded native call — context+first-token for
+    // chat, interpreter+zero-tensor invoke for TFLite — before this
+    // deployment is ever reported to the backend as ready.
+    ModelRejection? rejection;
+    if (adapterId == 'llama_cpp_gguf_chat_v1') {
+      rejection = await _smokeTestChat(modelPath);
+    } else if (adapterId == 'tflite_yamnet_audio_v1') {
+      rejection =
+          await ModelGuard.validateAudioTflite(modelPath) ??
+          await _smokeTestTflite(modelPath, label: 'audio');
+    } else if (adapterId == 'tflite_imagenet_classifier_v1') {
+      rejection =
+          await ModelGuard.validateVisionTflite(modelPath) ??
+          await _smokeTestTflite(modelPath, label: 'vision');
+    } else {
+      rejection = ModelRejection(
+        'RUNTIME_ADAPTER_UNSUPPORTED',
+        'This Android build does not implement adapter $adapterId.',
+      );
+    }
+    final success = rejection == null;
+    final event = <String, dynamic>{
+      'type': 'runtime_event',
+      'event_id':
+          '$deploymentId:${success ? 'validation-ok' : 'validation-failed'}:${config['model_sha256'] ?? ''}',
+      'schema_version': 1,
+      'deployment_id': deploymentId,
+      'model_id': config['model_name'],
+      'adapter_id': adapterId,
+      'adapter_version': adapterVersion,
+      'runtime_version': 'lokiai_android_runtime_1',
+      'operation': 'deployment_validation',
+      'event_type': 'runtime_validation',
+      'success': success,
+      'error_code': rejection?.code,
+      'error_detail': rejection?.message,
+      'occurred_at': now,
+    };
+    return _RuntimeValidationResult(
+      success: success,
+      errorCode: rejection?.code,
+      errorDetail: rejection?.message,
+      runtimeEvent: event,
+    );
+  }
+}
+
+class _RuntimeValidationResult {
+  final bool success;
+  final String? errorCode;
+  final String? errorDetail;
+  final Map<String, dynamic> runtimeEvent;
+
+  const _RuntimeValidationResult({
+    required this.success,
+    required this.errorCode,
+    required this.errorDetail,
+    required this.runtimeEvent,
+  });
+}
+
+/// Loads the model into a throwaway [ChatInference] and drives its real,
+/// public load-then-generate path — context creation, then an actual bounded
+/// generation through the exact same `generateText` production code path a
+/// real chat message uses — before disposing it. Deliberately does not touch
+/// [ChatInference]'s private load internals: this is a second, independent
+/// caller of the one public API surface, not a parallel implementation that
+/// could drift from what real chat actually does.
+Future<ModelRejection?> _smokeTestChat(String modelPath) async {
+  final probe = ChatInference();
+  try {
+    await probe.initialize(modelPath);
+    if (!probe.isReady) {
+      return ModelRejection(
+        'CHAT_CONTEXT_CREATE_FAILED',
+        probe.failureMessage ?? 'The chat model failed a startup validation check.',
+      );
+    }
+    final tokens = <String>[];
+    try {
+      await probe
+          .generateText('Hi')
+          .timeout(
+            const Duration(seconds: 45),
+            onTimeout: (sink) => sink.close(),
+          )
+          .forEach(tokens.add);
+    } catch (e) {
+      return ModelRejection(
+        'CHAT_GENERATION_FAILED',
+        'This chat model loaded but failed a bounded smoke generation on '
+            'this device ($e).',
+      );
+    }
+    if (tokens.isEmpty) {
+      return ModelRejection(
+        'CHAT_GENERATION_FAILED',
+        'This chat model loaded but produced no output on a bounded smoke '
+            'generation.',
+      );
+    }
+    return null;
+  } finally {
+    await probe.dispose();
+  }
+}
+
+/// Opens a throwaway TFLite [Interpreter] and invokes it once on an
+/// all-zero input tensor shaped to the model's own declared shape/dtype.
+/// Proves the file is a real, loadable, invocable interpreter — not just a
+/// file with the right header — before it is ever reported as ready.
+Future<ModelRejection?> _smokeTestTflite(
+  String modelPath, {
+  required String label,
+}) async {
+  Interpreter? interpreter;
+  try {
+    interpreter = Interpreter.fromFile(File(modelPath));
+    interpreter.allocateTensors();
+    final inTensor = interpreter.getInputTensor(0);
+    final outTensor = interpreter.getOutputTensor(0);
+    if (inTensor.shape.any((d) => d <= 0) ||
+        outTensor.shape.any((d) => d <= 0)) {
+      return ModelRejection(
+        '${label.toUpperCase()}_TENSOR_CONTRACT_MISMATCH',
+        'This $label model has a dynamic or invalid tensor shape LokiAI '
+            'cannot bind to a fixed smoke test.',
+      );
+    }
+    // Matched by string, not enum member, on purpose: the same pattern the
+    // live vision isolate uses (see vision_engine.dart) to stay agnostic of
+    // exactly which TensorType values this plugin version exposes.
+    final quantizedIn = inTensor.type.toString().contains('int8');
+    final quantizedOut = outTensor.type.toString().contains('int8');
+    final input = _zeroBuffer(inTensor.shape, asInt: quantizedIn);
+    final output = _zeroBuffer(outTensor.shape, asInt: quantizedOut);
+    interpreter.run(input, output);
+    return null;
+  } catch (e) {
+    return ModelRejection(
+      '${label.toUpperCase()}_INFERENCE_FAILED',
+      'This $label model could not complete a bounded smoke inference on '
+          'this device ($e).',
+    );
+  } finally {
+    try {
+      interpreter?.close();
+    } catch (_) {}
+  }
+}
+
+/// Nested zero-filled buffer matching an arbitrary tensor shape, e.g. `[1,
+/// 224, 224, 3]` -> a 4-deep nested List. Mirrors the same shape-generic
+/// pattern the live vision isolate uses, so a smoke test that passes here
+/// exercises the identical tensor layout the real interpreter will see.
+dynamic _zeroBuffer(List<int> shape, {required bool asInt}) {
+  if (shape.length == 1) {
+    return asInt ? List<int>.filled(shape[0], 0) : List<double>.filled(shape[0], 0.0);
+  }
+  return List.generate(shape[0], (_) => _zeroBuffer(shape.sublist(1), asInt: asInt));
 }
 
 /// Incremental SHA-256 so huge model files never sit in memory twice.

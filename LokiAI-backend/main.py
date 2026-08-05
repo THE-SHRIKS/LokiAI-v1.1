@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, Depends, UploadFi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timezone, timedelta
 import asyncio
@@ -248,6 +248,58 @@ async def _run_migrations(pool: asyncpg.Pool):
             "CREATE INDEX IF NOT EXISTS chat_runs_active_idx "
             "ON chat_runs (status, created_at) "
             "WHERE status IN ('queued', 'routing', 'generating')"
+        )
+        # Runtime validation and telemetry. These are additive so existing
+        # deployments keep working, but new deployments only become successful
+        # when the phone reports `ready` after adapter validation/smoke test.
+        for statement in (
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS adapter_id TEXT",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS adapter_version TEXT",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS runtime_version TEXT",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS artifact_fingerprint TEXT",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS validation_result JSONB",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS initialization_result JSONB",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS smoke_test_result JSONB",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS failure_code TEXT",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS failure_details TEXT",
+        ):
+            await conn.execute(statement)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                event_id        TEXT PRIMARY KEY,
+                schema_version  INTEGER NOT NULL,
+                device_id       UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                deployment_id   UUID,
+                model_id        TEXT,
+                adapter_id      TEXT,
+                adapter_version TEXT,
+                runtime_epoch   TEXT,
+                request_id      TEXT,
+                operation       TEXT,
+                event_type      TEXT NOT NULL,
+                success         BOOLEAN,
+                error_code      TEXT,
+                error_detail    TEXT,
+                memory_snapshot JSONB,
+                correlation_id  TEXT,
+                occurred_at     TIMESTAMPTZ NOT NULL,
+                received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS runtime_events_device_time_idx "
+            "ON runtime_events (device_id, occurred_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS runtime_events_deployment_time_idx "
+            "ON runtime_events (deployment_id, occurred_at DESC)"
+        )
+        await conn.execute(
+            """UPDATE deployments
+               SET status = 'downloaded'
+               WHERE status = 'complete'
+                 AND smoke_test_result IS NULL
+                 AND validation_result IS NULL"""
         )
 
 
@@ -2226,6 +2278,284 @@ def _find_deployable_file(siblings: list) -> Optional[str]:
     return None
 
 
+RUNTIME_ADAPTER_VERSION = "1"
+RUNTIME_VERIFICATION_LEVEL = "adapter_contract"
+ANDROID_RUNTIME_VERSION = "lokiai_android_runtime_1"
+
+
+RUNTIME_ADAPTERS: Dict[str, Dict[str, Any]] = {
+    "llama_cpp_gguf_chat_v1": {
+        "adapter_id": "llama_cpp_gguf_chat_v1",
+        "adapter_version": RUNTIME_ADAPTER_VERSION,
+        "status": "IMPLEMENTED_AND_TESTED",
+        "task": "text-generation",
+        "supported_model_family": "single_file_gguf_chat",
+        "artifact_count": 1,
+        "artifact_roles": ["model"],
+        "formats": ["gguf"],
+        "accepted_filenames": ["*.gguf"],
+        "required_input_tensor_count": 0,
+        "required_output_tensor_count": 0,
+        "input_dtype": "token_ids",
+        "accepted_input_shapes": ["bounded_prompt_tokens"],
+        "dynamic_shape_policy": "bounded_by_context_length",
+        "accepted_output_shapes": ["streamed_tokens"],
+        "preprocessing": "llama_chat_template_v1",
+        "postprocessing": "token_stream_v1",
+        "label_source": None,
+        "delegate_policy": "cpu_only",
+        "cpu_fallback_policy": "required",
+        "memory_estimator": "estimate_peak_memory_mb",
+        "smoke_test": "bounded_context_create_and_generate",
+        "disposal_behavior": "stop_completion_then_release_context_once",
+        "failure_codes": [
+            "CHAT_MODEL_FILE_MISSING", "CHAT_MODEL_FORMAT_INVALID",
+            "CHAT_MODEL_MEMORY_ESTIMATE_EXCEEDED", "CHAT_CONTEXT_CREATE_FAILED",
+            "CHAT_GENERATION_FAILED",
+        ],
+        "supported_runtime_version_range": "android_fllama_0.0.1",
+    },
+    "tflite_yamnet_audio_v1": {
+        "adapter_id": "tflite_yamnet_audio_v1",
+        "adapter_version": RUNTIME_ADAPTER_VERSION,
+        "status": "IMPLEMENTED_AND_TESTED",
+        "task": "audio-classification",
+        "supported_model_family": "yamnet_audio_classification",
+        "artifact_count": 1,
+        "artifact_roles": ["model"],
+        "formats": ["tflite"],
+        "accepted_filenames": ["*yamnet*.tflite", "*.tflite"],
+        "required_input_tensor_count": 1,
+        "required_input_dtype": "float32",
+        "accepted_input_shapes": [[15600], [1, 15600]],
+        "dynamic_shape_policy": "fixed_or_single_dynamic_audio_window",
+        "required_output_tensor_count": 1,
+        "accepted_output_shapes": [[521], [1, 521]],
+        "sample_rate": 16000,
+        "channel_count": 1,
+        "preprocessing": "pcm16_mono_to_float32_16khz",
+        "postprocessing": "topk_softmax_or_logits",
+        "label_source": "assets/audioset_labels.txt",
+        "delegate_policy": "cpu_only",
+        "cpu_fallback_policy": "required",
+        "memory_estimator": "estimate_peak_memory_mb",
+        "smoke_test": "tflite_interpreter_create_and_zero_window_invoke",
+        "disposal_behavior": "close_interpreter_and_recorder_session_once",
+        "failure_codes": [
+            "AUDIO_MODEL_BUNDLE_INCOMPLETE", "AUDIO_TENSOR_CONTRACT_MISMATCH",
+            "AUDIO_LABEL_MISMATCH", "AUDIO_INTERPRETER_INIT_FAILED",
+            "AUDIO_INFERENCE_FAILED",
+        ],
+        "supported_runtime_version_range": "tflite_flutter_0.12.x",
+        "model_family_constraints": ["yamnet"],
+    },
+    "tflite_imagenet_classifier_v1": {
+        "adapter_id": "tflite_imagenet_classifier_v1",
+        "adapter_version": RUNTIME_ADAPTER_VERSION,
+        "status": "IMPLEMENTED_AND_TESTED",
+        "task": "image-classification",
+        "supported_model_family": "imagenet_classifier",
+        "artifact_count": 1,
+        "artifact_roles": ["model"],
+        "formats": ["tflite"],
+        "accepted_filenames": ["*.tflite"],
+        "required_input_tensor_count": 1,
+        "required_input_dtype": "float32_or_uint8",
+        "accepted_input_shapes": [[1, 224, 224, 3], [1, 3, 224, 224]],
+        "dynamic_shape_policy": "fixed_image",
+        "required_output_tensor_count": 1,
+        "accepted_output_shapes": [[1, 1000], [1, 1001]],
+        "image_dimensions": [224, 224],
+        "channel_count": 3,
+        "preprocessing": "resize_rgb_normalize_or_uint8",
+        "postprocessing": "topk_classification",
+        "label_source": "assets/imagenet_labels.txt",
+        "delegate_policy": "nnapi_gpu_then_cpu",
+        "cpu_fallback_policy": "required",
+        "memory_estimator": "estimate_peak_memory_mb",
+        "smoke_test": "tflite_interpreter_create_and_zero_image_invoke",
+        "disposal_behavior": "isolate_owned_interpreter_close_once",
+        "failure_codes": [
+            "VISION_INPUT_CONTRACT_MISMATCH", "VISION_OUTPUT_CONTRACT_MISMATCH",
+            "VISION_PREPROCESSING_FAILED", "VISION_INFERENCE_FAILED",
+        ],
+        "supported_runtime_version_range": "tflite_flutter_0.12.x",
+        "model_family_constraints": ["mobilenet", "efficientnet", "squeezenet"],
+    },
+    "tflite_yolox_detector_v1": {
+        "adapter_id": "tflite_yolox_detector_v1",
+        "adapter_version": RUNTIME_ADAPTER_VERSION,
+        "status": "PARTIALLY_IMPLEMENTED",
+        "task": "object-detection",
+        "supported_model_family": "yolox_detector",
+        "artifact_count": 1,
+        "artifact_roles": ["model"],
+        "formats": ["tflite"],
+        "accepted_filenames": ["*yolox*.tflite", "*.tflite"],
+        "required_input_tensor_count": 1,
+        "required_input_dtype": "float32_or_uint8",
+        "accepted_input_shapes": [[1, 416, 416, 3], [1, 640, 640, 3]],
+        "dynamic_shape_policy": "fixed_image",
+        "required_output_tensor_count": 1,
+        "accepted_output_shapes": [[1, -1, -1]],
+        "image_dimensions": "model_input",
+        "channel_count": 3,
+        "preprocessing": "resize_rgb_model_dims",
+        "postprocessing": "yolox_decode_nms",
+        "label_source": "adapter_bundle",
+        "delegate_policy": "nnapi_gpu_then_cpu",
+        "cpu_fallback_policy": "required",
+        "memory_estimator": "estimate_peak_memory_mb",
+        "smoke_test": "not_enabled_until_output_contract_validated",
+        "disposal_behavior": "isolate_owned_interpreter_close_once",
+        "failure_codes": [
+            "VISION_OUTPUT_CONTRACT_MISMATCH", "VISION_INFERENCE_FAILED",
+        ],
+        "supported_runtime_version_range": "tflite_flutter_0.12.x",
+        "model_family_constraints": ["yolox"],
+    },
+}
+
+
+UNSUPPORTED_MODEL_FAMILY_RE = re.compile(
+    r"(?:wav2vec|w2v2|panns|cnn14|whisper|moonshine|speech[-_ ]?to[-_ ]?text)",
+    re.IGNORECASE,
+)
+
+
+def bind_runtime_adapter(model_id: str, filename: str, task: str,
+                         size_mb: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Bind a candidate to a LokiAI Android runtime adapter.
+
+    This is intentionally narrower than "has .tflite/.gguf": only contracts
+    the current Android code can validate and execute are recommendable.
+    """
+    haystack = f"{model_id} {filename} {task}".lower()
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if UNSUPPORTED_MODEL_FAMILY_RE.search(haystack):
+        return None
+    if ext == "gguf" and task == "text-generation" and is_usable_chat_file(filename, size_mb):
+        return _deployable_adapter("llama_cpp_gguf_chat_v1")
+    if ext != "tflite":
+        return None
+    if task == "audio-classification" and "yamnet" in haystack:
+        return _deployable_adapter("tflite_yamnet_audio_v1")
+    if task == "image-classification" and any(
+        family in haystack for family in ("mobilenet", "efficientnet", "squeezenet")
+    ):
+        return _deployable_adapter("tflite_imagenet_classifier_v1")
+    if task == "object-detection" and "yolox" in haystack:
+        return _deployable_adapter("tflite_yolox_detector_v1")
+    return None
+
+
+def _deployable_adapter(adapter_id: str) -> Optional[Dict[str, Any]]:
+    adapter = RUNTIME_ADAPTERS.get(adapter_id)
+    if not adapter or adapter.get("status") != "IMPLEMENTED_AND_TESTED":
+        return None
+    return adapter
+
+
+def estimate_peak_memory_mb(adapter: Dict[str, Any], size_mb: Optional[float],
+                            device: Optional[dict] = None) -> Dict[str, Any]:
+    """Conservative adapter-specific memory budget.
+
+    This replaces the old single ``ram_mb * 0.4`` compatibility rule with a
+    visible estimate. The estimate is still intentionally simple because true
+    tensor arena and KV-cache sizes are confirmed by the phone smoke test.
+    """
+    model_mb = max(float(size_mb or 0), 0.0)
+    adapter_id = adapter.get("adapter_id", "")
+    if adapter_id == "llama_cpp_gguf_chat_v1":
+        kv_cache = 192
+        compute = 256
+        runtime = 320
+        reserve = 900
+        peak = model_mb + kv_cache + compute + runtime + reserve
+    elif adapter_id == "tflite_yamnet_audio_v1":
+        peak = model_mb * 2.2 + 96 + 64 + 256
+    else:
+        peak = model_mb * 2.6 + 192 + 96 + 320
+    ram_mb = float((device or {}).get("ram_mb") or 4096)
+    usable = max(ram_mb - 1536, ram_mb * 0.45)
+    return {
+        "estimated_peak_mb": round(peak, 2),
+        "available_runtime_mb": round(usable, 2),
+        "safe": peak <= usable,
+        "method": adapter.get("memory_estimator") or "estimate_peak_memory_mb",
+    }
+
+
+def device_artifact_size_budget_mb(device: Optional[dict]) -> float:
+    """Upper bound for download size, separate from runtime peak memory."""
+    ram_mb = float((device or {}).get("ram_mb") or 4096)
+    storage_free_gb = (device or {}).get("storage_free_gb")
+    storage_mb = float(storage_free_gb) * 1024 if storage_free_gb else ram_mb * 2
+    # Keep space for ten deployed-model metadata records and temporary .part
+    # downloads; runtime safety is checked separately by estimate_peak_memory_mb.
+    return max(256.0, min(storage_mb * 0.5, ram_mb * 0.85))
+
+
+def resolve_runtime_compatibility(model_id: str, filename: str, task: str,
+                                  size_mb: Optional[float],
+                                  device: Optional[dict] = None) -> Dict[str, Any]:
+    adapter = bind_runtime_adapter(model_id, filename, task, size_mb)
+    if adapter is None:
+        return {
+            "deployable": False,
+            "adapter_id": None,
+            "adapter_version": None,
+            "artifact_manifest": [],
+            "runtime_version_range": None,
+            "reasons": ["No IMPLEMENTED_AND_TESTED LokiAI Android adapter matches this artifact."],
+            "rejection_code": "RUNTIME_ADAPTER_UNSUPPORTED",
+            "memory_estimate": None,
+            "verification_level": "none",
+            "device_capable": None,
+            "artifact_compatible": False,
+            "adapter_supported": False,
+            "runtime_supported": False,
+            "memory_estimate_safe": False,
+            "runtime_verified": False,
+        }
+    memory = estimate_peak_memory_mb(adapter, size_mb, device)
+    if not memory["safe"]:
+        return {
+            "deployable": False,
+            "adapter_id": adapter["adapter_id"],
+            "adapter_version": adapter["adapter_version"],
+            "artifact_manifest": [{"role": "model", "filename": filename, "size_mb": size_mb}],
+            "runtime_version_range": adapter.get("supported_runtime_version_range"),
+            "reasons": ["Estimated peak memory exceeds this device runtime budget."],
+            "rejection_code": "MODEL_MEMORY_ESTIMATE_EXCEEDED",
+            "memory_estimate": memory,
+            "verification_level": RUNTIME_VERIFICATION_LEVEL,
+            "device_capable": False,
+            "artifact_compatible": True,
+            "adapter_supported": True,
+            "runtime_supported": True,
+            "memory_estimate_safe": False,
+            "runtime_verified": False,
+        }
+    return {
+        "deployable": True,
+        "adapter_id": adapter["adapter_id"],
+        "adapter_version": adapter["adapter_version"],
+        "artifact_manifest": [{"role": "model", "filename": filename, "size_mb": size_mb}],
+        "runtime_version_range": adapter.get("supported_runtime_version_range"),
+        "reasons": ["Artifact matches an implemented LokiAI Android adapter and memory estimate."],
+        "rejection_code": None,
+        "memory_estimate": memory,
+        "verification_level": RUNTIME_VERIFICATION_LEVEL,
+        "device_capable": True,
+        "artifact_compatible": True,
+        "adapter_supported": True,
+        "runtime_supported": True,
+        "memory_estimate_safe": True,
+        "runtime_verified": False,
+    }
+
+
 # llama.cpp's split-model naming convention, e.g.
 # "GLM-5.2-UD-IQ4_NL-00001-of-00009.gguf". A shard is NOT a model: its tensors
 # are spread across every part, and llama.cpp aborts the process - not raises,
@@ -2419,6 +2749,42 @@ def size_ceiling_for(preference: str, max_size_mb: float) -> float:
     return max_size_mb * _SIZE_PREFERENCE_CEILING.get(preference, 1.0)
 
 
+_MIN_SIZE_RE = re.compile(
+    r"(?:greater than|more than|over|at least|minimum|min)\s+(\d+(?:\.\d+)?)\s*(gb|gib|mb|mib)\b",
+    re.IGNORECASE,
+)
+_PARAM_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*b\b|\b(\d+(?:\.\d+)?)\s*billion\b", re.IGNORECASE)
+
+
+def extract_hard_constraints(message: str) -> Dict[str, Any]:
+    msg = message or ""
+    constraints: Dict[str, Any] = {}
+    min_match = _MIN_SIZE_RE.search(msg)
+    if min_match:
+        value = float(min_match.group(1))
+        unit = min_match.group(2).lower()
+        constraints["min_size_mb"] = value * 1024 if unit.startswith("g") else value
+    param_match = _PARAM_RE.search(msg)
+    if param_match:
+        value = float(param_match.group(1) or param_match.group(2))
+        constraints["parameter_b"] = value
+    return constraints
+
+
+def _filename_matches_parameter_constraint(filename: str, model_id: str,
+                                           parameter_b: Optional[float]) -> bool:
+    if not parameter_b:
+        return True
+    text = f"{model_id} {filename}".lower()
+    target = int(parameter_b) if parameter_b.is_integer() else parameter_b
+    patterns = [
+        rf"(?<!\d){re.escape(str(target))}\s*b(?![a-z])",
+        rf"(?<!\d){re.escape(str(target))}b(?![a-z])",
+        rf"(?<!\d){re.escape(str(target))}\s*billion\b",
+    ]
+    return any(re.search(p, text) for p in patterns)
+
+
 def rank_candidates(models: list, size_preference: str) -> list:
     """Order candidates by what the user actually asked for.
 
@@ -2489,6 +2855,87 @@ def classify_tasks(message: str) -> list:
     return [task["capability"] for task in classify_task_plan(message)]
 
 
+_TROUBLESHOOT_PATTERNS = [
+    ("microphone", re.compile(r"\b(mic|microphone|recording|voice)\b.*\b(nothing|failed|error|not work|didn'?t|doesn'?t|silent)\b|\b(nothing|failed|error)\b.*\b(mic|microphone|recording|voice)\b", re.I)),
+    ("camera", re.compile(r"\b(camera|photo|preview|vision)\b.*\b(crash\w*|failed|error|not work|black|closed)\b|\b(crash\w*|failed|error)\b.*\b(camera|photo|preview|vision)\b", re.I)),
+    ("chat", re.compile(r"\b(chat|message|reply|respond|generation|inference)\b.*\b(failed|error|not work|didn'?t|doesn'?t|crash|stuck)\b", re.I)),
+    ("deployment", re.compile(r"\b(deploy(?:ed|ment)?|download(?:ed)?)\b.*\b(failed|error|not run|didn'?t run|doesn'?t run|complete|ready)\b|\b(model loaded|loaded but|downloaded but)\b", re.I)),
+]
+
+
+def detect_troubleshooting_intent(message: str) -> Optional[str]:
+    for area, pattern in _TROUBLESHOOT_PATTERNS:
+        if pattern.search(message or ""):
+            return area
+    return None
+
+
+async def build_troubleshooting_reply(pool, user_id: str, device_id: str, area: str) -> dict:
+    async with pool.acquire() as conn:
+        deployment = await conn.fetchrow(
+            """SELECT d.id, d.status, d.error_message, d.failure_code, d.failure_details,
+                      d.adapter_id, d.adapter_version, d.runtime_version,
+                      d.validation_result, d.initialization_result, d.smoke_test_result,
+                      m.name AS model_name, m.hf_model_id
+               FROM deployments d
+               LEFT JOIN models m ON m.id = d.model_id
+               WHERE d.user_id = $1::uuid AND d.device_id = $2::uuid
+               ORDER BY d.deployed_at DESC LIMIT 1""",
+            user_id, device_id,
+        )
+        event = await conn.fetchrow(
+            """SELECT event_type, operation, success, error_code, error_detail,
+                      adapter_id, adapter_version, occurred_at
+               FROM runtime_events
+               WHERE device_id = $1::uuid
+                 AND ($2::uuid IS NULL OR deployment_id = $2::uuid)
+               ORDER BY occurred_at DESC LIMIT 1""",
+            device_id, deployment["id"] if deployment else None,
+        )
+
+    if event and event["error_code"]:
+        model_name = deployment["model_name"] if deployment else "the selected model"
+        return {
+            "response": (
+                f"The latest {area} failure is {event['error_code']} while "
+                f"{event['operation'] or event['event_type']} ran for {model_name}. "
+                f"{event['error_detail'] or 'Retry the same action once so the phone can send a fresh runtime event.'}"
+            ),
+            "action": None,
+            "search_results": [],
+            "error_code": event["error_code"],
+        }
+    if deployment and deployment["failure_code"]:
+        return {
+            "response": (
+                f"The latest deployment failed with {deployment['failure_code']}: "
+                f"{deployment['failure_details'] or deployment['error_message'] or 'no further detail was reported'}."
+            ),
+            "action": None,
+            "search_results": [],
+            "error_code": deployment["failure_code"],
+        }
+    if deployment and deployment["status"] in ("queued", "downloading", "downloaded", "validating"):
+        return {
+            "response": (
+                f"The model is currently {deployment['status']}, not runtime-ready yet. "
+                "Open the LokiAI phone app and retry the same action once so it can send the validation or smoke-test result."
+            ),
+            "action": None,
+            "search_results": [],
+            "error_code": "RUNTIME_VALIDATION_PENDING",
+        }
+    return {
+        "response": (
+            f"I do not yet have a structured {area} runtime error from the phone. "
+            "Retry that exact action once in the Android app so LokiAI can capture the validation, initialization, or inference event."
+        ),
+        "action": None,
+        "search_results": [],
+        "error_code": "RUNTIME_TELEMETRY_MISSING",
+    }
+
+
 def expand_vision_siblings(capabilities: list) -> list:
     """Vision tasks share candidate pools on HuggingFace.
 
@@ -2519,6 +2966,7 @@ def is_android_tflite_file(filename: str) -> bool:
 
 async def search_deployable_models(
     client: httpx.AsyncClient, tasks: list, user_message: str, max_size_mb: float,
+    device: Optional[dict] = None,
     limit: int = 12,
 ) -> list:
     """Real HuggingFace search constrained to phone-runnable models.
@@ -2529,6 +2977,7 @@ async def search_deployable_models(
     """
     hf_url = "https://huggingface.co/api/models"
     keywords = _extract_keywords(user_message)
+    hard_constraints = extract_hard_constraints(user_message)
 
     # The app's chat runtime is llama.cpp: chat models MUST be GGUF.
     # Vision/audio run on TFLite. Never cross-recommend formats.
@@ -2661,12 +3110,25 @@ async def search_deployable_models(
         m, fname, size_mb = item
         if not (0 < size_mb <= max_size_mb):
             continue
+        if size_mb < hard_constraints.get("min_size_mb", 0):
+            continue
+        if not _filename_matches_parameter_constraint(
+            fname, m["id"], hard_constraints.get("parameter_b")
+        ):
+            continue
         # Second gate, now that the real size is known. A .gguf that is under
         # the chat-model floor is a fragment however it was named, and
         # deploying it crashes the phone's native runtime.
         if fname.endswith(".gguf") and not is_usable_chat_file(fname, size_mb):
             print(f"[search] skipping unusable chat file {m['id']}/{fname} "
                   f"({size_mb:.2f} MB)")
+            continue
+        compatibility = resolve_runtime_compatibility(
+            m["id"], fname, m.get("pipeline_tag") or tasks[0], size_mb, device
+        )
+        if not compatibility["deployable"]:
+            print(f"[search] skipping unsupported runtime contract "
+                  f"{m['id']}/{fname} task={m.get('pipeline_tag') or tasks[0]}")
             continue
         org = m["id"].split("/")[0].lower()
         results.append({
@@ -2678,6 +3140,11 @@ async def search_deployable_models(
             "filename": fname,
             "format": fname.rsplit(".", 1)[-1],
             "reputable": org in REPUTABLE_ORGS,
+            "adapter_id": compatibility["adapter_id"],
+            "adapter_version": compatibility["adapter_version"],
+            "compatibility": compatibility,
+            "memory_estimate": compatibility["memory_estimate"],
+            "runtime_verified": False,
         })
 
     results.sort(key=lambda x: (x["reputable"], x["downloads"]), reverse=True)
@@ -2702,7 +3169,7 @@ async def search_models(req: ModelSearchRequest, request: Request, user_id: str 
         if not device:
             raise HTTPException(status_code=404, detail="Device not found")
             
-    max_size_mb = (device["ram_mb"] or 4096) * 0.4
+    max_size_mb = device_artifact_size_budget_mb(device)
 
     # The keyword planner is multi-intent too: this endpoint is the fallback
     # recommendation path, and fixing only the model-driven path would leave it
@@ -2720,6 +3187,7 @@ async def search_models(req: ModelSearchRequest, request: Request, user_id: str 
                 search_deployable_models(
                     client, expand_vision_siblings([task["capability"]]),
                     req.user_message, max_size_mb,
+                    device_specs,
                     limit=max(5, task["quantity"] * 4),
                 )
                 for task in plan
@@ -3348,6 +3816,24 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
     except httpx.HTTPError:
         meta = {}
 
+    inferred_task = meta.get("pipeline_tag") or (
+        "text-generation" if fname.endswith(".gguf") else "unknown"
+    )
+    compatibility = resolve_runtime_compatibility(repo_id, fname, inferred_task, size_mb)
+    if not compatibility["deployable"]:
+        result = {
+            "ok": False, "code": compatibility["rejection_code"] or "MODEL_INCOMPATIBLE",
+            "message": (
+                f"“{repo_id}” has a file LokiAI can download, but it does not "
+                "match any runtime adapter this Android build can validate and "
+                "execute. I will not deploy it as ready."
+            ),
+            "detail": compatibility,
+        }
+        if cacheable:
+            _hf_cache_put(cache_key, result)
+        return result
+
     result = {
         "ok": True,
         "model": {
@@ -3355,11 +3841,16 @@ async def _resolve_explicit_repo(client: httpx.AsyncClient, repo_id: str,
             "name": meta.get("id", repo_id).split("/")[-1],
             "downloads": meta.get("downloads", 0),
             "size_mb": round(size_mb, 2),
-            "task": meta.get("pipeline_tag") or "unknown",
+            "task": inferred_task,
             "filename": fname,
             "format": fname.rsplit(".", 1)[-1],
             "reputable": repo_id.split("/")[0].lower() in REPUTABLE_ORGS,
             "download_url": f"https://huggingface.co/{repo_id}/resolve/main/{fname}",
+            "adapter_id": compatibility["adapter_id"],
+            "adapter_version": compatibility["adapter_version"],
+            "compatibility": compatibility,
+            "memory_estimate": compatibility["memory_estimate"],
+            "runtime_verified": False,
         },
     }
     _hf_cache_put(cache_key, result)
@@ -3552,8 +4043,8 @@ def _compose_description(
     card_data: Optional[dict],
     source: str,
 ) -> str:
-    """Answers: what it does, what it takes, what it returns, what it is for."""
-    full, clause = _TASK_DESCRIPTIONS.get(
+    """Canonical LokiAI description from structured compatibility facts."""
+    _, clause = _TASK_DESCRIPTIONS.get(
         capability,
         (
             "LokiAI could not determine what this model does - its publisher "
@@ -3561,16 +4052,29 @@ def _compose_description(
             "Task not stated by the publisher.",
         ),
     )
-    # When the publisher wrote usable prose, it stands alone. The capability is
-    # already a chip on the card ("text-generation"), so prefixing a clause to
-    # every card was pure repetition. `clause` is retained only for callers
-    # that need a bare capability phrase.
-    del clause
-    if card_summary:
-        shortened = _shorten_description(card_summary)
-        if shortened:
-            return shortened
-    return full
+    del card_summary, card_data, source
+    fmt = (model.get("format") or "").upper()
+    adapter_id = model.get("adapter_id") or "unverified adapter"
+    filename = (model.get("filename") or model.get("name") or "").lower()
+    quant = None
+    q = re.search(r"\b(q[2-8](?:_[a-z0-9]+)?)\b", filename)
+    if q:
+        quant = q.group(1).upper()
+    size = model.get("size_mb")
+    size_text = f"{size:.0f} MB" if isinstance(size, (int, float)) else "unknown size"
+    memory = model.get("memory_estimate") or (model.get("compatibility") or {}).get("memory_estimate") or {}
+    peak = memory.get("estimated_peak_mb")
+    peak_text = f", estimated peak memory {peak:.0f} MB" if isinstance(peak, (int, float)) else ""
+    verified = (
+        "passed runtime validation on this device"
+        if model.get("runtime_verified") else
+        "requires phone-side validation before it is ready"
+    )
+    quant_text = f" using {quant} quantization" if quant else ""
+    return (
+        f"{clause} {fmt} artifact{quant_text}; download size {size_text}"
+        f"{peak_text}. Runs through LokiAI adapter {adapter_id} and {verified}."
+    )
 
 
 def _annotate_comparisons(models: list, max_size_mb: float) -> None:
@@ -3626,7 +4130,7 @@ def _annotate_comparisons(models: list, max_size_mb: float) -> None:
 # v3: descriptions are capped at one sentence and packaging/marketing prose is
 # stripped, so every v2 row (which could still hold a full card paragraph) is
 # recomputed on next use.
-DESCRIPTION_SCHEMA_VERSION = 3
+DESCRIPTION_SCHEMA_VERSION = 4
 
 
 async def _load_cached_descriptions(pool, model_ids: list) -> dict:
@@ -3708,29 +4212,7 @@ async def _describe_models(
                 source_url,
             )
 
-        # 2. HuggingFace model-card metadata, then 3. the README prose.
-        card_data, card_summary, source = None, None, "task_tag"
-        try:
-            meta_resp = await _hf_get(
-                client, f"https://huggingface.co/api/models/{model_id}"
-            )
-            if meta_resp.status_code == 200:
-                meta = meta_resp.json()
-                card_data = meta.get("cardData") if isinstance(meta, dict) else None
-                capability = meta.get("pipeline_tag") or capability
-                source = "huggingface_metadata"
-        except (httpx.HTTPError, ValueError):
-            pass
-
-        readme = await _fetch_model_card(client, model_id)
-        if readme:
-            card_summary = _first_card_paragraph(readme)
-            if card_summary:
-                source = "huggingface_model_card"
-
-        # 4/5. Task tags, or the clearly-marked conservative fallback.
-        if not card_summary and source not in ("huggingface_metadata",):
-            source = "fallback"
+        card_data, card_summary, source = None, None, "lokiai_structured"
         return (
             _compose_description(model, capability, card_summary, card_data, source),
             source,
@@ -4517,7 +4999,8 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
        with counts and constraints, or an empty plan for plain conversation.
     3. Real HuggingFace search per task (unauthenticated, public CDN).
     4. Python filters to phone-runnable files (.tflite/.gguf, q4 preferred)
-       that fit max_size_mb = ram_mb * 0.4, using real CDN HEAD sizes.
+       that fit the device artifact budget and adapter memory estimate, using
+       real CDN HEAD sizes.
     5. Every candidate is given a sourced description.
     6. A second NIM call — given ONLY the real device specs and the
        filtered candidates — ranks and explains them.
@@ -4555,7 +5038,13 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
             )
 
     device = dict(device_row)
-    max_size_mb = (device["ram_mb"] or 4096) * 0.4
+    max_size_mb = device_artifact_size_budget_mb(device)
+
+    troubleshooting_area = detect_troubleshooting_intent(req.message)
+    if troubleshooting_area:
+        return await build_troubleshooting_reply(
+            pool, user_id, req.device_id, troubleshooting_area
+        )
 
     history = []
     for h in (req.conversation_history or [])[-8:]:
@@ -4787,6 +5276,7 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
             # reduced ceiling would starve the result set on a narrow request.
             found = await search_deployable_models(
                 client, search_tags, req.message, max_size_mb,
+                device,
                 limit=max(12, task["quantity"] * 6),
             )
             found = _apply_task_constraints(found, task["constraints"])
@@ -4879,6 +5369,11 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
         cand_id = row["hf_model_id"] or f"upload:{row['id']}"
         if cand_id in seen_ids:
             continue
+        adapter = bind_runtime_adapter(
+            cand_id, row["name"], row["task_type"], row["size_mb"]
+        )
+        if adapter is None:
+            continue
         seen_ids.add(cand_id)
         models_data.append({
             "id": cand_id,
@@ -4890,6 +5385,9 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
             "format": row["format"],
             "reputable": False,
             "download_url": row["download_url"],
+            "adapter_id": adapter["adapter_id"],
+            "adapter_version": adapter["adapter_version"],
+            "runtime_verified": False,
         })
 
     # A specifically-named repo that the backend proved unusable is answered
@@ -5113,7 +5611,9 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
     status = data.get("status")
     progress = data.get("progress_percent", 0)
     error_message = data.get("error_message")
-    if not deployment_id or status not in ("downloading", "complete", "failed", "cancelled"):
+    if not deployment_id or status not in (
+        "downloading", "downloaded", "validating", "complete", "failed", "cancelled"
+    ):
         return
 
     # The deployment must belong to the device reporting on it. Without this a
@@ -5136,30 +5636,125 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
     if current_status == "cancelled":
         return
 
+    runtime_verified = bool(
+        data.get("runtime_verified") or data.get("smoke_test_success")
+    )
+    persisted_status = "downloaded" if status == "complete" and not runtime_verified else status
+
     deployment_status[deployment_id] = {
-        "status": status,
+        "status": persisted_status,
         "progress_percent": progress,
         "error_message": error_message,
     }
     try:
         async with pool.acquire() as conn:
-            if status == "complete":
+            if persisted_status == "complete":
                 await conn.execute(
-                    "UPDATE deployments SET status = $2, progress = $3, completed_at = NOW() WHERE id = $1::uuid",
-                    deployment_id, status, progress
+                    """UPDATE deployments
+                       SET status = $2, progress = $3, completed_at = NOW(),
+                           smoke_test_result = COALESCE($4::jsonb, smoke_test_result),
+                           validation_result = COALESCE($5::jsonb, validation_result)
+                       WHERE id = $1::uuid""",
+                    deployment_id, persisted_status, progress,
+                    json.dumps(data.get("smoke_test_result")) if data.get("smoke_test_result") is not None else None,
+                    json.dumps(data.get("validation_result")) if data.get("validation_result") is not None else None,
                 )
             elif status in ("failed", "cancelled"):
                 await conn.execute(
-                    "UPDATE deployments SET status = $2, progress = $3, error_message = $4 WHERE id = $1::uuid AND status <> 'cancelled'",
-                    deployment_id, status, progress, error_message
+                    """UPDATE deployments
+                       SET status = $2, progress = $3, error_message = $4,
+                           failure_code = COALESCE($5, failure_code),
+                           failure_details = COALESCE($6, failure_details)
+                       WHERE id = $1::uuid AND status <> 'cancelled'""",
+                    deployment_id, status, progress, error_message,
+                    data.get("error_code"), data.get("error_detail"),
                 )
             else:
                 await conn.execute(
                     "UPDATE deployments SET status = $2, progress = $3 WHERE id = $1::uuid",
-                    deployment_id, status, progress
+                    deployment_id, persisted_status, progress
                 )
     except (asyncpg.PostgresError, ValueError):
         pass
+
+
+async def _handle_runtime_event(pool, device_id: str, data: dict):
+    """Phone -> server runtime telemetry with idempotent persistence."""
+    event_id = data.get("event_id") or data.get("id")
+    event_type = data.get("event_type") or data.get("runtime_event_type")
+    deployment_id = data.get("deployment_id")
+    if not event_id or not event_type:
+        return
+    occurred_at = (
+        data.get("occurred_at")
+        or data.get("timestamp")
+        or datetime.now(timezone.utc).isoformat()
+    )
+    try:
+        async with pool.acquire() as conn:
+            if deployment_id:
+                owner = await conn.fetchval(
+                    "SELECT 1 FROM deployments WHERE id = $1::uuid AND device_id = $2::uuid",
+                    deployment_id, device_id,
+                )
+                if not owner:
+                    print(f"[WS] runtime event for foreign deployment {deployment_id} ignored")
+                    return
+            await conn.execute(
+                """INSERT INTO runtime_events (
+                       event_id, schema_version, device_id, deployment_id, model_id,
+                       adapter_id, adapter_version, runtime_epoch, request_id,
+                       operation, event_type, success, error_code, error_detail,
+                       memory_snapshot, correlation_id, occurred_at
+                   )
+                   VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6, $7, $8, $9,
+                           $10, $11, $12, $13, $14, $15::jsonb, $16, $17::timestamptz)
+                   ON CONFLICT (event_id) DO NOTHING""",
+                str(event_id), int(data.get("schema_version") or 1), device_id,
+                deployment_id, data.get("model_id"), data.get("adapter_id"),
+                data.get("adapter_version"), data.get("runtime_epoch"),
+                data.get("request_id"), data.get("operation"), event_type,
+                data.get("success"), data.get("error_code"), data.get("error_detail"),
+                json.dumps(data.get("memory_snapshot")) if data.get("memory_snapshot") is not None else None,
+                data.get("correlation_id"), occurred_at,
+            )
+            if deployment_id and event_type in ("runtime_validation", "smoke_test"):
+                if bool(data.get("success")):
+                    await conn.execute(
+                        """UPDATE deployments
+                           SET status = 'complete', progress = 100,
+                               completed_at = COALESCE(completed_at, NOW()),
+                               adapter_id = COALESCE(adapter_id, $2),
+                               adapter_version = COALESCE(adapter_version, $3),
+                               runtime_version = COALESCE(runtime_version, $4),
+                               smoke_test_result = COALESCE(smoke_test_result, $5::jsonb)
+                           WHERE id = $1::uuid AND device_id = $6::uuid""",
+                        deployment_id, data.get("adapter_id"), data.get("adapter_version"),
+                        data.get("runtime_version") or ANDROID_RUNTIME_VERSION,
+                        json.dumps(data), device_id,
+                    )
+                    deployment_status[str(deployment_id)] = {
+                        "status": "complete",
+                        "progress_percent": 100,
+                        "error_message": None,
+                    }
+                elif data.get("error_code"):
+                    await conn.execute(
+                        """UPDATE deployments
+                           SET status = 'failed', error_message = $2,
+                               failure_code = $3, failure_details = $4
+                           WHERE id = $1::uuid AND device_id = $5::uuid""",
+                        deployment_id,
+                        data.get("error_detail") or data.get("error_code"),
+                        data.get("error_code"), json.dumps(data), device_id,
+                    )
+                    deployment_status[str(deployment_id)] = {
+                        "status": "failed",
+                        "progress_percent": 100,
+                        "error_message": data.get("error_detail") or data.get("error_code"),
+                    }
+    except (asyncpg.PostgresError, ValueError, TypeError) as e:
+        print(f"[WS] runtime_event handling failed for {device_id}: {type(e).__name__}")
 
 
 async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebSocket):
@@ -5177,7 +5772,7 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
 
     try:
         async with pool.acquire() as conn:
-            if reported_id and reported_status in ("complete", "failed"):
+            if reported_id and reported_status in ("complete", "downloaded", "failed"):
                 row = await conn.fetchrow(
                     """SELECT id, status FROM deployments
                        WHERE id = $1::uuid AND device_id = $2::uuid""",
@@ -5186,10 +5781,10 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
                 if row and row["status"] in ("queued", "downloading"):
                     # Server thought it was still running; the device says it
                     # finished while we weren't listening.
-                    if reported_status == "complete":
+                    if reported_status in ("complete", "downloaded"):
                         await conn.execute(
-                            "UPDATE deployments SET status='complete', progress=100, "
-                            "completed_at=COALESCE(completed_at, NOW()) WHERE id=$1::uuid",
+                            "UPDATE deployments SET status='downloaded', progress=100 "
+                            "WHERE id=$1::uuid",
                             reported_id,
                         )
                     else:
@@ -5199,8 +5794,8 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
                             str(data.get("error_message") or "Device reported failure after reconnect")[:500],
                         )
                     deployment_status[str(reported_id)] = {
-                        "status": reported_status,
-                        "progress_percent": 100 if reported_status == "complete" else 0,
+                        "status": "downloaded" if reported_status == "complete" else reported_status,
+                        "progress_percent": 100 if reported_status in ("complete", "downloaded") else 0,
                         "error_message": data.get("error_message"),
                     }
                     print(f"[WS] reconciled deployment {reported_id} -> {reported_status} from device report")
@@ -5211,7 +5806,7 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
             # guessing.
             pending = await conn.fetch(
                 """SELECT id, status FROM deployments
-                   WHERE device_id = $1::uuid AND status IN ('queued', 'downloading')
+                   WHERE device_id = $1::uuid AND status IN ('queued', 'downloading', 'downloaded', 'validating')
                    ORDER BY deployed_at DESC LIMIT 5""",
                 device_id,
             )
@@ -5312,6 +5907,8 @@ async def device_websocket(websocket: WebSocket, device_id: str, token: str = ""
                 }))
             elif data.get("type") == "state_report":
                 await _handle_state_report(pool, device_id, data, websocket)
+            elif data.get("type") == "runtime_event":
+                await _handle_runtime_event(pool, device_id, data)
             elif "deployment_id" in data:
                 await _handle_deployment_update(pool, device_id, data)
     except WebSocketDisconnect:
@@ -5387,7 +5984,19 @@ class DeploymentRequest(BaseModel):
         return self.config.confidence_threshold if self.config else self.confidence_threshold
 
 
-async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".tflite") -> str:
+def task_for_inference_mode(mode: str) -> str:
+    normalized = (mode or "").lower()
+    if normalized in ("chat", "text-generation"):
+        return "text-generation"
+    if normalized in ("voice", "audio", "audio-classification"):
+        return "audio-classification"
+    if normalized in ("object-detection", "detector"):
+        return "object-detection"
+    return "image-classification"
+
+
+async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".tflite",
+                             task: str = "image-classification") -> str:
     """Find the deployable on-device model file inside an HF repo.
 
     Lists the repo's files via the HF API, keeps candidates matching the
@@ -5455,11 +6064,18 @@ async def resolve_model_file(hf_model_id: str, max_size_mb: float, ext: str = ".
                     ),
                 )
 
-        fitting = [(f, s) for f, s in sized if s <= max_size_mb]
+        fitting = [
+            (f, s) for f, s in sized
+            if s <= max_size_mb and bind_runtime_adapter(hf_model_id, f, task, s)
+        ]
         if not fitting:
             raise HTTPException(
                 status_code=422,
-                detail=f"No {ext} file in '{hf_model_id}' fits the device budget of {max_size_mb:.1f} MB. Candidates: {[(f, round(s,1)) for f, s in sized]}"
+                detail=(
+                    f"No {ext} file in '{hf_model_id}' both fits this device "
+                    f"and matches a LokiAI runtime adapter for {task}. "
+                    f"Candidates: {[(f, round(s,1)) for f, s in sized]}"
+                )
             )
         # Largest variant that fits = best quality within the device budget.
         fitting.sort(key=lambda t: t[1], reverse=True)
@@ -5483,6 +6099,45 @@ async def lookup_model_sha256(hf_model_id: str, filename: str) -> Optional[str]:
     except httpx.HTTPError:
         return None
     return None
+
+
+import ipaddress as _ipaddress
+import urllib.parse as _urllib_parse
+
+
+def _is_ssrf_safe_url(url: str) -> bool:
+    """Best-effort guard before the backend itself fetches a user-supplied URL.
+
+    Direct-URL deployments let a user hand us any link; the phone downloading
+    it is not a backend risk, but the backend HEAD-ing it (to size the model
+    for the memory gate below) is. Blocks non-http(s) schemes and loopback/
+    private/link-local/reserved targets. Does not defend against DNS
+    rebinding between this check and the actual request — good enough for a
+    HEAD-only size probe, not a substitute for network-level egress control.
+    """
+    try:
+        parsed = _urllib_parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    if host.lower() == "localhost" or host.lower().endswith(".local"):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        try:
+            ip = _ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
 
 
 @app.post("/deployments")
@@ -5513,7 +6168,7 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         active = await conn.fetchrow(
             """SELECT id, status, progress FROM deployments
                WHERE device_id = $1::uuid
-                 AND status IN ('queued', 'downloading')
+                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
                  AND deployed_at > NOW() - INTERVAL '15 minutes'
                ORDER BY deployed_at DESC LIMIT 1""",
             req.device_id
@@ -5531,7 +6186,7 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
             """UPDATE deployments SET status = 'failed',
                    error_message = 'Timed out: phone stopped reporting progress'
                WHERE device_id = $1::uuid
-                 AND status IN ('queued', 'downloading')
+                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
                  AND deployed_at <= NOW() - INTERVAL '15 minutes'""",
             req.device_id
         )
@@ -5566,9 +6221,12 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         # Auto-resolve the model file inside the HF repo when not specified.
         filename = req.model_filename or req.filename
         if not filename:
-            max_size_mb = (device["ram_mb"] or 4096) * 0.4
+            max_size_mb = device_artifact_size_budget_mb(device)
             ext = ".gguf" if req.effective_mode == "chat" else ".tflite"
-            filename = await resolve_model_file(req.hf_model_id, max_size_mb, ext)
+            filename = await resolve_model_file(
+                req.hf_model_id, max_size_mb, ext,
+                task=task_for_inference_mode(req.effective_mode),
+            )
 
         if filename.lower().endswith(".tflite") and not (
             is_android_tflite_file(req.hf_model_id) and is_android_tflite_file(filename)
@@ -5583,6 +6241,45 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         model_basename = os.path.basename(filename)
         model_sha256 = await lookup_model_sha256(req.hf_model_id, filename)
 
+    task = task_for_inference_mode(req.effective_mode)
+    resolved_size_mb: Optional[float] = None
+    size_probe_url = model_url if req.model_url else (
+        f"https://huggingface.co/{req.hf_model_id}/resolve/main/{filename}"
+    )
+    # For HF repos this is best-effort defense in depth (the search/resolve
+    # flow already sized the file); for direct-URL deployments it is the ONLY
+    # place size is ever resolved, so a silent None here would let
+    # estimate_peak_memory_mb treat the model as 0 MB and pass the memory
+    # gate regardless of actual size. Fail closed for that path instead.
+    if (not req.model_url) or _is_ssrf_safe_url(size_probe_url):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                head = await _hf_head(client, size_probe_url)
+                cl = head.headers.get("content-length")
+                if cl:
+                    resolved_size_mb = int(cl) / (1024 * 1024)
+        except httpx.HTTPError:
+            resolved_size_mb = None
+    if req.model_url and resolved_size_mb is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not verify this model's file size from its URL, so "
+                   "its on-device memory footprint cannot be estimated safely. "
+                   "Host it somewhere that returns Content-Length on HEAD, or "
+                   "deploy it from HuggingFace instead."
+        )
+    compatibility = resolve_runtime_compatibility(
+        req.hf_model_id, filename, task, resolved_size_mb, dict(device)
+    )
+    if not compatibility["deployable"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "This model does not match an implemented LokiAI Android runtime contract.",
+                "compatibility": compatibility,
+            },
+        )
+
     config = {
         "inference_mode": req.effective_mode,
         "confidence_threshold": req.effective_threshold
@@ -5590,23 +6287,31 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
 
     async with pool.acquire() as conn:
         model_row = await conn.fetchrow("""
-            INSERT INTO models (user_id, name, hf_model_id, source, format, task_type, download_url, sha256)
-            VALUES ($1::uuid, $2, $3, 'huggingface', $4, $5, $6, $7)
+            INSERT INTO models (user_id, name, hf_model_id, source, format, task_type, download_url, sha256, size_mb)
+            VALUES ($1::uuid, $2, $3, 'huggingface', $4, $5, $6, $7, $8)
             RETURNING id
         """, user_id, model_basename, req.hf_model_id,
            model_basename.rsplit(".", 1)[-1] if "." in model_basename else "unknown",
-           req.effective_mode, model_url, model_sha256)
+           task, model_url, model_sha256, resolved_size_mb)
 
         row = await conn.fetchrow("""
-            INSERT INTO deployments (user_id, device_id, model_id, status, progress, config)
-            VALUES ($1::uuid, $2::uuid, $3::uuid, 'queued', 0, $4::jsonb)
+            INSERT INTO deployments (
+                user_id, device_id, model_id, status, progress, config,
+                adapter_id, adapter_version, runtime_version, validation_result
+            )
+            VALUES ($1::uuid, $2::uuid, $3::uuid, 'queued', 0, $4::jsonb,
+                    $5, $6, $7, $8::jsonb)
             RETURNING id
         """, user_id, req.device_id, str(model_row["id"]), json.dumps({
             "hf_model_id": req.hf_model_id,
             "filename": filename,
             "model_url": model_url,
+            "adapter_id": compatibility["adapter_id"],
+            "adapter_version": compatibility["adapter_version"],
+            "compatibility": compatibility,
             **config
-        }))
+        }), compatibility["adapter_id"], compatibility["adapter_version"],
+            ANDROID_RUNTIME_VERSION, json.dumps(compatibility))
         deployment_id = str(row["id"])
 
     deployment_status[deployment_id] = {"status": "queued", "progress_percent": 0, "error_message": None}
@@ -5617,7 +6322,15 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         "model_url": model_url,
         "model_name": model_basename,
         "model_sha256": model_sha256,
-        "config": config
+        "adapter_id": compatibility["adapter_id"],
+        "adapter_version": compatibility["adapter_version"],
+        "compatibility": compatibility,
+        "config": {
+            **config,
+            "adapter_id": compatibility["adapter_id"],
+            "adapter_version": compatibility["adapter_version"],
+            "compatibility": compatibility,
+        }
     })
     if not sent:
         error_msg = "WebSocket send failed: device disconnected before the deployment instruction was delivered"
@@ -5712,14 +6425,14 @@ async def cancel_deployment(deployment_id: str, request: Request, user_id: str =
                 """UPDATE deployments
                    SET status = 'cancelled', error_message = 'Cancelled by user'
                    WHERE id = $1::uuid AND user_id = $2::uuid
-                     AND status IN ('queued', 'downloading')
+                     AND status IN ('queued', 'downloading', 'downloaded', 'validating')
                    RETURNING device_id""",
                 deployment_id, user_id,
             )
     except (asyncpg.PostgresError, ValueError):
         raise HTTPException(status_code=404, detail="Deployment not found")
     if not row:
-        raise HTTPException(status_code=409, detail="Only queued or downloading deployments can be cancelled")
+        raise HTTPException(status_code=409, detail="Only queued, downloading, downloaded, or validating deployments can be cancelled")
 
     deployment_status[deployment_id] = {
         "status": "cancelled", "progress_percent": 0,
