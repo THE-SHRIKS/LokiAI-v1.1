@@ -262,6 +262,13 @@ async def _run_migrations(pool: asyncpg.Pool):
             "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS smoke_test_result JSONB",
             "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS failure_code TEXT",
             "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS failure_details TEXT",
+            # Tracks the last time a deployment actually heard from the phone
+            # (any progress/status/runtime-event report), separate from
+            # deployed_at (creation time). Staleness checks that used
+            # deployed_at killed genuinely slow-but-progressing downloads and
+            # let dead ones block new deployments for the full timeout
+            # regardless of how long they'd already been silent.
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         ):
             await conn.execute(statement)
         await conn.execute("""
@@ -5652,6 +5659,7 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
                 await conn.execute(
                     """UPDATE deployments
                        SET status = $2, progress = $3, completed_at = NOW(),
+                           updated_at = NOW(),
                            smoke_test_result = COALESCE($4::jsonb, smoke_test_result),
                            validation_result = COALESCE($5::jsonb, validation_result)
                        WHERE id = $1::uuid""",
@@ -5663,6 +5671,7 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
                 await conn.execute(
                     """UPDATE deployments
                        SET status = $2, progress = $3, error_message = $4,
+                           updated_at = NOW(),
                            failure_code = COALESCE($5, failure_code),
                            failure_details = COALESCE($6, failure_details)
                        WHERE id = $1::uuid AND status <> 'cancelled'""",
@@ -5671,7 +5680,7 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
                 )
             else:
                 await conn.execute(
-                    "UPDATE deployments SET status = $2, progress = $3 WHERE id = $1::uuid",
+                    "UPDATE deployments SET status = $2, progress = $3, updated_at = NOW() WHERE id = $1::uuid",
                     deployment_id, persisted_status, progress
                 )
     except (asyncpg.PostgresError, ValueError):
@@ -5724,6 +5733,7 @@ async def _handle_runtime_event(pool, device_id: str, data: dict):
                         """UPDATE deployments
                            SET status = 'complete', progress = 100,
                                completed_at = COALESCE(completed_at, NOW()),
+                               updated_at = NOW(),
                                adapter_id = COALESCE(adapter_id, $2),
                                adapter_version = COALESCE(adapter_version, $3),
                                runtime_version = COALESCE(runtime_version, $4),
@@ -5742,6 +5752,7 @@ async def _handle_runtime_event(pool, device_id: str, data: dict):
                     await conn.execute(
                         """UPDATE deployments
                            SET status = 'failed', error_message = $2,
+                               updated_at = NOW(),
                                failure_code = $3, failure_details = $4
                            WHERE id = $1::uuid AND device_id = $5::uuid""",
                         deployment_id,
@@ -5783,13 +5794,14 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
                     # finished while we weren't listening.
                     if reported_status in ("complete", "downloaded"):
                         await conn.execute(
-                            "UPDATE deployments SET status='downloaded', progress=100 "
-                            "WHERE id=$1::uuid",
+                            "UPDATE deployments SET status='downloaded', progress=100, "
+                            "updated_at=NOW() WHERE id=$1::uuid",
                             reported_id,
                         )
                     else:
                         await conn.execute(
-                            "UPDATE deployments SET status='failed', error_message=$2 WHERE id=$1::uuid",
+                            "UPDATE deployments SET status='failed', error_message=$2, "
+                            "updated_at=NOW() WHERE id=$1::uuid",
                             reported_id,
                             str(data.get("error_message") or "Device reported failure after reconnect")[:500],
                         )
@@ -6165,11 +6177,29 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
     # One model per phone (PRD): never run parallel downloads on one device.
     # Stale rows (e.g. app killed mid-download) auto-expire after 15 minutes.
     async with pool.acquire() as conn:
+        # Cleanup runs BEFORE the blocking check, not after: a deployment that
+        # has gone silent for 15 minutes is dead and must not cost the user an
+        # extra round-trip (409, then retry) before the very next attempt can
+        # succeed. Staleness is measured from updated_at (last time the phone
+        # actually reported anything for this deployment), not deployed_at
+        # (creation time) — the old deployed_at-based check killed a
+        # genuinely slow-but-still-progressing download the moment it passed
+        # 15 minutes old, while a deployment that died instantly still got a
+        # full 15-minute grace period before it stopped blocking new ones.
+        await conn.execute(
+            """UPDATE deployments SET status = 'failed',
+                   error_message = 'Timed out: phone stopped reporting progress',
+                   updated_at = NOW()
+               WHERE device_id = $1::uuid
+                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
+                 AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '15 minutes'""",
+            req.device_id
+        )
         active = await conn.fetchrow(
             """SELECT id, status, progress FROM deployments
                WHERE device_id = $1::uuid
                  AND status IN ('queued', 'downloading', 'downloaded', 'validating')
-                 AND deployed_at > NOW() - INTERVAL '15 minutes'
+                 AND COALESCE(updated_at, deployed_at) > NOW() - INTERVAL '15 minutes'
                ORDER BY deployed_at DESC LIMIT 1""",
             req.device_id
         )
@@ -6180,16 +6210,6 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
                        f"({active['status']}, {active['progress'] or 0}%). "
                        f"Wait for it to finish before deploying another model."
             )
-        # Anything older stuck in queued/downloading is dead — mark it failed
-        # so history stays truthful.
-        await conn.execute(
-            """UPDATE deployments SET status = 'failed',
-                   error_message = 'Timed out: phone stopped reporting progress'
-               WHERE device_id = $1::uuid
-                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
-                 AND deployed_at <= NOW() - INTERVAL '15 minutes'""",
-            req.device_id
-        )
 
     if req.model_url:
         # Direct-URL deployment: GitHub release assets, any CDN — the phone
@@ -6337,7 +6357,8 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         deployment_status[deployment_id] = {"status": "failed", "progress_percent": 0, "error_message": error_msg}
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE deployments SET status = 'failed', error_message = $2 WHERE id = $1::uuid",
+                "UPDATE deployments SET status = 'failed', error_message = $2, "
+                "updated_at = NOW() WHERE id = $1::uuid",
                 deployment_id, error_msg
             )
         raise HTTPException(status_code=409, detail=error_msg)
