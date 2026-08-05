@@ -442,7 +442,7 @@ export async function waitForRun(
 
 export interface DeploymentStatus {
   deployment_id: string;
-  status: "queued" | "downloading" | "complete" | "failed" | string;
+  status: "queued" | "downloading" | "downloaded" | "validating" | "complete" | "failed" | string;
   progress_percent: number;
   error_message: string | null;
 }

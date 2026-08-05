@@ -6615,6 +6615,53 @@ def _is_ssrf_safe_url(url: str) -> bool:
     return True
 
 
+# Status-aware staleness: a large file transfer (queued/downloading) can
+# legitimately run for many minutes on a slow connection, but validation
+# (downloaded/validating) is a single bounded local operation — one chat
+# generation or one TFLite invoke — that either finishes in seconds or has
+# died (native crash, dropped connection, unhandled hang). Giving that phase
+# the same 15-minute grace period as a genuine download is exactly what let
+# a crashed validation block every other deployment on the device for a
+# quarter of an hour. Used both when a new deployment is requested and when
+# an existing one is simply polled — polling alone must be able to notice a
+# dead deployment, not just the next deploy attempt.
+_STALE_DEPLOYMENT_PREDICATE = """
+    status IN ('queued', 'downloading', 'downloaded', 'validating')
+    AND (
+      (status IN ('queued', 'downloading')
+       AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '15 minutes')
+      OR
+      (status IN ('downloaded', 'validating')
+       AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '90 seconds')
+    )
+"""
+
+
+async def _expire_deployment_if_stale(pool, deployment_id: str) -> Optional[dict]:
+    """Per-deployment staleness check usable outside the device-wide gate in
+    create_deployment — specifically so GET /deployments/{id} (what the
+    dashboard actually polls every 1.5s) can notice a dead deployment on its
+    own, instead of a stuck 'downloaded'/'validating' spinner only ever
+    resolving when the user happens to attempt a brand new deployment."""
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""UPDATE deployments SET status = 'failed',
+                       error_message = 'Timed out: phone stopped reporting progress',
+                       updated_at = NOW()
+                   WHERE id = $1::uuid AND {_STALE_DEPLOYMENT_PREDICATE}
+                   RETURNING id, status, error_message""",
+                deployment_id,
+            )
+    except (asyncpg.PostgresError, ValueError):
+        return None
+    if not row:
+        return None
+    fresh = {"status": row["status"], "progress_percent": 0, "error_message": row["error_message"]}
+    deployment_status[deployment_id] = fresh
+    return fresh
+
+
 @app.post("/deployments")
 @limiter.limit("10/minute", key_func=_user_or_ip_key)
 async def create_deployment(req: DeploymentRequest, request: Request, user_id: str = Depends(get_current_user)):
@@ -6639,7 +6686,8 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
 
     # One model per phone (PRD): never run parallel downloads on one device.
     # Stale rows auto-expire — 15 minutes for an in-progress download,
-    # 90 seconds for a stalled validation (see below for why they differ).
+    # 90 seconds for a stalled validation (see _STALE_DEPLOYMENT_PREDICATE
+    # for why they differ).
     async with pool.acquire() as conn:
         # Cleanup runs BEFORE the blocking check, not after: a deployment that
         # has gone silent for 15 minutes is dead and must not cost the user an
@@ -6650,40 +6698,22 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         # genuinely slow-but-still-progressing download the moment it passed
         # 15 minutes old, while a deployment that died instantly still got a
         # full 15-minute grace period before it stopped blocking new ones.
-        #
-        # The timeout itself is status-aware, not one blanket number: a large
-        # file transfer (queued/downloading) can legitimately run for many
-        # minutes on a slow connection, but validation (downloaded/
-        # validating) is a single bounded local operation — one chat
-        # generation or one TFLite invoke — that either finishes in seconds
-        # or has died (native crash, dropped connection, unhandled hang).
-        # Giving that phase the same 15-minute grace period as a genuine
-        # download is exactly what left a crashed validation blocking every
-        # other deployment on the device for a quarter of an hour.
         await conn.execute(
-            """UPDATE deployments SET status = 'failed',
+            f"""UPDATE deployments SET status = 'failed',
                    error_message = 'Timed out: phone stopped reporting progress',
                    updated_at = NOW()
                WHERE device_id = $1::uuid
-                 AND (
-                   (status IN ('queued', 'downloading')
-                    AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '15 minutes')
-                   OR
-                   (status IN ('downloaded', 'validating')
-                    AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '90 seconds')
-                 )""",
+                 AND {_STALE_DEPLOYMENT_PREDICATE}""",
             req.device_id
         )
+        # The UPDATE immediately above already flipped anything stale to
+        # 'failed', so a plain status filter is sufficient and correct here
+        # — no need to re-check timing against a row that can no longer be
+        # in one of these statuses if it was actually stale.
         active = await conn.fetchrow(
             """SELECT id, status, progress FROM deployments
                WHERE device_id = $1::uuid
-                 AND (
-                   (status IN ('queued', 'downloading')
-                    AND COALESCE(updated_at, deployed_at) > NOW() - INTERVAL '15 minutes')
-                   OR
-                   (status IN ('downloaded', 'validating')
-                    AND COALESCE(updated_at, deployed_at) > NOW() - INTERVAL '90 seconds')
-                 )
+                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
                ORDER BY deployed_at DESC LIMIT 1""",
             req.device_id
         )
@@ -6902,18 +6932,29 @@ async def get_deployment_status(deployment_id: str, request: Request, user_id: s
         if not row:
             raise HTTPException(status_code=404, detail="Deployment not found")
 
-        # Owner confirmed — the in-memory entry (written by the WebSocket
-        # progress handler) is fresher than the row for anything still active.
-        live = deployment_status.get(deployment_id)
-        if live:
-            return {"deployment_id": deployment_id, **live}
+    # A deployment sitting in a non-terminal status may simply be dead. This
+    # is checked on every poll, not just when a new deployment is requested
+    # — the dashboard polls this exact endpoint every 1.5s, and previously
+    # only attempting a brand new deployment could ever notice a stuck one,
+    # so a dead validation showed a spinner at 100% forever instead of
+    # resolving on its own within the timeout.
+    if row["status"] in ("queued", "downloading", "downloaded", "validating"):
+        expired = await _expire_deployment_if_stale(pool, deployment_id)
+        if expired:
+            return {"deployment_id": deployment_id, **expired}
 
-        return {
-            "deployment_id": str(row["id"]),
-            "status": row["status"],
-            "error_message": row["error_message"],
-            "progress_percent": 100 if row["status"] == "complete" else (row["progress"] or 0)
-        }
+    # Owner confirmed — the in-memory entry (written by the WebSocket
+    # progress handler) is fresher than the row for anything still active.
+    live = deployment_status.get(deployment_id)
+    if live:
+        return {"deployment_id": deployment_id, **live}
+
+    return {
+        "deployment_id": str(row["id"]),
+        "status": row["status"],
+        "error_message": row["error_message"],
+        "progress_percent": 100 if row["status"] == "complete" else (row["progress"] or 0)
+    }
 
 @app.post("/deployments/{deployment_id}/cancel")
 async def cancel_deployment(deployment_id: str, request: Request, user_id: str = Depends(get_current_user)):

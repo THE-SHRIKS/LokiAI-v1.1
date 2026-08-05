@@ -1,5 +1,6 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import { toast } from "sonner";
 
 // Custom-model upload is hidden in production until the feature is ready.
 // Set VITE_ENABLE_CUSTOM_UPLOAD=true in .env to enable during development.
@@ -26,10 +27,24 @@ import {
   inferenceModeForTask,
   uploadModel,
   UPLOAD_TASK_OPTIONS,
+  ApiError,
   type Device,
   type ModelRecord,
 } from "@/lib/lokiai-api";
 import { CURATED_MODELS, type CuratedModel } from "@/lib/curated-models";
+
+// A 409 from POST /deployments means exactly one thing: this device already
+// has a deployment running. Surface it as a toast, not just a small red
+// "Failed" label buried in the card grid.
+function notifyIfDeploymentBlocked(e: unknown) {
+  if (e instanceof ApiError && e.status === 409) {
+    toast.error("A model is already deploying on this device", {
+      description: "Wait for it to finish, or cancel it from Background Tasks before deploying another.",
+    });
+    return true;
+  }
+  return false;
+}
 
 export const Route = createFileRoute("/models")({
   head: () => ({
@@ -44,7 +59,7 @@ export const Route = createFileRoute("/models")({
 const REFRESH_MS = 5000;
 
 interface DeployState {
-  status: "idle" | "queued" | "downloading" | "complete" | "failed";
+  status: "idle" | "queued" | "downloading" | "downloaded" | "validating" | "complete" | "failed";
   progress: number;
   error?: string;
 }
@@ -106,7 +121,7 @@ function ModelsPage() {
     // the second call's real 409 would otherwise overwrite the first call's
     // real progress with a misleading "Failed".
     const existing = deployStates[model.id]?.status;
-    if (existing === "queued" || existing === "downloading") return;
+    if (existing === "queued" || existing === "downloading" || existing === "downloaded" || existing === "validating") return;
     const mode = model.format === "gguf" ? "chat" : inferenceModeForTask(model.task_type);
     setDeployStates((s) => ({ ...s, [model.id]: { status: "queued", progress: 0 } }));
     try {
@@ -134,6 +149,7 @@ function ModelsPage() {
         }
       }, 1500);
     } catch (e) {
+      notifyIfDeploymentBlocked(e);
       setDeployStates((s) => ({
         ...s,
         [model.id]: { status: "failed", progress: 0, error: e instanceof Error ? e.message : String(e) },
@@ -399,6 +415,11 @@ function ModelCard({
           </span>
         )}
       </div>
+      {(st === "downloaded" || st === "validating") && (
+        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
+          <div className="h-full bg-olive-glow" style={{ width: `${state?.progress ?? 100}%` }} />
+        </div>
+      )}
       {st === "failed" && state?.error && (
         <div className="border-t border-border px-3 py-1.5 text-[11px] text-destructive-foreground">{state.error}</div>
       )}

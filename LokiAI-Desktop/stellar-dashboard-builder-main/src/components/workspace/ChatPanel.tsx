@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 import type { Device, ModelRecommendation, DeploymentRecord } from "@/lib/lokiai-api";
 
 export interface DeployState {
-  status: "idle" | "queued" | "downloading" | "complete" | "failed";
+  status: "idle" | "queued" | "downloading" | "downloaded" | "validating" | "complete" | "failed";
   progress: number;
   error?: string;
 }
@@ -233,7 +233,7 @@ function ActivityCard() {
     ? formatDuration(durations.reduce((a, b) => a + b, 0) / durations.length)
     : "—";
 
-  const active = deployments.find((d) => d.status === "queued" || d.status === "downloading");
+  const active = deployments.find((d) => d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating");
 
   // Real 56-day contribution calendar: bucket every deployment by UTC day,
   // oldest to newest, left-to-right (matches the fixed grid regardless of
@@ -468,7 +468,7 @@ function ModelCard({
           </dl>
         </details>
       )}
-      {(st === "downloading" || st === "queued") && (
+      {(st === "downloading" || st === "queued" || st === "downloaded" || st === "validating") && (
         <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-secondary">
           <div
             className="h-full bg-olive-bright transition-all"

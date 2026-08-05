@@ -331,7 +331,7 @@ export function ChangesPanel({ onClose }: { onClose?: () => void }) {
       <span className={cn(
         "grid h-4 w-4 shrink-0 place-items-center rounded text-[10px] font-bold",
         d.status === "complete" && "bg-olive/30 text-olive-bright",
-        (d.status === "queued" || d.status === "downloading") && "bg-olive/20 text-olive-glow",
+        (d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") && "bg-olive/20 text-olive-glow",
         d.status === "failed" && "bg-destructive/30 text-destructive",
       )}>
         {d.status === "complete" ? "✓" : d.status === "failed" ? "✕" : "…"}
@@ -435,6 +435,7 @@ const DEPLOYMENTS_POLL_MS = 3000;
 function useDeployments() {
   const [deployments, setDeployments] = useState<DeploymentRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const loadRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     let cancelled = false;
@@ -447,20 +448,26 @@ function useDeployments() {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
     };
+    loadRef.current = load;
     load();
     const t = setInterval(load, DEPLOYMENTS_POLL_MS);
     return () => { cancelled = true; clearInterval(t); };
   }, []);
 
-  return { deployments, error };
+  // Exposed so an action the user just took (cancel) can refresh the list
+  // immediately instead of leaving a stale label on screen for up to
+  // DEPLOYMENTS_POLL_MS until the next scheduled tick.
+  const refresh = () => loadRef.current();
+
+  return { deployments, error, refresh };
 }
 
 export function TasksPanel({ onClose }: { onClose?: () => void }) {
-  const { deployments, error } = useDeployments();
+  const { deployments, error, refresh } = useDeployments();
   const [cancelling, setCancelling] = useState<string | null>(null);
   const [cancelError, setCancelError] = useState<string | null>(null);
 
-  const active = deployments.filter((d) => d.status === "queued" || d.status === "downloading");
+  const active = deployments.filter((d) => d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating");
   const finished = deployments.filter((d) => d.status === "complete" || d.status === "failed" || d.status === "cancelled").slice(0, 15);
 
   const cancel = async (deploymentId: string) => {
@@ -469,6 +476,10 @@ export function TasksPanel({ onClose }: { onClose?: () => void }) {
     try {
       const { cancelDeployment } = await import("@/lib/lokiai-api");
       await cancelDeployment(deploymentId);
+      // The backend applies the cancellation immediately; re-fetch now
+      // rather than waiting for the next poll tick so the card relabels
+      // right away instead of appearing to do nothing.
+      await refresh();
     } catch (e) {
       setCancelError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -486,16 +497,16 @@ export function TasksPanel({ onClose }: { onClose?: () => void }) {
         <div className="truncate text-[11px] text-muted-foreground">
           {d.phone_model ?? "device"} · <span className={cn(
             d.status === "complete" && "text-olive-glow/80",
-            (d.status === "queued" || d.status === "downloading") && "text-olive-bright",
+            (d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") && "text-olive-bright",
             (d.status === "failed" || d.status === "cancelled") && "text-destructive",
           )}>
-            {d.status}{(d.status === "queued" || d.status === "downloading") ? ` ${d.progress}%` : ""}
+            {d.status}{(d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") ? ` ${d.progress}%` : ""}
           </span>
         </div>
         {(d.status === "failed" || d.status === "cancelled") && d.error_message && (
           <div className="truncate text-[10px] text-destructive">{d.error_message}</div>
         )}
-        {(d.status === "queued" || d.status === "downloading") && (
+        {(d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") && (
           <button
             type="button"
             onClick={() => void cancel(d.id)}
@@ -572,7 +583,7 @@ export function PlanPanel({ onClose }: { onClose?: () => void }) {
   // manually toggleable, so it can never show progress that didn't happen.
   const paired = devices.length > 0;
   const recommended = deployments.length > 0;
-  const downloading = deployments.some((d) => d.status === "downloading" || d.status === "complete");
+  const downloading = deployments.some((d) => d.status === "downloading" || d.status === "downloaded" || d.status === "validating" || d.status === "complete");
   const complete = deployments.some((d) => d.status === "complete");
 
   const steps = [

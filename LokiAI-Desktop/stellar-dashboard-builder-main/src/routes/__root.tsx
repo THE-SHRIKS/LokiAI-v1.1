@@ -11,6 +11,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
 import { ensureAuthReady } from "../lib/lokiai-api";
+import { Toaster } from "../components/ui/sonner";
 
 // Production browser console must not leak internal errors, API payloads,
 // or anything else logged during development. Runs once at module load,
@@ -166,6 +167,7 @@ function RootComponent() {
     <QueryClientProvider client={queryClient}>
       {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
       <Outlet />
+      <Toaster position="bottom-right" />
     </QueryClientProvider>
   );
 }

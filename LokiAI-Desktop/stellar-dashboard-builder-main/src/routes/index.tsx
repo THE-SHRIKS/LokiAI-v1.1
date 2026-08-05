@@ -1,5 +1,6 @@
 import { createFileRoute, Navigate, useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import { Sidebar } from "@/components/workspace/Sidebar";
 import { ChatPanel, type ChatMessage, type DeployState } from "@/components/workspace/ChatPanel";
 import { Workspace } from "@/components/workspace/Workspace";
@@ -13,9 +14,24 @@ import {
   createDeployment,
   getDeployment,
   inferenceModeForTask,
+  ApiError,
   type Device,
   type ModelRecommendation,
 } from "@/lib/lokiai-api";
+
+// A 409 from POST /deployments means exactly one thing: this device already
+// has a deployment running. The card alone (a small red "Failed" label deep
+// in a scrolled list) is easy to miss — this is the one failure mode users
+// specifically asked to see called out, not buried.
+function notifyIfDeploymentBlocked(e: unknown) {
+  if (e instanceof ApiError && e.status === 409) {
+    toast.error("A model is already deploying on this device", {
+      description: "Wait for it to finish, or cancel it from Background Tasks before deploying another.",
+    });
+    return true;
+  }
+  return false;
+}
 
 interface DeploySearch {
   deployId?: string;
@@ -272,7 +288,7 @@ function Index() {
     // is already in progress") overwrites the FIRST call's real progress in
     // deployStates, making a genuinely-healthy download look like it failed.
     const existing = deployStates[rec.id]?.status;
-    if (existing === "queued" || existing === "downloading") return;
+    if (existing === "queued" || existing === "downloading" || existing === "downloaded" || existing === "validating") return;
     // GGUF files always run in chat mode; otherwise infer from the task.
     const mode = rec.format === "gguf" ? "chat" : inferenceModeForTask(rec.task);
     setDeployStates((s) => ({ ...s, [rec.id]: { status: "queued", progress: 0 } }));
@@ -300,6 +316,7 @@ function Index() {
         }
       }, 1500);
     } catch (e) {
+      notifyIfDeploymentBlocked(e);
       setDeployStates((s) => ({
         ...s,
         [rec.id]: {
@@ -383,6 +400,7 @@ function Index() {
           }
         }, 1500);
       } catch (e) {
+        notifyIfDeploymentBlocked(e);
         setDeployStates((s) => ({
           ...s,
           [rec.id]: { status: "failed", progress: 0, error: e instanceof Error ? e.message : String(e) },
