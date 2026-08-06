@@ -10,7 +10,7 @@ import {
 import { useEffect, useState, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
-import { ensureAuthReady } from "../lib/lokiai-api";
+import { DASHBOARD_BUILD, ensureAuthReady } from "../lib/lokiai-api";
 import { Toaster } from "../components/ui/sonner";
 
 // Production browser console must not leak internal errors, API payloads,
@@ -112,6 +112,22 @@ function RootShell({ children }: { children: ReactNode }) {
     <html lang="en">
       <head>
         <HeadContent />
+        {/*
+          Build stamp, emitted into the served HTML so the deployed dashboard
+          can be identified without guessing. The incident review could not
+          prove which commit the live bundle came from: chunk content hashes
+          only tell you two builds DIFFER, never which commit either is. These
+          meta tags are readable with a single curl.
+        */}
+        <meta name="lokiai-build-commit" content={DASHBOARD_BUILD.commit} />
+        <meta
+          name="lokiai-build-timestamp"
+          content={DASHBOARD_BUILD.buildTimestamp}
+        />
+        <meta
+          name="lokiai-frontend-protocol"
+          content={DASHBOARD_BUILD.frontendProtocolVersion}
+        />
       </head>
       <body>
         {children}

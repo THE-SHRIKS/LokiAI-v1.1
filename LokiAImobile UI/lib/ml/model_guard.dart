@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -328,17 +330,37 @@ class ModelGuard {
   /// escalates it to `quarantined`. Returns the path a marker was found for,
   /// regardless of which state it lands in — callers should check
   /// [isQuarantined] afterward to know whether a retry is still allowed.
-  static Future<String?> recoverFromNativeCrash() async {
+  ///
+  /// [exitReason] is Android's own explanation for the previous process
+  /// death, when one is available (see ServiceExitInspector). A marker alone
+  /// is NOT evidence against the model: the process can die because Android
+  /// reclaimed memory, because the app was updated, or because the inference
+  /// service crashed for reasons unrelated to these bytes. Escalation to
+  /// `quarantined` therefore requires an exit reason that is actually
+  /// attributable to the artifact. Without one the file stays
+  /// `temporarily_failed` and remains retryable indefinitely.
+  static Future<String?> recoverFromNativeCrash({String? exitReason}) async {
     final prefs = await SharedPreferences.getInstance();
     final pending = prefs.getString(_pendingKey);
     if (pending == null || pending.isEmpty) return null;
 
     final previous = await _healthFor(pending);
     final alreadyFailedOnce = previous?.status == _healthStatusTemporarilyFailed;
-    final nextStatus = alreadyFailedOnce
+    final attributable = isAttributableToModel(exitReason ?? 'NATIVE_LOAD_ABORT');
+    final nextStatus = (alreadyFailedOnce && attributable)
         ? _healthStatusQuarantined
         : _healthStatusTemporarilyFailed;
-    await _setHealth(pending, nextStatus, 'interrupted_load');
+    await _setHealth(
+      pending,
+      nextStatus,
+      attributable ? 'interrupted_load' : (exitReason ?? 'unattributable_exit'),
+    );
+    await recordFailure(
+      path: pending,
+      failureClass: exitReason ?? 'NATIVE_LOAD_ABORT',
+      operation: 'load',
+      attributedToModel: attributable,
+    );
     await prefs.remove(_quarantineKey);
     await prefs.remove(_pendingKey);
 
@@ -373,6 +395,126 @@ class ModelGuard {
     if (filtered.length != health.length) {
       await prefs.setStringList(_healthKey, filtered);
     }
+  }
+
+  /// Failure classes that are NOT attributable to the model artifact.
+  ///
+  /// A strike may only be recorded when deterministic evidence connects the
+  /// exact artifact to a repeatable native load failure. Everything below is
+  /// evidence that something else went wrong — the inference service died,
+  /// Android reclaimed memory, the app was updated, the device rebooted, the
+  /// user cancelled. Counting any of them as a model strike is what let a
+  /// service kill quarantine a perfectly good model after two attempts.
+  static const Set<String> nonAttributableFailures = {
+    'INFERENCE_SERVICE_DISCONNECTED',
+    'INFERENCE_SERVICE_BIND_FAILED',
+    'INFERENCE_SERVICE_DIED',
+    'INFERENCE_SERVICE_BINDER_DIED',
+    'INFERENCE_SERVICE_START_FAILED',
+    'INFERENCE_SERVICE_REBIND_EXHAUSTED',
+    'INFERENCE_SERVICE_LOW_MEMORY_KILL',
+    'INFERENCE_SERVICE_NATIVE_CRASH',
+    'INFERENCE_SERVICE_JVM_CRASH',
+    'INFERENCE_SERVICE_UNKNOWN_EXIT',
+    'APP_TERMINATED',
+    'APP_UPDATED',
+    'DEVICE_RESTARTED',
+    'NETWORK_FAILURE',
+    'OPERATION_CANCELLED',
+    'STALE_LOAD_MARKER',
+  };
+
+  static const String _failureLogKey = 'loki_model_failure_log_v1';
+
+  /// True when [failureClass] may count against the model itself.
+  static bool isAttributableToModel(String? failureClass) {
+    if (failureClass == null || failureClass.isEmpty) return false;
+    return !nonAttributableFailures.contains(failureClass);
+  }
+
+  /// Abandons an in-flight load attempt WITHOUT recording a strike.
+  ///
+  /// Used when the attempt was aborted by something other than the model:
+  /// the load marker is cleared so it cannot later be mistaken for an
+  /// interrupted native load, but the model's health is left untouched.
+  static Future<void> discardLoadAttempt(
+    String path, {
+    required String reason,
+    Map<String, dynamic> evidence = const {},
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_pendingKey);
+    await recordFailure(
+      path: path,
+      failureClass: reason,
+      operation: 'load',
+      evidence: evidence,
+      attributedToModel: false,
+    );
+    debugPrint('MODEL: discarded load attempt for $path (reason=$reason)');
+  }
+
+  /// Persists a structured failure record for later diagnosis.
+  ///
+  /// Kept deliberately separate from the health/strike store: this is
+  /// evidence, not a verdict. `attributedToModel` records whether the
+  /// evidence was strong enough to blame the artifact.
+  static Future<void> recordFailure({
+    required String path,
+    required String failureClass,
+    required String operation,
+    Map<String, dynamic> evidence = const {},
+    bool attributedToModel = false,
+    String adapterVersion = '1',
+    String runtimeVersion = 'lokiai_android_runtime_1',
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final log = prefs.getStringList(_failureLogKey) ?? <String>[];
+      final exit = evidence['exit_evidence'];
+      log.add(jsonEncode({
+        'artifact_fingerprint': _fingerprint(path),
+        'adapter_version': adapterVersion,
+        'runtime_version': runtimeVersion,
+        'failure_class': failureClass,
+        'exit_reason': exit is Map ? exit['reason_name'] : null,
+        'operation': operation,
+        'timestamp': DateTime.now().toUtc().toIso8601String(),
+        // 'platform_confirmed' means Android itself explained the exit;
+        // 'inferred' means we only know the lifecycle callback that fired.
+        'evidence_level': exit is Map ? 'platform_confirmed' : 'inferred',
+        'attributed_to_model': attributedToModel,
+      }));
+      // Bounded: keep the most recent 50 records.
+      final trimmed = log.length > 50 ? log.sublist(log.length - 50) : log;
+      await prefs.setStringList(_failureLogKey, trimmed);
+    } catch (e) {
+      debugPrint('MODEL: failure record could not be persisted: $e');
+    }
+  }
+
+  /// The persisted structured failure records, newest last.
+  static Future<List<Map<String, dynamic>>> failureLog() async {
+    final prefs = await SharedPreferences.getInstance();
+    final log = prefs.getStringList(_failureLogKey) ?? const <String>[];
+    return log
+        .map((e) {
+          try {
+            final decoded = jsonDecode(e);
+            return decoded is Map<String, dynamic> ? decoded : null;
+          } catch (_) {
+            return null;
+          }
+        })
+        .whereType<Map<String, dynamic>>()
+        .toList();
+  }
+
+  /// Short, path-free identifier for an artifact, so no private absolute
+  /// path is written into the failure log.
+  static String _fingerprint(String path) {
+    final base = path.split(RegExp(r'[/\\]')).last;
+    return sha256.convert(utf8.encode(base)).toString().substring(0, 16);
   }
 
   /// Lets a user retry a model they believe is now fine (e.g. re-downloaded).

@@ -43,10 +43,40 @@ class ModelDownloader {
   /// Stops an active download immediately when the dashboard cancels it.
   /// Closing the client aborts a blocked network read; the existing cleanup
   /// path then removes the partial file.
-  static void cancel(String deploymentId) {
+  static void cancel(String deploymentId, {String? requestId}) {
     _cancelledDeployments.add(deploymentId);
+    if (requestId != null && requestId.isNotEmpty) {
+      _cancellationRequestIds[deploymentId] = requestId;
+    }
     _activeClients.remove(deploymentId)?.close(force: true);
   }
+
+  /// Correlation id supplied by the backend with a cancel command, echoed
+  /// back in the acknowledgement so the two can be tied together.
+  static final Map<String, String> _cancellationRequestIds = <String, String>{};
+
+  /// The cancellation acknowledgement payload. Reports the real progress
+  /// reached rather than a hardcoded 0 — overwriting progress with zero
+  /// destroyed the evidence of how far the transfer had actually got and made
+  /// every cancellation look like a deployment that never started.
+  static Map<String, dynamic> _cancellationAck(
+    String deploymentId, {
+    required int progressPercent,
+  }) {
+    final requestId = _cancellationRequestIds.remove(deploymentId);
+    return <String, dynamic>{
+      'deployment_id': deploymentId,
+      'status': 'cancelled',
+      'progress_percent': progressPercent,
+      'error_message': 'Cancelled by user',
+      'cancellation_source': 'device',
+      'cancellation_request_id': ?requestId,
+    };
+  }
+
+  /// Last progress percent this phone reported for a deployment, so a
+  /// cancellation can preserve it.
+  static final Map<String, int> _lastProgress = <String, int>{};
 
   /// Reduces a server-supplied model_name to a bare, safe filename.
   ///
@@ -110,12 +140,11 @@ class ModelDownloader {
     }
 
     if (_cancelledDeployments.remove(deploymentId)) {
-      send({
-        'deployment_id': deploymentId,
-        'status': 'cancelled',
-        'progress_percent': 0,
-        'error_message': 'Cancelled by user',
-      });
+      send(_cancellationAck(
+        deploymentId,
+        progressPercent: _lastProgress[deploymentId] ?? 0,
+      ));
+      _lastProgress.remove(deploymentId);
       return;
     }
 
@@ -152,23 +181,21 @@ class ModelDownloader {
         );
         saved = await _download(modelUrl, modelName, deploymentId, expectedSha, send);
         if (_cancelledDeployments.remove(deploymentId)) {
-          send({
-            'deployment_id': deploymentId,
-            'status': 'cancelled',
-            'progress_percent': 0,
-            'error_message': 'Cancelled by user',
-          });
+          send(_cancellationAck(
+            deploymentId,
+            progressPercent: _lastProgress[deploymentId] ?? 0,
+          ));
+          _lastProgress.remove(deploymentId);
           return;
         }
         break;
       } catch (e) {
         if (_cancelledDeployments.remove(deploymentId)) {
-          send({
-            'deployment_id': deploymentId,
-            'status': 'cancelled',
-            'progress_percent': 0,
-            'error_message': 'Cancelled by user',
-          });
+          send(_cancellationAck(
+            deploymentId,
+            progressPercent: _lastProgress[deploymentId] ?? 0,
+          ));
+          _lastProgress.remove(deploymentId);
           return;
         }
         lastError = e.toString();
@@ -359,6 +386,9 @@ class ModelDownloader {
             // Report in ~10% steps to keep WS traffic sane.
             if (pct >= lastReported + 10 && pct < 100) {
               lastReported = pct;
+              // Remembered so a cancellation can report the progress that was
+              // actually reached instead of a hardcoded 0.
+              _lastProgress[deploymentId] = pct;
               send({
                 'deployment_id': deploymentId,
                 'status': 'downloading',

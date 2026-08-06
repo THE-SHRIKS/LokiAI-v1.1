@@ -27,10 +27,17 @@ class RuntimeContractTests(unittest.TestCase):
         )
 
     def test_partially_implemented_adapter_is_not_deployable(self):
-        adapter = main.bind_runtime_adapter(
+        # bind_runtime_adapter now returns an AdapterBindResult carrying the
+        # rejection reason instead of a bare Optional, so callers no longer
+        # have to invent their own error text. `adapter is None` is still the
+        # "nothing may bind" signal, and the result is falsy.
+        result = main.bind_runtime_adapter(
             "example/yolox-tflite", "yolox.tflite", "object-detection", 25
         )
-        self.assertIsNone(adapter)
+        self.assertIsNone(result.adapter)
+        self.assertFalse(result)
+        self.assertEqual(result.code, "RUNTIME_ADAPTER_UNSUPPORTED")
+        self.assertIn("IMPLEMENTED_AND_TESTED", result.detail)
 
     def test_unknown_adapter_rejected_by_resolver(self):
         result = main.resolve_runtime_compatibility(

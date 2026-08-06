@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, Depends, UploadFi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, NamedTuple
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timezone, timedelta
 import asyncio
@@ -35,6 +35,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # (whoever has JWT_SECRET_KEY can already mint valid sessions for anyone).
 from cryptography.fernet import Fernet
 import base64
+import uuid
 import hashlib as _hashlib
 
 _fernet = Fernet(base64.urlsafe_b64encode(_hashlib.sha256(JWT_SECRET_KEY.encode()).digest()))
@@ -1389,6 +1390,23 @@ async def _issue_otp(conn, user_id, email: str, name: str, purpose: str = "verif
         )
 
 
+# Wire/protocol identity, bumped when the phone<->backend contract changes.
+BACKEND_PROTOCOL_VERSION = "lokiai_backend_protocol_2"
+
+
+# RUNTIME_ADAPTERS is defined further down this module, so these are derived
+# lazily rather than at import time.
+def supported_adapter_versions() -> List[str]:
+    return sorted({a["adapter_version"] for a in RUNTIME_ADAPTERS.values()})
+
+
+def supported_adapter_ids() -> List[str]:
+    return sorted(
+        a_id for a_id, a in RUNTIME_ADAPTERS.items()
+        if a.get("status") == "IMPLEMENTED_AND_TESTED"
+    )
+
+
 @app.get("/health")
 def health_check():
     # The deployed commit is reported so a release can be verified from
@@ -1400,6 +1418,16 @@ def health_check():
         "commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
         "branch": os.getenv("RENDER_GIT_BRANCH", "unknown"),
         "service": os.getenv("RENDER_SERVICE_NAME", "local"),
+        # Protocol identity: a matching commit is not the same thing as a
+        # matching wire contract, and only the latter decides whether a
+        # given phone build can actually talk to this backend.
+        "backend_protocol_version": BACKEND_PROTOCOL_VERSION,
+        "runtime_protocol_version": ANDROID_RUNTIME_VERSION,
+        "adapter_version": RUNTIME_ADAPTER_VERSION,
+        "supported_adapter_ids": supported_adapter_ids(),
+        "supported_adapter_versions": supported_adapter_versions(),
+        "audio_deployment_enabled": audio_deployment_enabled(),
+        "audio_catalog_size": len(AUDIO_ARTIFACT_CATALOG),
     }
 
 
@@ -2005,13 +2033,104 @@ async def download_apk(request: Request):
         headers={"Content-Disposition": "attachment; filename=lokiai.apk"},
     )
 
+# APK identity is computed once per process and cached by (size, mtime): the
+# file never changes under a running process, and hashing ~85MB on every
+# dashboard poll would be absurd.
+_APK_IDENTITY_CACHE: Dict[str, Any] = {}
+
+
+def _apk_identity() -> Dict[str, Any]:
+    """Full, verifiable identity of the APK this backend serves.
+
+    Size alone proved nothing during the incident review — two different
+    builds can share a size to MB resolution. SHA-256 over the served bytes
+    is the only statement that actually pins the artifact.
+    """
+    stat = os.stat(_APK_PATH)
+    key = f"{stat.st_size}:{int(stat.st_mtime)}"
+    if _APK_IDENTITY_CACHE.get("key") == key:
+        return _APK_IDENTITY_CACHE["value"]
+    digest = _hashlib.sha256()
+    with open(_APK_PATH, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    value = {
+        "available": True,
+        "filename": "lokiai.apk",
+        "application_id": os.getenv("APK_APPLICATION_ID", "io.lokiai.lokiai_app"),
+        "version_name": os.getenv("APK_VERSION_NAME", "1.0.10"),
+        "version_code": int(os.getenv("APK_VERSION_CODE", "12")),
+        "sha256": digest.hexdigest(),
+        "size_bytes": stat.st_size,
+        "size_mb": round(stat.st_size / (1024 * 1024), 1),
+        "published_by_commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
+        "build_timestamp": datetime.fromtimestamp(
+            stat.st_mtime, tz=timezone.utc,
+        ).isoformat(),
+        "runtime_protocol_version": ANDROID_RUNTIME_VERSION,
+        "supported_adapter_versions": supported_adapter_versions(),
+        "supported_adapter_ids": supported_adapter_ids(),
+    }
+    _APK_IDENTITY_CACHE["key"] = key
+    _APK_IDENTITY_CACHE["value"] = value
+    return value
+
+
 @app.get("/apk/info")
 async def apk_info():
-    """Returns APK metadata (size, availability) so the frontend can show accurate info."""
+    """Full APK identity (version, code, SHA-256, exact bytes, publishing
+    commit) so a release can be PROVEN rather than inferred from file size."""
     if not os.path.exists(_APK_PATH):
         return {"available": False}
-    size_mb = round(os.path.getsize(_APK_PATH) / (1024 * 1024), 1)
-    return {"available": True, "size_mb": size_mb, "filename": "lokiai.apk"}
+    return _apk_identity()
+
+
+@app.get("/diagnostics/versions")
+async def diagnostics_versions(request: Request):
+    """Every component's identity in one response, plus an explicit
+    consistency verdict, so a release audit is a single call instead of four
+    manual comparisons that quietly disagree."""
+    backend_commit = os.getenv("RENDER_GIT_COMMIT", "unknown")
+    apk = _apk_identity() if os.path.exists(_APK_PATH) else {"available": False}
+    dashboard = {
+        "commit": os.getenv("DASHBOARD_BUILD_COMMIT", "unknown"),
+        "build_timestamp": os.getenv("DASHBOARD_BUILD_TIMESTAMP", "unknown"),
+        "frontend_protocol_version": os.getenv(
+            "DASHBOARD_PROTOCOL_VERSION", "lokiai_frontend_protocol_1",
+        ),
+    }
+    known = [c for c in (backend_commit, apk.get("published_by_commit"),
+                         dashboard["commit"]) if c and c != "unknown"]
+    mismatches = []
+    if len(set(known)) > 1:
+        mismatches.append(
+            "Component commits disagree: "
+            f"backend={backend_commit}, apk={apk.get('published_by_commit')}, "
+            f"dashboard={dashboard['commit']}"
+        )
+    unknown = [n for n, c in (("backend", backend_commit),
+                              ("apk", apk.get("published_by_commit")),
+                              ("dashboard", dashboard["commit"]))
+               if not c or c == "unknown"]
+    return {
+        "backend": {
+            "commit": backend_commit,
+            "branch": os.getenv("RENDER_GIT_BRANCH", "unknown"),
+            "protocol_version": BACKEND_PROTOCOL_VERSION,
+            "runtime_protocol_version": ANDROID_RUNTIME_VERSION,
+            "adapter_version": RUNTIME_ADAPTER_VERSION,
+        },
+        "dashboard": dashboard,
+        "apk": apk,
+        # What is ACTUALLY installed on each connected handset, as reported by
+        # the phone itself in its state report.
+        "devices": device_build_identity,
+        "audio_deployment_enabled": audio_deployment_enabled(),
+        "audio_catalog_size": len(AUDIO_ARTIFACT_CATALOG),
+        "consistent": not mismatches and not unknown,
+        "mismatches": mismatches,
+        "unverifiable": unknown,
+    }
 
 
 @app.get("/system/info")
@@ -2538,6 +2657,189 @@ RUNTIME_ADAPTERS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Supported audio artifact catalog (P0 incident: yamnetp_ahead_ds_lr0.000001)
+# ---------------------------------------------------------------------------
+# The previous audio binding rule was:
+#
+#     task == "audio-classification" and "yamnet" in haystack
+#
+# where haystack was "{repo_id} {filename} {pipeline_tag}".lower(). That bound
+# ANY .tflite whose repo name or filename merely CONTAINED the substring
+# "yamnet" — which is how "yamnetp_ahead_ds_lr0.000001.tflite" (a fine-tuned
+# artifact declaring a 1-sample input window) was recommended, offered a
+# Deploy button, downloaded, and only then rejected by the phone.
+#
+# None of the signals available at recommendation time — repository name,
+# filename substring, HuggingFace pipeline_tag, .tflite extension, Float32
+# dtype, README text, model-card claims — say anything about the artifact's
+# actual tensor contract. Only the bytes do. So binding is no longer inferred
+# at all: an audio artifact binds to tflite_yamnet_audio_v1 if and only if its
+# exact immutable identity appears in this catalog with a proven,
+# byte-verified tensor contract.
+#
+# Stable artifact identity is:
+#     repository + immutable revision + filename + sha256 + adapter_version
+#
+# A mutable branch ("main") is deliberately NOT part of identity and is
+# rejected as a revision: the same branch name can resolve to different bytes
+# tomorrow, which is precisely the property that makes it useless as a
+# compatibility contract.
+#
+# The catalog is EMPTY. No audio artifact has yet been proven end-to-end
+# through the real production microphone path on a physical device, and
+# adding a plausible-looking entry to make tests pass would reintroduce the
+# exact class of defect this incident is about. It stays empty until one
+# exact artifact passes VoiceInference.validateAndProbe() on real hardware.
+AUDIO_ARTIFACT_CATALOG: List[Dict[str, Any]] = [
+    # Template for a proven entry — DO NOT populate without device evidence:
+    # {
+    #     "repository": "<org>/<repo>",
+    #     "revision": "<40-hex immutable commit sha>",
+    #     "filename": "<exact filename>",
+    #     "sha256": "<64-hex sha256 of the artifact bytes>",
+    #     "size_bytes": <exact byte size>,
+    #     "adapter_id": "tflite_yamnet_audio_v1",
+    #     "adapter_version": "1",
+    #     "task": "audio-classification",
+    #     "input_dtype": "float32",
+    #     "input_shape": [15600],
+    #     "sample_rate": 16000,
+    #     "sample_count": 15600,
+    #     "output_shape": [521],
+    #     "label_set_id": "audioset_v1",
+    #     "label_count": 521,
+    #     "preprocessing": "pcm16_mono_to_float32_16khz",
+    #     "runtime_version_range": "tflite_flutter_0.12.x",
+    #     "verification_status": "IMPLEMENTED_AND_TESTED",
+    # },
+]
+
+_IMMUTABLE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+
+# Product containment switch. Audio deployment stays OFF until the catalog
+# holds at least one proven artifact AND the operator explicitly opts in.
+# Both conditions are required: flipping the env var alone cannot re-enable a
+# path that has nothing verified to deploy.
+AUDIO_MODEL_DEPLOYMENT_ENABLED = (
+    os.getenv("AUDIO_MODEL_DEPLOYMENT_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+AUDIO_ADAPTER_IDS = frozenset({"tflite_yamnet_audio_v1"})
+AUDIO_TASKS = frozenset({"audio-classification", "audio-classification-tflite"})
+
+# Deliberately functional, not a device-capability claim: the phone is fine,
+# the feature is withheld. It also never tells the user to look for a
+# "standard Float32" model — Float32 alone was never a compatibility contract
+# and saying so is what sent users hunting for artifacts like the one that
+# caused this incident.
+AUDIO_DISABLED_MESSAGE = (
+    "Audio model deployment is temporarily unavailable. LokiAI only deploys "
+    "audio models whose exact tensor contract has been verified end-to-end "
+    "against the on-device microphone pipeline, and no artifact currently "
+    "meets that bar. Chat and vision models are unaffected. This is a "
+    "LokiAI-side restriction, not a limitation of your phone."
+)
+
+
+def audio_deployment_enabled() -> bool:
+    """Audio Deploy is live only when explicitly enabled AND something proven
+    exists to deploy. An empty catalog can never be 'enabled'."""
+    if not AUDIO_MODEL_DEPLOYMENT_ENABLED:
+        return False
+    return any(
+        entry.get("verification_status") == "IMPLEMENTED_AND_TESTED"
+        for entry in AUDIO_ARTIFACT_CATALOG
+    )
+
+
+def _catalog_lookup(repository: Optional[str], revision: Optional[str],
+                    filename: Optional[str], sha256: Optional[str]
+                    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Exact-identity catalog lookup. Returns (entry, rejection_detail).
+
+    Every component of the identity tuple must match exactly. A near miss is
+    a rejection with the specific mismatched field named, never a fallback to
+    a looser match.
+    """
+    if not AUDIO_ARTIFACT_CATALOG:
+        return None, (
+            "No audio artifact has been verified end-to-end through LokiAI's "
+            "production microphone pipeline, so the supported-artifact "
+            "catalog is empty and no audio artifact can bind an adapter."
+        )
+    repo_matches = [
+        e for e in AUDIO_ARTIFACT_CATALOG
+        if (e.get("repository") or "").lower() == (repository or "").lower()
+    ]
+    if not repo_matches:
+        return None, (
+            f"Repository “{repository}” is not in the supported audio artifact "
+            "catalog. Audio artifacts are bound by exact verified identity, "
+            "not by repository or file name."
+        )
+    if not revision or not _IMMUTABLE_REVISION_RE.match(revision):
+        return None, (
+            "An immutable 40-character commit revision is required to identify "
+            f"an audio artifact; got “{revision or 'none'}”. A mutable branch "
+            "such as “main” cannot be a compatibility contract because the "
+            "bytes behind it can change."
+        )
+    rev_matches = [
+        e for e in repo_matches
+        if (e.get("revision") or "").lower() == revision.lower()
+    ]
+    if not rev_matches:
+        return None, (
+            f"Revision {revision} of “{repository}” is not a verified audio "
+            "artifact revision."
+        )
+    name_matches = [e for e in rev_matches if e.get("filename") == filename]
+    if not name_matches:
+        return None, (
+            f"“{filename}” is not a verified artifact filename at revision "
+            f"{revision} of “{repository}”."
+        )
+    if not sha256 or not _SHA256_RE.match(sha256 or ""):
+        return None, (
+            "A SHA-256 of the exact artifact bytes is required to bind an "
+            "audio adapter; none was supplied or it is malformed."
+        )
+    for entry in name_matches:
+        if (entry.get("sha256") or "").lower() == sha256.lower():
+            if entry.get("verification_status") != "IMPLEMENTED_AND_TESTED":
+                return None, (
+                    f"Catalog entry for “{filename}” is marked "
+                    f"{entry.get('verification_status')}, not "
+                    "IMPLEMENTED_AND_TESTED, so it is not deployable."
+                )
+            return entry, None
+    return None, (
+        f"The SHA-256 supplied for “{filename}” does not match the verified "
+        "bytes for that artifact. The file has changed, or it is a different "
+        "artifact reusing the same name."
+    )
+
+
+def audio_catalog_entry(repository: Optional[str], revision: Optional[str],
+                        filename: Optional[str], sha256: Optional[str],
+                        size_bytes: Optional[int] = None
+                        ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Catalog lookup plus exact byte-size confirmation."""
+    entry, detail = _catalog_lookup(repository, revision, filename, sha256)
+    if entry is None:
+        return None, detail
+    if size_bytes is not None and int(size_bytes) != int(entry["size_bytes"]):
+        return None, (
+            f"“{filename}” is {size_bytes} bytes but the verified artifact is "
+            f"{entry['size_bytes']} bytes. Identity requires an exact size "
+            "match."
+        )
+    return entry, None
+
+
 UNSUPPORTED_MODEL_FAMILY_RE = re.compile(
     r"(?:wav2vec|w2v2|panns|cnn14|whisper|moonshine|speech[-_ ]?to[-_ ]?text)",
     re.IGNORECASE,
@@ -2571,32 +2873,89 @@ UNSUPPORTED_CHAT_ARCHITECTURE_RE = re.compile(
 )
 
 
+class AdapterBindResult(NamedTuple):
+    """Outcome of an adapter binding attempt.
+
+    `adapter` is None whenever nothing may bind. `code`/`detail` carry the
+    precise, user-facing reason so a caller never has to invent one — the
+    old API returned a bare Optional and every caller wrote its own vague
+    "does not match any runtime adapter" text.
+    """
+    adapter: Optional[Dict[str, Any]]
+    code: Optional[str] = None
+    detail: Optional[str] = None
+    catalog_entry: Optional[Dict[str, Any]] = None
+
+    def __bool__(self) -> bool:  # keeps `if bind_runtime_adapter(...)` working
+        return self.adapter is not None
+
+
 def bind_runtime_adapter(model_id: str, filename: str, task: str,
-                         size_mb: Optional[float] = None) -> Optional[Dict[str, Any]]:
+                         size_mb: Optional[float] = None,
+                         *, revision: Optional[str] = None,
+                         sha256: Optional[str] = None,
+                         size_bytes: Optional[int] = None) -> AdapterBindResult:
     """Bind a candidate to a LokiAI Android runtime adapter.
 
-    This is intentionally narrower than "has .tflite/.gguf": only contracts
-    the current Android code can validate and execute are recommendable.
+    Audio binds ONLY by exact catalog identity (repo + immutable revision +
+    filename + sha256 + exact size). Nothing about the file's name, its
+    repository, its pipeline tag, its extension or its dtype can bind it.
     """
     haystack = f"{model_id} {filename} {task}".lower()
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if UNSUPPORTED_MODEL_FAMILY_RE.search(haystack):
-        return None
+        return AdapterBindResult(
+            None, "RUNTIME_ADAPTER_UNSUPPORTED",
+            "This model family has no implemented LokiAI Android adapter.",
+        )
     if ext == "gguf" and task == "text-generation" and is_usable_chat_file(filename, size_mb):
         if UNSUPPORTED_CHAT_ARCHITECTURE_RE.search(haystack):
-            return None
-        return _deployable_adapter("llama_cpp_gguf_chat_v1")
+            return AdapterBindResult(
+                None, "RUNTIME_ADAPTER_UNSUPPORTED",
+                "This chat architecture is not implemented by the llama.cpp "
+                "build vendored in this Android release.",
+            )
+        return _bind_ok("llama_cpp_gguf_chat_v1")
+
+    # Audio is decided before the extension check so an audio-tagged artifact
+    # can never fall through into a vision branch.
+    if task in AUDIO_TASKS:
+        if not audio_deployment_enabled():
+            return AdapterBindResult(
+                None, "AUDIO_DEPLOYMENT_TEMPORARILY_DISABLED",
+                AUDIO_DISABLED_MESSAGE,
+            )
+        entry, detail = audio_catalog_entry(
+            model_id, revision, filename, sha256, size_bytes,
+        )
+        if entry is None:
+            return AdapterBindResult(
+                None, "AUDIO_ARTIFACT_NOT_CATALOGUED", detail,
+            )
+        adapter = _deployable_adapter(entry["adapter_id"])
+        if adapter is None:
+            return AdapterBindResult(
+                None, "RUNTIME_ADAPTER_UNSUPPORTED",
+                f"Adapter {entry['adapter_id']} is not IMPLEMENTED_AND_TESTED "
+                "in this build.",
+            )
+        return AdapterBindResult(adapter, catalog_entry=entry)
+
     if ext != "tflite":
-        return None
-    if task == "audio-classification" and "yamnet" in haystack:
-        return _deployable_adapter("tflite_yamnet_audio_v1")
+        return AdapterBindResult(
+            None, "RUNTIME_ADAPTER_UNSUPPORTED",
+            "No implemented LokiAI Android adapter handles this file format.",
+        )
     if task == "image-classification" and any(
         family in haystack for family in ("mobilenet", "efficientnet", "squeezenet")
     ):
-        return _deployable_adapter("tflite_imagenet_classifier_v1")
+        return _bind_ok("tflite_imagenet_classifier_v1")
     if task == "object-detection" and "yolox" in haystack:
-        return _deployable_adapter("tflite_yolox_detector_v1")
-    return None
+        return _bind_ok("tflite_yolox_detector_v1")
+    return AdapterBindResult(
+        None, "RUNTIME_ADAPTER_UNSUPPORTED",
+        "No IMPLEMENTED_AND_TESTED LokiAI Android adapter matches this artifact.",
+    )
 
 
 def _deployable_adapter(adapter_id: str) -> Optional[Dict[str, Any]]:
@@ -2604,6 +2963,52 @@ def _deployable_adapter(adapter_id: str) -> Optional[Dict[str, Any]]:
     if not adapter or adapter.get("status") != "IMPLEMENTED_AND_TESTED":
         return None
     return adapter
+
+
+def _bind_ok(adapter_id: str) -> AdapterBindResult:
+    """Wrap a deployability check so a non-tested adapter always carries a
+    reason rather than a bare None."""
+    adapter = _deployable_adapter(adapter_id)
+    if adapter is None:
+        return AdapterBindResult(
+            None, "RUNTIME_ADAPTER_UNSUPPORTED",
+            f"Adapter {adapter_id} is not IMPLEMENTED_AND_TESTED in this build.",
+        )
+    return AdapterBindResult(adapter)
+
+
+def runtime_contract_for(adapter: Dict[str, Any],
+                         entry: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The exact tensor/preprocessing contract the phone will be held to.
+
+    Taken from the catalog entry when one exists (proven, per-artifact), and
+    from the adapter declaration otherwise (nominal, per-family).
+    """
+    if entry is not None:
+        return {
+            "input_dtype": entry["input_dtype"],
+            "input_shape": entry["input_shape"],
+            "sample_rate": entry.get("sample_rate"),
+            "sample_count": entry.get("sample_count"),
+            "output_shape": entry["output_shape"],
+            "label_set_id": entry.get("label_set_id"),
+            "label_count": entry.get("label_count"),
+            "preprocessing": entry["preprocessing"],
+            "runtime_version_range": entry["runtime_version_range"],
+            "source": "catalog",
+        }
+    return {
+        "input_dtype": adapter.get("required_input_dtype"),
+        "input_shape": adapter.get("accepted_input_shapes"),
+        "sample_rate": adapter.get("sample_rate"),
+        "sample_count": None,
+        "output_shape": adapter.get("accepted_output_shapes"),
+        "label_set_id": adapter.get("label_source"),
+        "label_count": None,
+        "preprocessing": adapter.get("preprocessing"),
+        "runtime_version_range": adapter.get("supported_runtime_version_range"),
+        "source": "adapter_declaration",
+    }
 
 
 def estimate_peak_memory_mb(adapter: Dict[str, Any], size_mb: Optional[float],
@@ -2648,17 +3053,32 @@ def device_artifact_size_budget_mb(device: Optional[dict]) -> float:
 
 def resolve_runtime_compatibility(model_id: str, filename: str, task: str,
                                   size_mb: Optional[float],
-                                  device: Optional[dict] = None) -> Dict[str, Any]:
-    adapter = bind_runtime_adapter(model_id, filename, task, size_mb)
-    if adapter is None:
+                                  device: Optional[dict] = None,
+                                  *, revision: Optional[str] = None,
+                                  sha256: Optional[str] = None,
+                                  size_bytes: Optional[int] = None,
+                                  ) -> Dict[str, Any]:
+    """THE compatibility resolver. Every path that can lead to a Deploy —
+    model search, curated lists, direct HF deployment, retries, uploads,
+    dashboard Deploy actions, POST /deployments — must call this and must
+    honour its verdict. Nothing may bind an adapter by any other route."""
+    bind = bind_runtime_adapter(
+        model_id, filename, task, size_mb,
+        revision=revision, sha256=sha256, size_bytes=size_bytes,
+    )
+    if bind.adapter is None:
         return {
             "deployable": False,
             "adapter_id": None,
             "adapter_version": None,
             "artifact_manifest": [],
+            "expected_sha256": None,
+            "expected_size": None,
+            "runtime_contract": None,
             "runtime_version_range": None,
-            "reasons": ["No IMPLEMENTED_AND_TESTED LokiAI Android adapter matches this artifact."],
-            "rejection_code": "RUNTIME_ADAPTER_UNSUPPORTED",
+            "reasons": [bind.detail or "No IMPLEMENTED_AND_TESTED LokiAI Android adapter matches this artifact."],
+            "rejection_code": bind.code or "RUNTIME_ADAPTER_UNSUPPORTED",
+            "rejection_detail": bind.detail,
             "memory_estimate": None,
             "verification_level": "none",
             "device_capable": None,
@@ -2668,18 +3088,47 @@ def resolve_runtime_compatibility(model_id: str, filename: str, task: str,
             "memory_estimate_safe": False,
             "runtime_verified": False,
         }
+    adapter = bind.adapter
+    entry = bind.catalog_entry
+    expected_sha = (entry or {}).get("sha256") or sha256
+    expected_size = (entry or {}).get("size_bytes") or size_bytes
+    manifest = [{
+        "role": "model",
+        "filename": filename,
+        "size_mb": size_mb,
+        "repository": model_id,
+        "revision": (entry or {}).get("revision") or revision,
+        "sha256": expected_sha,
+        "size_bytes": expected_size,
+        "adapter_id": adapter["adapter_id"],
+        "adapter_version": adapter["adapter_version"],
+        "verification_status": (entry or {}).get("verification_status")
+                               or adapter.get("status"),
+    }]
+    contract = runtime_contract_for(adapter, entry)
+    # A catalog-backed artifact has a proven per-artifact contract; anything
+    # else is only nominal and must be labelled as such so the dashboard
+    # never presents it as verified.
+    verification_level = "catalog_verified_artifact" if entry else RUNTIME_VERIFICATION_LEVEL
     memory = estimate_peak_memory_mb(adapter, size_mb, device)
     if not memory["safe"]:
         return {
             "deployable": False,
             "adapter_id": adapter["adapter_id"],
             "adapter_version": adapter["adapter_version"],
-            "artifact_manifest": [{"role": "model", "filename": filename, "size_mb": size_mb}],
+            "artifact_manifest": manifest,
+            "expected_sha256": expected_sha,
+            "expected_size": expected_size,
+            "runtime_contract": contract,
             "runtime_version_range": adapter.get("supported_runtime_version_range"),
             "reasons": ["Estimated peak memory exceeds this device runtime budget."],
             "rejection_code": "MODEL_MEMORY_ESTIMATE_EXCEEDED",
+            "rejection_detail": (
+                f"Estimated peak {memory['estimated_peak_mb']} MB exceeds the "
+                f"{memory['available_runtime_mb']} MB runtime budget on this device."
+            ),
             "memory_estimate": memory,
-            "verification_level": RUNTIME_VERIFICATION_LEVEL,
+            "verification_level": verification_level,
             "device_capable": False,
             "artifact_compatible": True,
             "adapter_supported": True,
@@ -2691,17 +3140,23 @@ def resolve_runtime_compatibility(model_id: str, filename: str, task: str,
         "deployable": True,
         "adapter_id": adapter["adapter_id"],
         "adapter_version": adapter["adapter_version"],
-        "artifact_manifest": [{"role": "model", "filename": filename, "size_mb": size_mb}],
+        "artifact_manifest": manifest,
+        "expected_sha256": expected_sha,
+        "expected_size": expected_size,
+        "runtime_contract": contract,
         "runtime_version_range": adapter.get("supported_runtime_version_range"),
         "reasons": ["Artifact matches an implemented LokiAI Android adapter and memory estimate."],
         "rejection_code": None,
+        "rejection_detail": None,
         "memory_estimate": memory,
-        "verification_level": RUNTIME_VERIFICATION_LEVEL,
+        "verification_level": verification_level,
         "device_capable": True,
         "artifact_compatible": True,
         "adapter_supported": True,
         "runtime_supported": True,
         "memory_estimate_safe": True,
+        # The phone remains the final authority: nothing is runtime_verified
+        # until VoiceInference.validateAndProbe()/the chat smoke test says so.
         "runtime_verified": False,
     }
 
@@ -3227,7 +3682,37 @@ ERROR_CODE_EXPLANATIONS: Dict[str, str] = {
     "MODEL_NATIVE_PROCESS_DIED": "The native model runtime process stopped unexpectedly.",
     "RUNTIME_ADAPTER_UNSUPPORTED": "This Android build does not implement a runtime adapter for this model.",
     "RUNTIME_VALIDATION_PENDING": "The model has not finished runtime validation on the phone yet.",
+    "AUDIO_DEPLOYMENT_TEMPORARILY_DISABLED": AUDIO_DISABLED_MESSAGE,
+    "AUDIO_ARTIFACT_NOT_CATALOGUED": "This audio artifact's exact identity is not in LokiAI's verified audio artifact catalog.",
+    "UNVERIFIED_USER_ARTIFACT": "This file was uploaded by you and has not been verified against any LokiAI runtime contract; the phone must validate it before it can be used.",
+    # Inference-service failures. These describe the Android runtime SERVICE,
+    # never the model artifact — mapping any of them onto a model failure code
+    # is what told users to redeploy perfectly good bytes.
+    "INFERENCE_SERVICE_DISCONNECTED": "The on-device inference service disconnected. This is a service fault, not a problem with the model.",
+    "INFERENCE_SERVICE_BIND_FAILED": "The app could not bind to the on-device inference service.",
+    "INFERENCE_SERVICE_DIED": "The on-device inference service process stopped unexpectedly.",
+    "INFERENCE_SERVICE_BINDER_DIED": "The IPC channel to the on-device inference service was lost.",
+    "INFERENCE_SERVICE_START_FAILED": "The on-device inference service could not be started.",
+    "INFERENCE_SERVICE_REBIND_EXHAUSTED": "The inference service could not be recovered after the allowed number of attempts.",
+    "INFERENCE_SERVICE_LOW_MEMORY_KILL": "Android terminated the inference service to reclaim memory.",
+    "INFERENCE_SERVICE_NATIVE_CRASH": "The inference service stopped due to a native crash.",
+    "INFERENCE_SERVICE_JVM_CRASH": "The inference service stopped due to an unhandled Java/Kotlin exception.",
+    "INFERENCE_SERVICE_UNKNOWN_EXIT": "The inference service stopped for a reason this Android version does not report.",
 }
+
+# Service-fault codes must never be reported as model incompatibility, and
+# must never trigger a redeploy suggestion. Asserted by the test suite.
+INFERENCE_SERVICE_FAILURE_CODES = frozenset({
+    "INFERENCE_SERVICE_DISCONNECTED", "INFERENCE_SERVICE_BIND_FAILED",
+    "INFERENCE_SERVICE_DIED", "INFERENCE_SERVICE_BINDER_DIED",
+    "INFERENCE_SERVICE_START_FAILED", "INFERENCE_SERVICE_REBIND_EXHAUSTED",
+    "INFERENCE_SERVICE_LOW_MEMORY_KILL", "INFERENCE_SERVICE_NATIVE_CRASH",
+    "INFERENCE_SERVICE_JVM_CRASH", "INFERENCE_SERVICE_UNKNOWN_EXIT",
+})
+
+
+def is_service_failure(code: Optional[str]) -> bool:
+    return code in INFERENCE_SERVICE_FAILURE_CODES
 
 
 def detect_troubleshooting_intent(message: str) -> Optional[str]:
@@ -5954,11 +6439,16 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
         cand_id = row["hf_model_id"] or f"upload:{row['id']}"
         if cand_id in seen_ids:
             continue
-        adapter = bind_runtime_adapter(
-            cand_id, row["name"], row["task_type"], row["size_mb"]
+        # User uploads carry no proven runtime contract. They are storable and
+        # downloadable, but they are never presented as verified, and an
+        # uncatalogued audio upload can never claim the YAMNet adapter.
+        bind = bind_runtime_adapter(
+            cand_id, row["name"], row["task_type"], row["size_mb"],
+            sha256=row["sha256"],
         )
-        if adapter is None:
+        if bind.adapter is None:
             continue
+        adapter = bind.adapter
         seen_ids.add(cand_id)
         models_data.append({
             "id": cand_id,
@@ -6237,8 +6727,12 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
         return
 
     # A user cancellation wins over a late packet from a phone that had
-    # already received the deployment instruction.
-    if current_status == "cancelled":
+    # already received the deployment instruction — EXCEPT the phone's own
+    # cancellation acknowledgement, which must be allowed through so its
+    # correlation id can be recorded against the row. Without this exception
+    # the acknowledgement was silently dropped and the cancellation chain
+    # ended at the backend.
+    if current_status == "cancelled" and status != "cancelled":
         return
 
     runtime_verified = bool(
@@ -6265,7 +6759,26 @@ async def _handle_deployment_update(pool, device_id: str, data: dict):
                     json.dumps(data.get("smoke_test_result")) if data.get("smoke_test_result") is not None else None,
                     json.dumps(data.get("validation_result")) if data.get("validation_result") is not None else None,
                 )
-            elif status in ("failed", "cancelled"):
+            elif status == "cancelled":
+                # The phone only ever echoes a cancellation the backend sent
+                # it, so this is an ACKNOWLEDGEMENT. Attribution is recorded
+                # as 'device' only when the backend had no record of who
+                # asked — COALESCE keeps the original user attribution when
+                # the cancel endpoint already wrote it, and the request id is
+                # what ties the two together.
+                await conn.execute(
+                    """UPDATE deployments
+                       SET status = 'cancelled', error_message = $3,
+                           updated_at = NOW(),
+                           cancelled_at = COALESCE(cancelled_at, NOW()),
+                           cancellation_source = COALESCE(cancellation_source, 'device'),
+                           cancellation_request_id = COALESCE(cancellation_request_id, $4),
+                           progress_at_cancellation = COALESCE(progress_at_cancellation, $2)
+                       WHERE id = $1::uuid""",
+                    deployment_id, progress, error_message,
+                    data.get("cancellation_request_id"),
+                )
+            elif status == "failed":
                 await conn.execute(
                     """UPDATE deployments
                        SET status = $2, progress = $3, error_message = $4,
@@ -6396,6 +6909,22 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
     """
     reported_id = data.get("deployment_id")
     reported_status = data.get("status")
+
+    # Installed-build identity. Cached in memory so /diagnostics/versions can
+    # answer "what is actually running on this handset?" — a question the
+    # release audit could not answer at all before.
+    build = data.get("build")
+    if isinstance(build, dict):
+        device_build_identity[str(device_id)] = {
+            "application_id": build.get("application_id"),
+            "version_name": build.get("version_name"),
+            "version_code": build.get("version_code"),
+            "build_commit": build.get("build_commit"),
+            "protocol_version": build.get("protocol_version"),
+            "adapter_version": build.get("adapter_version"),
+            "supported_adapters": build.get("supported_adapters"),
+            "reported_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     try:
         async with pool.acquire() as conn:
@@ -6579,6 +7108,11 @@ import hashlib
 # the first pass of that removal took it with it and every POST /deployments
 # 500'd with NameError. Kept here, with the wireless path that actually uses it.
 deployment_status: dict = {}
+
+# device_id -> the build identity that device last reported (see
+# _handle_state_report). Surfaced by /diagnostics/versions so an installed
+# APK can be compared against the served APK and the backend commit.
+device_build_identity: Dict[str, Dict[str, Any]] = {}
 
 
 class DeploymentConfig(BaseModel):
@@ -7030,14 +7564,30 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
                    "Host it somewhere that returns Content-Length on HEAD, or "
                    "deploy it from HuggingFace instead."
         )
+    # Containment gate. Checked BEFORE the resolver so a disabled audio
+    # feature returns its own stable code even if the artifact would also
+    # have failed for some other reason — the user needs to know the feature
+    # is off, not be sent chasing a different model.
+    if task in AUDIO_TASKS and not audio_deployment_enabled():
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "AUDIO_DEPLOYMENT_TEMPORARILY_DISABLED",
+                "message": AUDIO_DISABLED_MESSAGE,
+            },
+        )
     compatibility = resolve_runtime_compatibility(
-        req.hf_model_id, filename, task, resolved_size_mb, dict(device)
+        req.hf_model_id, filename, task, resolved_size_mb, dict(device),
+        revision=getattr(req, "revision", None), sha256=model_sha256,
+        size_bytes=int(resolved_size_mb * 1024 * 1024) if resolved_size_mb else None,
     )
     if not compatibility["deployable"]:
         raise HTTPException(
             status_code=422,
             detail={
-                "message": "This model does not match an implemented LokiAI Android runtime contract.",
+                "code": compatibility["rejection_code"],
+                "message": compatibility.get("rejection_detail")
+                           or "This model does not match an implemented LokiAI Android runtime contract.",
                 "compatibility": compatibility,
             },
         )
@@ -7075,6 +7625,23 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
         }), compatibility["adapter_id"], compatibility["adapter_version"],
             ANDROID_RUNTIME_VERSION, json.dumps(compatibility))
         deployment_id = str(row["id"])
+
+        # Any deployment this device was still nominally working on has now
+        # been displaced by this one. Recording the successor makes
+        # "superseded" a first-class, attributable outcome instead of an
+        # anonymous 'failed' row the user has to guess about.
+        await conn.execute(
+            """UPDATE deployments
+                  SET superseded_by_deployment_id = $2::uuid,
+                      cancellation_source = COALESCE(cancellation_source, 'superseded'),
+                      cancellation_reason = COALESCE(cancellation_reason,
+                          'Displaced by a newer deployment on the same device'),
+                      cancelled_at = COALESCE(cancelled_at, NOW())
+                WHERE device_id = $1::uuid
+                  AND id <> $2::uuid
+                  AND status IN ('queued', 'downloading', 'downloaded', 'validating')""",
+            req.device_id, deployment_id,
+        )
 
     deployment_status[deployment_id] = {"status": "queued", "progress_percent": 0, "error_message": None}
 
@@ -7117,6 +7684,9 @@ async def list_deployments(request: Request, user_id: str = Depends(get_current_
         rows = await conn.fetch(
             """SELECT d.id, d.device_id, d.status, d.progress, d.error_message,
                       d.deployed_at, d.completed_at,
+                      d.cancellation_source, d.cancelled_at,
+                      d.cancellation_reason, d.cancellation_request_id,
+                      d.progress_at_cancellation, d.superseded_by_deployment_id,
                       dev.phone_model,
                       m.name AS model_name, m.format AS model_format, m.task_type
                FROM deployments d
@@ -7134,6 +7704,11 @@ async def list_deployments(request: Request, user_id: str = Depends(get_current_
         d["device_id"] = str(d["device_id"]) if d["device_id"] else None
         d["deployed_at"] = d["deployed_at"].isoformat() if d["deployed_at"] else None
         d["completed_at"] = d["completed_at"].isoformat() if d["completed_at"] else None
+        d["cancelled_at"] = d["cancelled_at"].isoformat() if d["cancelled_at"] else None
+        d["superseded_by_deployment_id"] = (
+            str(d["superseded_by_deployment_id"])
+            if d["superseded_by_deployment_id"] else None
+        )
         # Live in-memory status (set by the WS progress handler) is more
         # current than the DB row for anything still active.
         live = deployment_status.get(d["id"])
@@ -7141,6 +7716,10 @@ async def list_deployments(request: Request, user_id: str = Depends(get_current_
             d["status"] = live["status"]
             d["progress"] = live["progress_percent"]
             d["error_message"] = live["error_message"]
+            for key in ("cancellation_source", "cancellation_request_id",
+                        "progress_at_cancellation"):
+                if live.get(key) is not None:
+                    d[key] = live[key]
         result.append(d)
     return result
 
@@ -7193,30 +7772,92 @@ async def cancel_deployment(deployment_id: str, request: Request, user_id: str =
     the active download and discard its partial file.
     """
     pool = request.app.state.pool
+    # Correlation id: supplied by the dashboard so a cancellation can be
+    # traced from click -> HTTP request -> DB row -> WebSocket command ->
+    # phone acknowledgement. Generated here when a bare API call omits it, so
+    # the chain is never broken.
+    request_id = (
+        request.headers.get("x-lokiai-request-id")
+        or request.headers.get("x-request-id")
+        or f"srv-{uuid.uuid4()}"
+    )
+    # A dashboard click carries the correlation header; a raw API call does
+    # not. Both are the authenticated user, but they are different surfaces
+    # and the audit trail should say which.
+    source = "user_dashboard" if request.headers.get("x-lokiai-request-id") else "user_api"
+    existing = None
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """UPDATE deployments
-                   SET status = 'cancelled', error_message = 'Cancelled by user'
+                   SET status = 'cancelled',
+                       error_message = 'Cancelled by user',
+                       cancellation_source = $3,
+                       cancelled_by_user_id = $2::uuid,
+                       cancelled_by_device_id = device_id,
+                       cancelled_at = NOW(),
+                       cancellation_request_id = $4,
+                       cancellation_reason = 'Cancelled from the LokiAI dashboard',
+                       -- Progress is PRESERVED. Overwriting it with zero
+                       -- destroyed the only evidence of how far the transfer
+                       -- had reached, and made every cancellation look like a
+                       -- deployment that never started.
+                       progress_at_cancellation = progress,
+                       updated_at = NOW()
                    WHERE id = $1::uuid AND user_id = $2::uuid
                      AND status IN ('queued', 'downloading', 'downloaded', 'validating')
-                   RETURNING device_id""",
-                deployment_id, user_id,
+                   RETURNING device_id, progress, cancellation_request_id""",
+                deployment_id, user_id, source, request_id,
             )
+            if not row:
+                # Idempotency: re-cancelling an already-cancelled deployment
+                # is a no-op success, not a 409. The dashboard retries, and a
+                # duplicate click must not surface as an error.
+                existing = await conn.fetchrow(
+                    """SELECT status, progress, progress_at_cancellation,
+                              cancellation_source, cancellation_request_id
+                         FROM deployments
+                        WHERE id = $1::uuid AND user_id = $2::uuid""",
+                    deployment_id, user_id,
+                )
     except (asyncpg.PostgresError, ValueError):
         raise HTTPException(status_code=404, detail="Deployment not found")
     if not row:
+        if existing and existing["status"] == "cancelled":
+            return {
+                "deployment_id": deployment_id,
+                "status": "cancelled",
+                "cancellation_source": existing["cancellation_source"],
+                "cancellation_request_id": existing["cancellation_request_id"],
+                "progress_at_cancellation": existing["progress_at_cancellation"],
+                "idempotent_replay": True,
+            }
         raise HTTPException(status_code=409, detail="Only queued, downloading, downloaded, or validating deployments can be cancelled")
 
+    preserved = row["progress"] or 0
     deployment_status[deployment_id] = {
-        "status": "cancelled", "progress_percent": 0,
+        "status": "cancelled",
+        "progress_percent": preserved,
         "error_message": "Cancelled by user",
+        "cancellation_source": source,
+        "cancellation_request_id": request_id,
+        "progress_at_cancellation": preserved,
     }
     if row["device_id"]:
         await ws_manager.send_json(str(row["device_id"]), {
-            "action": "cancel_deployment", "deployment_id": deployment_id,
+            "action": "cancel_deployment",
+            "deployment_id": deployment_id,
+            # Echoed back by the phone so its acknowledgement can be tied to
+            # this exact cancellation request.
+            "cancellation_request_id": request_id,
         })
-    return {"deployment_id": deployment_id, "status": "cancelled"}
+    return {
+        "deployment_id": deployment_id,
+        "status": "cancelled",
+        "cancellation_source": source,
+        "cancellation_request_id": request_id,
+        "progress_at_cancellation": preserved,
+    }
 
 
 @app.get("/admin/stats")

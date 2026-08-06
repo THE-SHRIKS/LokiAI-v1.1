@@ -487,10 +487,31 @@ export function TasksPanel({ onClose }: { onClose?: () => void }) {
     }
   };
 
+  // Names the actor when the backend recorded one. `unknown_legacy` marks
+  // rows cancelled before cancellation attribution existed — shown honestly
+  // rather than being attributed to a user who may not have done it.
+  const cancellationLabel = (d: DeploymentRecord) => {
+    switch (d.cancellation_source) {
+      case "user_dashboard": return "cancelled from dashboard";
+      case "user_api": return "cancelled via API";
+      case "device": return "cancelled on device";
+      case "superseded": return "superseded by a newer deployment";
+      case "backend_recovery": return "cancelled by recovery";
+      case "administrator": return "cancelled by an administrator";
+      case "unknown_legacy": return "cancelled (source not recorded)";
+      default: return "cancelled";
+    }
+  };
+
   const item = (d: DeploymentRecord) => (
     <li key={d.id} className="flex items-center gap-2 rounded border border-border bg-background/40 px-2 py-1.5 text-xs">
+      {/* A cancellation is a deliberate user action, not a failure. It used
+          to share the destructive XCircle and red text with `failed`, which
+          made every cancelled deployment read as a broken model. Same layout,
+          honest semantics. */}
       {d.status === "complete" ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-olive-bright" />
-        : (d.status === "failed" || d.status === "cancelled") ? <XCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
+        : d.status === "cancelled" ? <Ban className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        : d.status === "failed" ? <XCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
         : <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-olive-bright" />}
       <div className="min-w-0 flex-1">
         <div className="truncate text-foreground">{d.model_name ?? "model"}</div>
@@ -498,13 +519,23 @@ export function TasksPanel({ onClose }: { onClose?: () => void }) {
           {d.phone_model ?? "device"} · <span className={cn(
             d.status === "complete" && "text-olive-glow/80",
             (d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") && "text-olive-bright",
-            (d.status === "failed" || d.status === "cancelled") && "text-destructive",
+            d.status === "cancelled" && "text-muted-foreground",
+            d.status === "failed" && "text-destructive",
           )}>
-            {d.status}{(d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") ? ` ${d.progress}%` : ""}
+            {d.status === "cancelled" ? cancellationLabel(d) : d.status}
+            {(d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") ? ` ${d.progress}%` : ""}
           </span>
         </div>
-        {(d.status === "failed" || d.status === "cancelled") && d.error_message && (
+        {d.status === "failed" && d.error_message && (
           <div className="truncate text-[10px] text-destructive">{d.error_message}</div>
+        )}
+        {d.status === "cancelled" && (
+          <div className="truncate text-[10px] text-muted-foreground">
+            {d.cancellation_reason ?? "Cancelled before completion"}
+            {typeof d.progress_at_cancellation === "number"
+              ? ` · stopped at ${d.progress_at_cancellation}%`
+              : ""}
+          </div>
         )}
         {(d.status === "queued" || d.status === "downloading" || d.status === "downloaded" || d.status === "validating") && (
           <button

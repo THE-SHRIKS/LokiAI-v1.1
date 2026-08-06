@@ -486,11 +486,56 @@ export async function getDeployment(deploymentId: string) {
   return request<DeploymentStatus>(`/deployments/${deploymentId}`);
 }
 
+export interface CancelDeploymentResult {
+  deployment_id: string;
+  status: "cancelled";
+  cancellation_source?: string;
+  cancellation_request_id?: string;
+  progress_at_cancellation?: number;
+  idempotent_replay?: boolean;
+}
+
+/**
+ * Cancels a deployment, carrying a correlation id so the cancellation can be
+ * traced end to end: this click -> HTTP request -> deployments row ->
+ * WebSocket command -> phone acknowledgement. The backend records
+ * `cancellation_source = 'user_dashboard'` when this header is present, and
+ * `'user_api'` when it is not — previously nothing distinguished the two, and
+ * a cancelled row recorded no actor at all.
+ */
 export async function cancelDeployment(deploymentId: string) {
-  return request<{ deployment_id: string; status: "cancelled" }>(
+  const requestId =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? `dash-${crypto.randomUUID()}`
+      : `dash-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return request<CancelDeploymentResult>(
     `/deployments/${deploymentId}/cancel`,
-    { method: "POST" },
+    { method: "POST", headers: { "X-LokiAI-Request-Id": requestId } },
   );
+}
+
+/** Build identity of this dashboard bundle, injected at build time. */
+export const DASHBOARD_BUILD = {
+  commit: (import.meta.env?.VITE_BUILD_COMMIT as string) ?? "unknown",
+  buildTimestamp: (import.meta.env?.VITE_BUILD_TIMESTAMP as string) ?? "unknown",
+  frontendProtocolVersion: "lokiai_frontend_protocol_1",
+} as const;
+
+/**
+ * Every component's version in one call, so a release audit is one request
+ * rather than four manual comparisons. The incident review could not prove
+ * which commit the live dashboard bundle came from because nothing in the
+ * bundle carried a stamp; DASHBOARD_BUILD above closes that gap.
+ */
+export async function getVersionDiagnostics() {
+  return request<{
+    backend: Record<string, unknown>;
+    dashboard: Record<string, unknown>;
+    apk: Record<string, unknown>;
+    consistent: boolean;
+    mismatches: string[];
+    unverifiable: string[];
+  }>("/diagnostics/versions");
 }
 
 export interface DeploymentRecord {
@@ -505,6 +550,16 @@ export interface DeploymentRecord {
   model_name: string | null;
   model_format: string | null;
   task_type: string | null;
+  // Cancellation attribution. Absent on rows written before the
+  // 20260806_deployment_cancellation_audit migration.
+  cancellation_source?:
+    | "user_dashboard" | "user_api" | "device" | "superseded"
+    | "backend_recovery" | "administrator" | "unknown_legacy" | null;
+  cancelled_at?: string | null;
+  cancellation_reason?: string | null;
+  cancellation_request_id?: string | null;
+  progress_at_cancellation?: number | null;
+  superseded_by_deployment_id?: string | null;
 }
 
 export async function listDeployments() {

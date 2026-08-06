@@ -8,6 +8,17 @@ import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 const isVercelDeployment = process.env.VERCEL === "1";
 
+// Build identity compiled into the bundle. The incident review could not
+// prove which commit the live dashboard was built from, because nothing in
+// the served JavaScript carried a stamp — chunk content hashes only say
+// "different", never "which". Vercel exposes VERCEL_GIT_COMMIT_SHA.
+const buildCommit =
+  process.env.VERCEL_GIT_COMMIT_SHA ??
+  process.env.GITHUB_SHA ??
+  process.env.VITE_BUILD_COMMIT ??
+  "unknown";
+const buildTimestamp = new Date().toISOString();
+
 export default defineConfig({
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
@@ -27,6 +38,8 @@ export default defineConfig({
       "import.meta.env.VITE_WORKSPACE_MOUNTED": JSON.stringify(
         isVercelDeployment ? "true" : "false",
       ),
+      "import.meta.env.VITE_BUILD_COMMIT": JSON.stringify(buildCommit),
+      "import.meta.env.VITE_BUILD_TIMESTAMP": JSON.stringify(buildTimestamp),
     },
     // No source maps in the shipped production bundle — don't hand out an
     // unminified map of the app's real source to anyone who opens DevTools.

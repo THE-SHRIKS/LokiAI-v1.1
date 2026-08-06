@@ -57,6 +57,15 @@ android {
 
     sourceSets {
         main.java.srcDirs += "src/main/kotlin"
+        test.java.srcDirs += "src/test/kotlin"
+    }
+
+    testOptions {
+        unitTests {
+            // Android framework calls return defaults instead of throwing, so
+            // the exit-classifier tests can run off-device.
+            returnDefaultValues = true
+        }
     }
 
     buildTypes {
@@ -123,4 +132,10 @@ dependencies {
     implementation platform("org.jetbrains.kotlin:kotlin-bom:$kotlin_version")
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutines_version"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutines_version"
+
+    // Off-device unit tests for the inference-service exit classifier and
+    // structured diagnostics (see src/test). org.json is stubbed to throw in
+    // unit tests by default, so a real implementation is supplied.
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "org.json:json:20240303"
 }

@@ -268,5 +268,78 @@ void main() {
       expect(await ModelGuard.isQuarantined('/data/models/bad.gguf'), isTrue);
       expect(await ModelGuard.isQuarantined('/data/models/good.gguf'), isFalse);
     });
+
+    // P0 incident, failure 2 (second-order damage): the inference service
+    // dying mid-load left the load marker behind, and two service kills then
+    // quarantined a model that had never actually failed.
+    test('a service kill never quarantines the model, however often', () async {
+      const path = '/data/models/innocent.gguf';
+      for (var i = 0; i < 5; i++) {
+        await ModelGuard.beginLoad(path);
+        await ModelGuard.recoverFromNativeCrash(
+          exitReason: 'INFERENCE_SERVICE_LOW_MEMORY_KILL',
+        );
+      }
+      expect(await ModelGuard.isQuarantined(path), isFalse);
+    });
+
+    test('an unexplained service exit does not quarantine either', () async {
+      const path = '/data/models/unknown-exit.gguf';
+      await ModelGuard.beginLoad(path);
+      await ModelGuard.recoverFromNativeCrash(
+        exitReason: 'INFERENCE_SERVICE_UNKNOWN_EXIT',
+      );
+      await ModelGuard.beginLoad(path);
+      await ModelGuard.recoverFromNativeCrash(
+        exitReason: 'INFERENCE_SERVICE_UNKNOWN_EXIT',
+      );
+      expect(await ModelGuard.isQuarantined(path), isFalse);
+    });
+
+    test('discardLoadAttempt clears the marker without a strike', () async {
+      const path = '/data/models/discarded.gguf';
+      await ModelGuard.beginLoad(path);
+      await ModelGuard.discardLoadAttempt(
+        path,
+        reason: 'INFERENCE_SERVICE_DISCONNECTED',
+        evidence: const {'exit_evidence': {'reason_name': 'LOW_MEMORY'}},
+      );
+      // No stale marker survives, so startup recovery finds nothing to blame.
+      expect(await ModelGuard.recoverFromNativeCrash(), isNull);
+      expect(await ModelGuard.isQuarantined(path), isFalse);
+    });
+
+    test('a structured failure record is persisted for diagnosis', () async {
+      const path = '/data/models/recorded.gguf';
+      await ModelGuard.recordFailure(
+        path: path,
+        failureClass: 'INFERENCE_SERVICE_LOW_MEMORY_KILL',
+        operation: 'load',
+        evidence: const {'exit_evidence': {'reason_name': 'LOW_MEMORY'}},
+        attributedToModel: false,
+      );
+      final log = await ModelGuard.failureLog();
+      expect(log, isNotEmpty);
+      final record = log.last;
+      expect(record['failure_class'], 'INFERENCE_SERVICE_LOW_MEMORY_KILL');
+      expect(record['exit_reason'], 'LOW_MEMORY');
+      expect(record['operation'], 'load');
+      expect(record['attributed_to_model'], isFalse);
+      expect(record['evidence_level'], 'platform_confirmed');
+      expect(record['adapter_version'], isNotNull);
+      expect(record['runtime_version'], isNotNull);
+      expect(record['timestamp'], isNotNull);
+      // The artifact is fingerprinted, never stored as an absolute path.
+      expect(record['artifact_fingerprint'], isNot(contains('/')));
+    });
+
+    test('a genuine native abort still quarantines after two strikes', () async {
+      const path = '/data/models/really-bad.gguf';
+      await ModelGuard.beginLoad(path);
+      await ModelGuard.recoverFromNativeCrash();
+      await ModelGuard.beginLoad(path);
+      await ModelGuard.recoverFromNativeCrash();
+      expect(await ModelGuard.isQuarantined(path), isTrue);
+    });
   });
 }

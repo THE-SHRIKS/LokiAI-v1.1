@@ -117,12 +117,17 @@ class VoiceInference {
     if (inTensor.type != TensorType.float32 ||
         outTensor.type != TensorType.float32) {
       interpreter.close();
+      // Names the exact contract that failed. The previous wording — "only
+      // supports a standard float32 sound-classification TFLite model" — sent
+      // users hunting for any Float32 audio model, which is precisely how an
+      // artifact with a 1-sample input window came to be deployed. Float32
+      // alone was never the contract.
       return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_INPUT_DTYPE_MISMATCH',
-          'This audio model uses ${inTensor.type}/${outTensor.type} '
-              'tensors. LokiAI\'s microphone pipeline only supports a '
-              'standard float32 sound-classification TFLite model.',
+          'Tensor dtype contract not met: expected Float32 input and Float32 '
+              'output, but this artifact declares ${_dtypeName(inTensor.type)} '
+              'input and ${_dtypeName(outTensor.type)} output.',
         ),
       );
     }
@@ -149,11 +154,14 @@ class VoiceInference {
       interpreter.close();
       return AudioProbeResult(
         rejection: ModelRejection(
-          'AUDIO_SAMPLE_RATE_UNSUPPORTED',
-          'This audio model expects an input window of $inputSamples '
-              'samples. LokiAI\'s only implemented audio adapter '
-              '(tflite_yamnet_audio_v1) requires exactly $yamnetInputSamples '
-              'samples (0.975s @ ${yamnetSampleRate}Hz mono).',
+          'AUDIO_INPUT_SHAPE_MISMATCH',
+          'Waveform window contract not met: expected $yamnetInputSamples '
+              'samples (0.975s of mono ${yamnetSampleRate}Hz audio) but this '
+              'artifact declares $inputSamples '
+              '${inputSamples == 1 ? "sample" : "samples"} '
+              '(input shape ${inTensor.shape}). The microphone pipeline '
+              'delivers fixed $yamnetInputSamples-sample frames and cannot '
+              'feed this artifact.',
         ),
       );
     }
@@ -183,14 +191,25 @@ class VoiceInference {
         ),
       );
     }
-    if (outputClasses != labels.length || outputClasses != yamnetOutputClasses) {
+    if (outputClasses != yamnetOutputClasses) {
+      interpreter.close();
+      return AudioProbeResult(
+        rejection: ModelRejection(
+          'AUDIO_OUTPUT_SHAPE_MISMATCH',
+          'Output contract not met: expected $yamnetOutputClasses classes but '
+              'this artifact declares $outputClasses '
+              '(output shape ${outTensor.shape}).',
+        ),
+      );
+    }
+    if (outputClasses != labels.length) {
       interpreter.close();
       return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_LABEL_CONTRACT_MISMATCH',
-          'This audio model outputs $outputClasses classes but the bundled '
-              'label set has ${labels.length} entries (adapter '
-              'tflite_yamnet_audio_v1 requires exactly $yamnetOutputClasses).',
+          'Label contract not met: this artifact produces $outputClasses '
+              'output values but the bundled AudioSet label set has '
+              '${labels.length} entries, so scores cannot be mapped to names.',
         ),
       );
     }
@@ -225,6 +244,15 @@ class VoiceInference {
     }
 
     return AudioProbeResult(interpreter: interpreter, labels: labels);
+  }
+
+  /// Human-readable tensor dtype, so a rejection can name what the artifact
+  /// actually declares (Int8, UInt8, Float16, …) instead of a generic
+  /// "not Float32".
+  static String _dtypeName(TensorType type) {
+    final raw = type.toString();
+    final dot = raw.lastIndexOf('.');
+    return dot >= 0 ? raw.substring(dot + 1) : raw;
   }
 
   /// A synthetic 1kHz sine tone encoded as PCM16 little-endian bytes, the

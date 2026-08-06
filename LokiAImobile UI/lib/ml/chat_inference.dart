@@ -5,6 +5,7 @@ import 'package:fllama/fllama.dart';
 
 import '../diagnostics.dart';
 import 'model_guard.dart';
+import 'service_failure.dart';
 
 /// The only owner of a fllama context.  A context is deliberately not shared
 /// between deployed models: model metadata may stay resident, native contexts
@@ -38,6 +39,17 @@ class ChatInference {
   // instead of collapsing every possible failure into one generic
   // "not ready, redeploy it" message.
   String? get failureCode => _failureCode;
+
+  /// Set when the last activation failed because the on-device inference
+  /// SERVICE failed, not the model. Callers use this to avoid presenting a
+  /// service fault as model incompatibility, and to avoid offering a
+  /// redeploy that cannot help.
+  ServiceFailure? get lastServiceFailure => _lastServiceFailure;
+
+  /// True when the last failure was the service rather than the artifact.
+  bool get failedDueToService => _lastServiceFailure != null;
+
+  ServiceFailure? _lastServiceFailure;
 
   double? _contextId;
   String? _modelPath;
@@ -119,6 +131,7 @@ class ChatInference {
     final epoch = _epoch;
     _modelPath = path;
     _failure = null;
+    _lastServiceFailure = null;
 
     if (await ModelGuard.isQuarantined(path)) {
       return _fail(
@@ -161,6 +174,27 @@ class ChatInference {
       _state = ChatRuntimeState.ready;
       _log('load', 'ready');
     } catch (error, stackTrace) {
+      // A failure of the inference SERVICE is not a failure of the model.
+      // This branch must come first: the generic handler below would
+      // otherwise relabel a SERVICE_DISCONNECTED as
+      // CHAT_CONTEXT_CREATE_FAILED and tell the user to redeploy bytes that
+      // were never the problem.
+      final service = ServiceFailure.from(error);
+      if (service != null) {
+        // Clear the load marker WITHOUT recording a strike. The model never
+        // got a fair attempt, so counting one would eventually quarantine an
+        // innocent file — exactly the compounding failure the incident review
+        // found.
+        await ModelGuard.discardLoadAttempt(
+          path,
+          reason: service.code,
+          evidence: service.details,
+        );
+        _record('load', error, stackTrace);
+        _lastServiceFailure = service;
+        _fail(service.userMessage, code: service.code);
+        return;
+      }
       await ModelGuard.endLoad(path);
       _record('load', error, stackTrace);
       // The exact native error is reported, not a generic catch-all — this

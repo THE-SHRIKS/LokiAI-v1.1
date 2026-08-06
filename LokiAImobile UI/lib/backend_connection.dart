@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'build_identity.dart';
 import 'config_reader.dart';
 import 'device_credential_store.dart';
 import 'device_registration.dart';
@@ -340,6 +341,10 @@ class BackendConnection {
         // config is unreadable", so the backend does not silently treat a
         // broken install as a clean one.
         'config_error': result.error,
+        // Installed-build identity, so a release audit can compare what is
+        // ACTUALLY running on this handset against the backend, dashboard and
+        // served APK — previously the phone reported no version at all.
+        'build': BuildIdentity.report(),
         'timestamp': DateTime.now().toUtc().toIso8601String(),
       });
     } catch (e) {
@@ -425,7 +430,13 @@ class BackendConnection {
     if (data['action'] == 'cancel_deployment') {
       final deploymentId = data['deployment_id'] as String?;
       if (deploymentId != null && deploymentId.isNotEmpty) {
-        ModelDownloader.cancel(deploymentId);
+        // The correlation id is carried through to the acknowledgement so a
+        // cancellation can be traced end to end: dashboard click -> HTTP
+        // request -> DB row -> WebSocket command -> phone acknowledgement.
+        ModelDownloader.cancel(
+          deploymentId,
+          requestId: data['cancellation_request_id'] as String?,
+        );
       }
       return;
     }

@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "lokiai-dashboard",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "LokiAI-Desktop/stellar-dashboard-builder-main", "run", "dev"],
+      "port": 8080,
+      "autoPort": true
+    },
+    {
+      "name": "lokiai-backend",
+      "runtimeExecutable": "L:/The Shriks/LokiAI/LokiAI-backend/venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "LokiAI-backend"],
+      "port": 8000
+    }
+  ]
+}
