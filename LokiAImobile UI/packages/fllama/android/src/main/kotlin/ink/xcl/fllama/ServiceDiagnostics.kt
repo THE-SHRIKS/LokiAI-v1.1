@@ -56,13 +56,15 @@ enum class ServiceOperationPhase(val wire: String) {
 object ServiceExitInspector {
 
     /** Exit evidence for the inference process, or null when none is available. */
-    fun inspect(context: Context, processSuffix: String = ":inference"): ExitEvidence? {
+    fun inspect(context: Context, processSuffix: String = ":inference", sinceTimestampMs: Long = 0): ExitEvidence? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         return try {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
                 ?: return null
             val records = am.getHistoricalProcessExitReasons(context.packageName, 0, 10)
-            val match = records.firstOrNull { it.processName.endsWith(processSuffix) }
+            val match = records.firstOrNull { 
+                it.processName.endsWith(processSuffix) && it.timestamp >= sinceTimestampMs 
+            }
                 ?: return null
             ExitEvidence(
                 code = classify(match),

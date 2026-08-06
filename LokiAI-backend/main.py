@@ -3835,6 +3835,7 @@ async def search_deployable_models(
     client: httpx.AsyncClient, tasks: list, user_message: str, max_size_mb: float,
     device: Optional[dict] = None,
     limit: int = 12,
+    hard_constraints: Optional[dict] = None,
 ) -> list:
     """Real HuggingFace search constrained to phone-runnable models.
 
@@ -3844,7 +3845,7 @@ async def search_deployable_models(
     """
     hf_url = "https://huggingface.co/api/models"
     keywords = _extract_keywords(user_message)
-    hard_constraints = extract_hard_constraints(user_message)
+    hard_constraints = hard_constraints or extract_hard_constraints(user_message)
 
     # The app's chat runtime is llama.cpp: chat models MUST be GGUF.
     # Vision/audio run on TFLite. Never cross-recommend formats.
@@ -5439,6 +5440,17 @@ def _record_shown_candidates(state: Dict[str, Any], candidate_ids: list) -> Dict
     return state
 
 
+_ARTIFACT_FAILURE_CODES = [
+    "CHAT_MODEL_FORMAT_INVALID",
+    "MODEL_NOT_GGUF",
+    "MODEL_IS_SPLIT_SHARD",
+    "MODEL_ARCHITECTURE_UNSUPPORTED",
+    "AUDIO_TENSOR_CONTRACT_MISMATCH",
+    "AUDIO_LABEL_MISMATCH",
+    "VISION_INPUT_CONTRACT_MISMATCH",
+    "VISION_OUTPUT_CONTRACT_MISMATCH",
+]
+
 async def _recently_failed_model_ids(pool, device_id: str, limit: int = 30) -> set:
     """HuggingFace model ids that failed on THIS exact device recently, so
     they are not silently re-recommended as if nothing had happened."""
@@ -5450,9 +5462,11 @@ async def _recently_failed_model_ids(pool, device_id: str, limit: int = 30) -> s
                    JOIN models m ON m.id = d.model_id
                    WHERE d.device_id = $1::uuid AND d.status = 'failed'
                      AND m.hf_model_id IS NOT NULL
+                     AND d.failure_category = 'smoke_test_failed'
+                     AND d.failure_code = ANY($3::text[])
                    ORDER BY m.hf_model_id
                    LIMIT $2""",
-                device_id, limit,
+                device_id, limit, _ARTIFACT_FAILURE_CODES,
             )
         return {r["hf_model_id"] for r in rows}
     except (asyncpg.PostgresError, ValueError):
@@ -6243,6 +6257,16 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
     if planned_tasks:
         search_state = _apply_task_change_to_state(search_state, planned_tasks[0])
         search_state["last_operation"] = "search_for_model"
+        
+        # F6: Merge hard constraints after potential task change reset
+        stored_constraints = search_state.get("hard_constraints") or {}
+        if hard_constraints:
+            search_state["hard_constraints"] = {**stored_constraints, **hard_constraints}
+        else:
+            search_state["hard_constraints"] = stored_constraints
+            
+        hard_constraints = search_state["hard_constraints"]
+        
         await _save_search_state(pool, conversation_id, search_state)
 
     # Four different audio-family capabilities (transcription, wake-word
@@ -6328,6 +6352,7 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
                 client, search_tags, req.message, max_size_mb,
                 device,
                 limit=max(12, task["quantity"] * 6),
+                hard_constraints=hard_constraints,
             )
             found = _apply_task_constraints(found, task["constraints"])
             # Repetition/failure exclusion: a candidate already shown in this
@@ -6542,6 +6567,7 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
     if task_failures:
         prose += " " + " ".join(f["message"] for f in task_failures)
 
+    # hard_constraints was merged and persisted at line 6259
     search_state = _record_shown_candidates(search_state, [m["id"] for m in validated])
     await _save_search_state(pool, conversation_id, search_state)
 
@@ -6934,7 +6960,7 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
                        WHERE id = $1::uuid AND device_id = $2::uuid""",
                     reported_id, device_id,
                 )
-                if row and row["status"] in ("queued", "downloading"):
+                if row and row["status"] in ("queued", "downloading", "downloaded", "validating"):
                     # Server thought it was still running; the device says it
                     # finished while we weren't listening.
                     if reported_status in ("complete", "downloaded"):
@@ -6957,10 +6983,33 @@ async def _handle_state_report(pool, device_id: str, data: dict, websocket: WebS
                     }
                     print(f"[WS] reconciled deployment {reported_id} -> {reported_status} from device report")
 
-            # Anything the server still believes is in flight for this device
-            # that the phone did NOT mention is unresolvable from the device's
-            # side; leave it for the stale-deployment timeout rather than
-            # guessing.
+            # Expire any downloaded/validating rows that the connected phone is definitively not working on.
+            exclude_id = reported_id if reported_status in ("downloading", "downloaded", "validating") else None
+            if exclude_id:
+                await conn.execute(
+                    """UPDATE deployments SET status = 'failed',
+                           error_message = 'Phone reconnected with a different active deployment',
+                           failure_category = 'transport_timeout',
+                           updated_at = NOW()
+                       WHERE device_id = $1::uuid
+                         AND id <> $2::uuid
+                         AND status IN ('downloaded', 'validating')
+                         AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '3 minutes'""",
+                    device_id, exclude_id,
+                )
+            else:
+                await conn.execute(
+                    """UPDATE deployments SET status = 'failed',
+                           error_message = 'Phone reconnected with no active deployment for this row',
+                           failure_category = 'transport_timeout',
+                           updated_at = NOW()
+                       WHERE device_id = $1::uuid
+                         AND status IN ('downloaded', 'validating')
+                         AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '3 minutes'""",
+                    device_id,
+                )
+
+            # Tell the device what the server still considers outstanding.
             pending = await conn.fetch(
                 """SELECT id, status FROM deployments
                    WHERE device_id = $1::uuid AND status IN ('queued', 'downloading', 'downloaded', 'validating')
@@ -7681,6 +7730,21 @@ async def list_deployments(request: Request, user_id: str = Depends(get_current_
     dashboard's Background Tasks (active) and Changes (history) panels."""
     pool = request.app.state.pool
     async with pool.acquire() as conn:
+        # F5: Bulk stale reconciliation. Only touch disconnected devices, 
+        # as connected devices self-heal via state_report.
+        devices = await conn.fetch("SELECT id FROM devices WHERE user_id = $1::uuid", user_id)
+        disconnected = [str(d["id"]) for d in devices if not ws_manager.is_connected(str(d["id"]))]
+        if disconnected:
+            await conn.execute(
+                f"""UPDATE deployments SET status = 'failed',
+                       error_message = 'Timed out: phone stopped reporting progress and is offline',
+                       failure_category = 'transport_timeout',
+                       updated_at = NOW()
+                   WHERE device_id = ANY($1::uuid[])
+                     AND {_STALE_DEPLOYMENT_PREDICATE}""",
+                disconnected
+            )
+
         rows = await conn.fetch(
             """SELECT d.id, d.device_id, d.status, d.progress, d.error_message,
                       d.deployed_at, d.completed_at,

@@ -48,6 +48,7 @@ class FllamaPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, EventChann
     private var state: ServiceConnectionState = ServiceConnectionState.UNBOUND
     private var rebindAttempts = 0
     private var sessionGeneration = 0
+    private var sessionStartTimeMs: Long = 0
     private var connectionRegistered = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var scheduledRebind: Runnable? = null
@@ -248,6 +249,7 @@ class FllamaPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, EventChann
             return
         }
         transitionTo(ServiceConnectionState.BINDING)
+        sessionStartTimeMs = System.currentTimeMillis()
         val intent = Intent(appContext, FllamaService::class.java)
         val boundSuccessfully = try {
             appContext.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
@@ -367,7 +369,7 @@ class FllamaPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, EventChann
      */
     private fun diagnostics(code: ServiceFailureCode, requestId: Int? = null): String {
         val ctx = context
-        val exit = ctx?.let { ServiceExitInspector.inspect(it) }
+        val exit = ctx?.let { ServiceExitInspector.inspect(it, sinceTimestampMs = sessionStartTimeMs) }
         val memory = ctx?.let { ServiceExitInspector.memoryState(it) }
         return ServiceDiagnostics.build(
             componentName = lastComponentName,
@@ -392,7 +394,7 @@ class FllamaPlugin : FlutterPlugin, MethodCallHandler, ActivityAware, EventChann
      */
     private fun resolveCode(code: ServiceFailureCode): ServiceFailureCode {
         val ctx = context ?: return code
-        val exit = ServiceExitInspector.inspect(ctx) ?: return code
+        val exit = ServiceExitInspector.inspect(ctx, sinceTimestampMs = sessionStartTimeMs) ?: return code
         return when (exit.code) {
             ServiceFailureCode.LOW_MEMORY_KILL,
             ServiceFailureCode.NATIVE_CRASH,

@@ -325,14 +325,23 @@ class ChatInference {
     } catch (error, stackTrace) {
       if (_epoch == epoch && _activeRequest == request) {
         _record('completion', error, stackTrace, request: request);
-        if (!output.isClosed)
-          output.add('Generation failed. Please try again.');
+        final service = ServiceFailure.from(error);
+        if (service != null) {
+          _lastServiceFailure = service;
+          _state = ChatRuntimeState.failed;
+          if (!output.isClosed) output.add(service.userMessage);
+        } else {
+          if (!output.isClosed)
+            output.add('Generation failed. Please try again.');
+        }
       }
     } finally {
       _watchdog?.cancel();
       if (_epoch == epoch && _activeRequest == request) {
         _invalidateRequest();
-        _state = ChatRuntimeState.ready;
+        if (_state != ChatRuntimeState.failed) {
+          _state = ChatRuntimeState.ready;
+        }
         await _detachTokens(subscription: tokenTap);
         if (!output.isClosed) await output.close();
       }
