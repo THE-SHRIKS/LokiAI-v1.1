@@ -329,6 +329,20 @@ async def _run_migrations(pool: asyncpg.Pool):
                  AND validation_result IS NULL"""
         )
 
+        # Internal-analytics only (see GET /admin/insights). Nothing before
+        # this table existed ever counted an APK download — there is no way
+        # to backfill history that was never recorded.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS apk_downloads (
+                id            BIGSERIAL PRIMARY KEY,
+                downloaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                user_agent    TEXT
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS apk_downloads_time_idx ON apk_downloads (downloaded_at)"
+        )
+
 
 async def _create_pool_with_retry(retries: int = 5, base_delay: float = 2.0) -> asyncpg.Pool:
     """Neon's serverless compute auto-suspends after inactivity and takes a
@@ -2022,6 +2036,20 @@ async def download_apk(request: Request):
     production — it keeps a ~141MB binary out of the repository); otherwise
     serves the copy shipped alongside the backend.
     """
+    # Count real downloads only — HEAD requests are pre-flight/size probes,
+    # not an install. Best-effort: a DB hiccup here must never break the
+    # actual download.
+    if request.method == "GET":
+        try:
+            pool = request.app.state.pool
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO apk_downloads (user_agent) VALUES ($1)",
+                    request.headers.get("user-agent", "")[:500],
+                )
+        except Exception as e:
+            print(f"[apk] download-count insert failed (non-fatal): {e}")
+
     if APK_DOWNLOAD_URL:
         return await _stream_external_apk(request)
     if not os.path.exists(_APK_PATH):
@@ -7983,3 +8011,107 @@ async def get_admin_stats(request: Request, _admin: str = Depends(require_admin)
             },
             "users": users
         }
+
+
+@app.get("/admin/insights")
+async def get_admin_insights(request: Request, _admin: str = Depends(require_admin)):
+    """Internal-only analytics for the local admin panel — never called by
+    the dashboard or app. Same ADMIN_EMAILS gate as /admin/stats.
+
+    'Peak time' here means hour-of-day (UTC) histograms of every event we
+    actually have a timestamp for — sign-ups, deployments, APK downloads,
+    and chat activity. There is no session-start/session-end tracking
+    anywhere in this schema, so "time spent" cannot be computed; these
+    histograms are the honest proxy for "when is LokiAI actually used."
+    """
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        apk_total = await conn.fetchval("SELECT COUNT(*) FROM apk_downloads")
+        apk_by_hour = await conn.fetch(
+            """SELECT EXTRACT(HOUR FROM downloaded_at)::int AS hour, COUNT(*) AS n
+               FROM apk_downloads GROUP BY hour ORDER BY hour"""
+        )
+        apk_by_day = await conn.fetch(
+            """SELECT downloaded_at::date AS day, COUNT(*) AS n
+               FROM apk_downloads GROUP BY day ORDER BY day DESC LIMIT 30"""
+        )
+
+        signups_by_hour = await conn.fetch(
+            """SELECT EXTRACT(HOUR FROM created_at)::int AS hour, COUNT(*) AS n
+               FROM users GROUP BY hour ORDER BY hour"""
+        )
+        deployments_by_hour = await conn.fetch(
+            """SELECT EXTRACT(HOUR FROM deployed_at)::int AS hour, COUNT(*) AS n
+               FROM deployments WHERE deployed_at IS NOT NULL GROUP BY hour ORDER BY hour"""
+        )
+        chat_by_hour = await conn.fetch(
+            """SELECT EXTRACT(HOUR FROM created_at)::int AS hour, COUNT(*) AS n
+               FROM chat_runs GROUP BY hour ORDER BY hour"""
+        )
+
+        model_counts = await conn.fetch(
+            """SELECT m.name AS model_name, m.hf_model_id, COUNT(*) AS n,
+                      SUM(CASE WHEN d.status = 'complete' THEN 1 ELSE 0 END) AS n_complete,
+                      SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) AS n_failed
+               FROM deployments d JOIN models m ON d.model_id = m.id
+               GROUP BY m.name, m.hf_model_id
+               ORDER BY n DESC"""
+        )
+
+        all_deployments = await conn.fetch(
+            """SELECT d.id, u.email, m.name AS model_name, m.hf_model_id,
+                      d.status, d.progress, d.deployed_at, d.updated_at, d.completed_at,
+                      d.failure_category, d.failure_code
+               FROM deployments d
+               JOIN users u ON d.user_id = u.id
+               JOIN models m ON d.model_id = m.id
+               ORDER BY d.deployed_at DESC
+               LIMIT 500"""
+        )
+
+    def hour_histogram(rows) -> list:
+        # Always return all 24 buckets, zero-filled, so the panel doesn't
+        # have to special-case missing hours.
+        counts = {int(r["hour"]): r["n"] for r in rows}
+        return [counts.get(h, 0) for h in range(24)]
+
+    return {
+        "apk_downloads": {
+            "total": apk_total,
+            "by_hour_utc": hour_histogram(apk_by_hour),
+            "by_day": [
+                {"day": r["day"].isoformat(), "count": r["n"]} for r in apk_by_day
+            ],
+        },
+        "activity": {
+            "signups_by_hour_utc": hour_histogram(signups_by_hour),
+            "deployments_by_hour_utc": hour_histogram(deployments_by_hour),
+            "chat_messages_by_hour_utc": hour_histogram(chat_by_hour),
+        },
+        "models": [
+            {
+                "model_name": r["model_name"],
+                "hf_model_id": r["hf_model_id"],
+                "deployments": r["n"],
+                "complete": r["n_complete"],
+                "failed": r["n_failed"],
+            }
+            for r in model_counts
+        ],
+        "deployments": [
+            {
+                "id": str(r["id"]),
+                "email": r["email"],
+                "model_name": r["model_name"],
+                "hf_model_id": r["hf_model_id"],
+                "status": r["status"],
+                "progress": r["progress"],
+                "deployed_at": r["deployed_at"].isoformat() if r["deployed_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+                "failure_category": r["failure_category"],
+                "failure_code": r["failure_code"],
+            }
+            for r in all_deployments
+        ],
+    }
