@@ -71,14 +71,14 @@ class VoiceInference {
   /// Used both by [loadModel] (real microphone runtime) and by the
   /// deployment smoke test in model_downloader.dart, so "ready" can never
   /// mean something different to the two callers. On success the returned
-  /// [_AudioProbeResult.interpreter] is the same live interpreter the caller
+  /// [AudioProbeResult.interpreter] is the same live interpreter the caller
   /// should keep (loadModel) or must close (the smoke test) — ownership
   /// transfers to the caller either way; this method never closes it on the
   /// success path.
-  static Future<_AudioProbeResult> validateAndProbe(String modelPath) async {
+  static Future<AudioProbeResult> validateAndProbe(String modelPath) async {
     final structural = await ModelGuard.validateAudioTflite(modelPath);
     if (structural != null) {
-      return _AudioProbeResult(rejection: structural);
+      return AudioProbeResult(rejection: structural);
     }
 
     Interpreter? interpreter;
@@ -89,7 +89,7 @@ class VoiceInference {
       try {
         interpreter?.close();
       } catch (_) {}
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_INTERPRETER_INIT_FAILED',
           'This audio model could not be opened by the TFLite interpreter '
@@ -102,7 +102,7 @@ class VoiceInference {
     final outputs = interpreter.getOutputTensors();
     if (inputs.length != 1 || outputs.isEmpty) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_BUNDLE_INCOMPLETE',
           'This audio model declares ${inputs.length} input tensor(s) and '
@@ -117,7 +117,7 @@ class VoiceInference {
     if (inTensor.type != TensorType.float32 ||
         outTensor.type != TensorType.float32) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_INPUT_DTYPE_MISMATCH',
           'This audio model uses ${inTensor.type}/${outTensor.type} '
@@ -128,7 +128,7 @@ class VoiceInference {
     }
     if (inTensor.shape.any((d) => d <= 0) || outTensor.shape.any((d) => d <= 0)) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_INPUT_SHAPE_MISMATCH',
           'This audio model has a dynamic or invalid tensor shape '
@@ -147,7 +147,7 @@ class VoiceInference {
     final inputSamples = inTensor.shape.reduce((a, b) => a * b);
     if (inputSamples != yamnetInputSamples) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_SAMPLE_RATE_UNSUPPORTED',
           'This audio model expects an input window of $inputSamples '
@@ -166,7 +166,7 @@ class VoiceInference {
       labels = decoded.map((k, v) => MapEntry(int.parse(k), v.toString()));
     } catch (e) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_LABEL_CONTRACT_MISMATCH',
           'The bundled AudioSet label map could not be loaded ($e), so '
@@ -176,7 +176,7 @@ class VoiceInference {
     }
     if (labels.isEmpty) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: const ModelRejection(
           'AUDIO_LABEL_CONTRACT_MISMATCH',
           'No labels are available to map this audio model\'s output to.',
@@ -185,7 +185,7 @@ class VoiceInference {
     }
     if (outputClasses != labels.length || outputClasses != yamnetOutputClasses) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_LABEL_CONTRACT_MISMATCH',
           'This audio model outputs $outputClasses classes but the bundled '
@@ -204,7 +204,7 @@ class VoiceInference {
       final scores = _decodeAndRun(interpreter, inTensor.shape, outTensor.shape, synthetic);
       if (scores.isEmpty || scores.length != labels.length) {
         interpreter.close();
-        return _AudioProbeResult(
+        return AudioProbeResult(
           rejection: ModelRejection(
             'AUDIO_SMOKE_TEST_FAILED',
             'This audio model produced ${scores.length} output values on a '
@@ -214,7 +214,7 @@ class VoiceInference {
       }
     } catch (e) {
       interpreter.close();
-      return _AudioProbeResult(
+      return AudioProbeResult(
         rejection: ModelRejection(
           'AUDIO_SMOKE_TEST_FAILED',
           'This audio model failed a bounded smoke inference through the '
@@ -224,7 +224,7 @@ class VoiceInference {
       );
     }
 
-    return _AudioProbeResult(interpreter: interpreter, labels: labels);
+    return AudioProbeResult(interpreter: interpreter, labels: labels);
   }
 
   /// A synthetic 1kHz sine tone encoded as PCM16 little-endian bytes, the
@@ -425,12 +425,12 @@ class VoiceInference {
 /// [interpreter] (caller takes ownership and must eventually close it) plus
 /// the resolved [labels], or a [rejection] explaining precisely why the
 /// artifact does not satisfy the production audio-adapter contract.
-class _AudioProbeResult {
+class AudioProbeResult {
   final Interpreter? interpreter;
   final Map<int, String> labels;
   final ModelRejection? rejection;
 
-  const _AudioProbeResult({
+  const AudioProbeResult({
     this.interpreter,
     this.labels = const {},
     this.rejection,
