@@ -432,11 +432,71 @@ class BackendConnection {
 
     if (data['type'] == 'state_ack') {
       // Server's view of what is still outstanding for this device after our
-      // state report. Logged for diagnosis; the server has already reconciled
-      // anything the report resolved.
-      final pending = data['pending_deployments'];
+      // state report. Anything the report itself resolved is already
+      // reconciled server-side. What's left here is every deployment the
+      // BACKEND still considers active (queued/downloading/downloaded/
+      // validating) for this device. Handled asynchronously because
+      // resolving it safely needs a read of the local registry — see
+      // _handleStateAck for why.
+      unawaited(_handleStateAck(data['pending_deployments']));
+    }
+  }
+
+  /// For every deployment the backend still lists as outstanding, tells it
+  /// definitively whether this phone has any record of it at all —
+  /// currently in flight (ModelDownloader.handleDeploy running now), OR
+  /// already a resolved entry in the local model registry/active config
+  /// (a real, completed download whose final 'complete' event may simply
+  /// never have reached the backend). Only a pending id matching NEITHER
+  /// is reported as abandoned.
+  ///
+  /// The registry check matters: the backend's pending query includes
+  /// 'downloaded' deployments, which is also the legitimate resting state
+  /// of a deployment that finished successfully but whose terminal event
+  /// was lost — treating everything not currently *in flight* as
+  /// abandoned would have wrongly killed exactly those already-successful
+  /// deployments the durable-reconciliation fix exists to protect.
+  Future<void> _handleStateAck(dynamic pending) async {
+    // ignore: avoid_print
+    print('VERIFICATION: ws -> state_ack pending=$pending');
+    if (pending is! List || pending.isEmpty) return;
+
+    final knownIds = <String>{};
+    try {
+      final active = await ConfigReader.load();
+      if (active.config != null && active.config!.deploymentId.isNotEmpty) {
+        knownIds.add(active.config!.deploymentId);
+      }
+      final installed = await ConfigReader.loadInstalled();
+      for (final model in installed) {
+        if (model.deploymentId.isNotEmpty) knownIds.add(model.deploymentId);
+      }
+    } catch (e) {
+      // Registry unreadable: do not report ANY pending deployment as
+      // abandoned on unreliable local state — fail closed and let the
+      // existing backend staleness timeout resolve it instead of risking a
+      // false-positive failure of a real, working deployment.
       // ignore: avoid_print
-      print('VERIFICATION: ws -> state_ack pending=$pending');
+      print('VERIFICATION: ws -> state_ack registry read failed, skipping: $e');
+      return;
+    }
+
+    for (final entry in pending) {
+      if (entry is! Map) continue;
+      final pendingId = entry['deployment_id'] as String?;
+      if (pendingId == null || pendingId.isEmpty) continue;
+      if (ModelDownloader.isInFlight(pendingId)) continue;
+      if (knownIds.contains(pendingId)) continue;
+      send({
+        'deployment_id': pendingId,
+        'status': 'failed',
+        'progress_percent': 0,
+        'error_message':
+            'Device has no record of this deployment (not in flight, not in '
+            'the local registry, after reconnect/restart) — releasing the '
+            'stale lease.',
+        'error_code': 'DEPLOYMENT_ABANDONED_ON_DEVICE',
+      });
     }
   }
 

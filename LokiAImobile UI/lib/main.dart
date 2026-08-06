@@ -683,6 +683,14 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
         // Native loading is explicit and only happens after the app is fully
         // interactive. ChatInference converts ordinary load errors into a
         // visible reply instead of terminating the UI.
+        //
+        // Every installed chat model's specific failure is kept (not just
+        // the last one) so the message shown when all of them fail reflects
+        // the REAL reason for each — quarantined, structurally rejected, or
+        // a genuine activation failure — rather than one fixed sentence that
+        // told the user to redeploy even when the model had loaded fine
+        // before and the true cause was something else entirely.
+        final attemptFailures = <String>[];
         for (final chatPath in chatPaths) {
           if (!(chatPath.endsWith('.gguf') || chatPath.endsWith('.bin'))) {
             continue;
@@ -693,12 +701,32 @@ class _LokiHomeScreenState extends State<LokiHomeScreen>
             _chatInference = chat;
             break;
           }
+          final reason = chat.failureMessage;
+          if (reason != null && reason.isNotEmpty) {
+            final code = chat.failureCode;
+            attemptFailures.add(code != null ? '$code: $reason' : reason);
+          }
           await chat.dispose();
         }
         if (_chatInference == null) {
-          finish(
-            'No downloaded chat model is ready on this phone yet. Select another chat model or redeploy it from the dashboard.',
-          );
+          if (attemptFailures.isEmpty) {
+            // Every candidate path existed but none was even attempted
+            // (extension filter) — this is a stale/incompatible registry
+            // entry, not an activation failure.
+            finish(
+              'The selected chat model\'s file is not a supported format on '
+              'this device. Select another downloaded chat model or '
+              'redeploy it from the dashboard.',
+            );
+          } else if (attemptFailures.length == 1) {
+            finish(attemptFailures.first);
+          } else {
+            finish(
+              'None of the ${attemptFailures.length} downloaded chat models '
+              'could activate on this device:\n'
+              '${attemptFailures.map((f) => '• $f').join('\n')}',
+            );
+          }
           return;
         }
       }

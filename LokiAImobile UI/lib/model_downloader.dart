@@ -7,6 +7,7 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 
 import 'ml/chat_inference.dart';
 import 'ml/model_guard.dart';
+import 'ml/voice_inference.dart';
 
 /// Downloads deployed models straight from the HuggingFace CDN into the
 /// app's internal storage, verifies SHA-256, reports progress over the
@@ -23,6 +24,21 @@ class ModelDownloader {
   static const Duration _validationTimeout = Duration(seconds: 60);
   static final Set<String> _cancelledDeployments = <String>{};
   static final Map<String, HttpClient> _activeClients = <String, HttpClient>{};
+
+  // Every deployment_id this phone is currently actually working on (from
+  // the instant handleDeploy is entered until its one terminal status is
+  // sent). Lets backend_connection.dart answer, authoritatively, "is the
+  // phone doing anything for this id right now?" when the backend's
+  // state_ack lists a deployment it still considers in flight — without
+  // this the phone had no way to tell the backend "I have no record of
+  // that deployment" and a stale backend row could only ever resolve by
+  // waiting out the staleness timeout.
+  static final Set<String> _inFlightDeployments = <String>{};
+
+  /// True while [deploymentId] is actively being downloaded/validated by
+  /// this phone right now.
+  static bool isInFlight(String deploymentId) =>
+      _inFlightDeployments.contains(deploymentId);
 
   /// Stops an active download immediately when the dashboard cancels it.
   /// Closing the client aborts a blocked network read; the existing cleanup
@@ -52,8 +68,25 @@ class ModelDownloader {
     return name;
   }
 
-  /// Entry point for a WebSocket "deploy" instruction.
+  /// Entry point for a WebSocket "deploy" instruction. Tracks
+  /// [deploymentId] as in-flight for the duration of the whole handler so
+  /// [isInFlight] is authoritative for backend_connection.dart's state_ack
+  /// handling, regardless of which of the many exit paths below this run
+  /// actually takes.
   static Future<void> handleDeploy(
+    Map<String, dynamic> data,
+    void Function(Map<String, dynamic>) send,
+  ) async {
+    final trackedId = data['deployment_id'] as String? ?? '';
+    if (trackedId.isNotEmpty) _inFlightDeployments.add(trackedId);
+    try {
+      await _handleDeployInternal(data, send);
+    } finally {
+      if (trackedId.isNotEmpty) _inFlightDeployments.remove(trackedId);
+    }
+  }
+
+  static Future<void> _handleDeployInternal(
     Map<String, dynamic> data,
     void Function(Map<String, dynamic>) send,
   ) async {
@@ -267,7 +300,18 @@ class ModelDownloader {
     void Function(Map<String, dynamic>) send,
   ) async {
     final docs = await getApplicationDocumentsDirectory();
-    final modelsDir = Directory('${docs.path}/models');
+    // Each deployment gets its OWN directory, keyed by deployment_id — not a
+    // single flat models/ folder keyed only by filename. Many HuggingFace
+    // GGUF/TFLite repos ship files with generic, colliding basenames (e.g.
+    // "model.gguf", "model.tflite"); two different deployed models sharing
+    // that basename used to overwrite the exact same on-disk file, so the
+    // FIRST model's registry entry silently started pointing at the SECOND
+    // model's bytes (or a corrupt half-written file if the second download
+    // raced the first). This is what made "deploy model B" appear to make
+    // model A disappear or corrupt. A per-deployment directory makes that
+    // collision structurally impossible, matching the multi-model registry's
+    // own on-disk layout (models/<local_model_id>/...).
+    final modelsDir = Directory('${docs.path}/models/${sanitizeFilename(deploymentId)}');
     if (!await modelsDir.exists()) {
       await modelsDir.create(recursive: true);
     }
@@ -485,9 +529,21 @@ class ModelDownloader {
     if (adapterId == 'llama_cpp_gguf_chat_v1') {
       rejection = await _smokeTestChat(modelPath);
     } else if (adapterId == 'tflite_yamnet_audio_v1') {
-      rejection =
-          await ModelGuard.validateAudioTflite(modelPath) ??
-          await _smokeTestTflite(modelPath, label: 'audio');
+      // Uses the SAME gate the real microphone runtime uses
+      // (VoiceInference.validateAndProbe) — exact tensor contract, exact
+      // known-adapter signature, exact label contract, and a real inference
+      // through the exact production preprocessing/postprocessing path on a
+      // synthetic waveform. A model that fails this can never be shown as
+      // ready and then rejected by mic_feature.dart later; the two paths
+      // share one implementation, not two independent opinions.
+      final probe = await VoiceInference.validateAndProbe(modelPath);
+      try {
+        rejection = probe.rejection;
+      } finally {
+        try {
+          probe.interpreter?.close();
+        } catch (_) {}
+      }
     } else if (adapterId == 'tflite_imagenet_classifier_v1') {
       rejection =
           await ModelGuard.validateVisionTflite(modelPath) ??

@@ -25,8 +25,18 @@ import {
 // specifically asked to see called out, not buried.
 function notifyIfDeploymentBlocked(e: unknown) {
   if (e instanceof ApiError && e.status === 409) {
+    // The backend now names the real blocking deployment and its stage
+    // (active_deployment_id/active_stage/active_progress) instead of a bare
+    // 409, so the toast can say what is actually running rather than a
+    // generic "a model is already deploying".
+    const detail =
+      e.detail && typeof e.detail === "object" ? (e.detail as Record<string, unknown>) : null;
+    const stage = detail && typeof detail.active_stage === "string" ? detail.active_stage : null;
+    const progress = detail && typeof detail.active_progress === "number" ? detail.active_progress : null;
     toast.error("A model is already deploying on this device", {
-      description: "Wait for it to finish, or cancel it from Background Tasks before deploying another.",
+      description: stage
+        ? `Currently ${stage}${progress != null ? ` (${progress}%)` : ""} — wait for it to finish, or cancel it from Background Tasks before deploying another.`
+        : "Wait for it to finish, or cancel it from Background Tasks before deploying another.",
     });
     return true;
   }

@@ -277,8 +277,19 @@ async def _run_migrations(pool: asyncpg.Pool):
             # let dead ones block new deployments for the full timeout
             # regardless of how long they'd already been silent.
             "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            # Machine-readable failure category, separate from the free-text
+            # error_message. Lets a late authoritative phone 'ready' event
+            # correctly supersede a pure transport_timeout/device_offline
+            # failure while never silently overwriting an explicit
+            # cancellation or a deterministic corrupt-artifact failure.
+            # See migrations/20260806_deployment_failure_category_forward.sql.
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS failure_category TEXT",
         ):
             await conn.execute(statement)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deployments_device_status "
+            "ON deployments (device_id, status)"
+        )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS runtime_events (
                 event_id        TEXT PRIMARY KEY,
@@ -6315,42 +6326,60 @@ async def _handle_runtime_event(pool, device_id: str, data: dict):
                 data.get("correlation_id"), occurred_at,
             )
             if deployment_id and event_type in ("runtime_validation", "smoke_test"):
+                # A user cancellation is a terminal, authoritative decision —
+                # see the identical rule in _handle_deployment_update. A late
+                # runtime_event (validation/smoke-test result that started
+                # before the cancel reached the phone) must never resurrect a
+                # deployment the user already cancelled. This UPDATE used to
+                # have no status guard at all, so a delayed "ready" smoke-test
+                # event could silently flip a cancelled deployment straight
+                # back to complete.
                 if bool(data.get("success")):
-                    await conn.execute(
+                    updated = await conn.fetchval(
                         """UPDATE deployments
                            SET status = 'complete', progress = 100,
                                completed_at = COALESCE(completed_at, NOW()),
                                updated_at = NOW(),
+                               failure_category = NULL,
                                adapter_id = COALESCE(adapter_id, $2),
                                adapter_version = COALESCE(adapter_version, $3),
                                runtime_version = COALESCE(runtime_version, $4),
                                smoke_test_result = COALESCE(smoke_test_result, $5::jsonb)
-                           WHERE id = $1::uuid AND device_id = $6::uuid""",
+                           WHERE id = $1::uuid AND device_id = $6::uuid
+                             AND status <> 'cancelled'
+                           RETURNING id""",
                         deployment_id, data.get("adapter_id"), data.get("adapter_version"),
                         data.get("runtime_version") or ANDROID_RUNTIME_VERSION,
                         json.dumps(data), device_id,
                     )
-                    deployment_status[str(deployment_id)] = {
-                        "status": "complete",
-                        "progress_percent": 100,
-                        "error_message": None,
-                    }
+                    if updated is not None:
+                        deployment_status[str(deployment_id)] = {
+                            "status": "complete",
+                            "progress_percent": 100,
+                            "error_message": None,
+                        }
+                    else:
+                        print(f"[WS] late ready event for cancelled/foreign deployment {deployment_id} ignored")
                 elif data.get("error_code"):
-                    await conn.execute(
+                    updated = await conn.fetchval(
                         """UPDATE deployments
                            SET status = 'failed', error_message = $2,
                                updated_at = NOW(),
-                               failure_code = $3, failure_details = $4
-                           WHERE id = $1::uuid AND device_id = $5::uuid""",
+                               failure_code = $3, failure_details = $4,
+                               failure_category = 'smoke_test_failed'
+                           WHERE id = $1::uuid AND device_id = $5::uuid
+                             AND status <> 'cancelled'
+                           RETURNING id""",
                         deployment_id,
                         data.get("error_detail") or data.get("error_code"),
                         data.get("error_code"), json.dumps(data), device_id,
                     )
-                    deployment_status[str(deployment_id)] = {
-                        "status": "failed",
-                        "progress_percent": 100,
-                        "error_message": data.get("error_detail") or data.get("error_code"),
-                    }
+                    if updated is not None:
+                        deployment_status[str(deployment_id)] = {
+                            "status": "failed",
+                            "progress_percent": 100,
+                            "error_message": data.get("error_detail") or data.get("error_code"),
+                        }
     except (asyncpg.PostgresError, ValueError, TypeError) as e:
         print(f"[WS] runtime_event handling failed for {device_id}: {type(e).__name__}")
 
@@ -6775,14 +6804,20 @@ async def _expire_deployment_if_stale(pool, deployment_id: str) -> Optional[dict
     resolving when the user happens to attempt a brand new deployment."""
     try:
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""UPDATE deployments SET status = 'failed',
-                       error_message = 'Timed out: phone stopped reporting progress',
-                       updated_at = NOW()
-                   WHERE id = $1::uuid AND {_STALE_DEPLOYMENT_PREDICATE}
-                   RETURNING id, status, error_message""",
-                deployment_id,
+            device_id = await conn.fetchval(
+                "SELECT device_id FROM deployments WHERE id = $1::uuid", deployment_id,
             )
+            row = await _release_if_abandoned(conn, deployment_id=deployment_id, device_id=device_id)
+            if row is None:
+                row = await conn.fetchrow(
+                    f"""UPDATE deployments SET status = 'failed',
+                           error_message = 'Timed out: phone stopped reporting progress',
+                           failure_category = 'transport_timeout',
+                           updated_at = NOW()
+                       WHERE id = $1::uuid AND {_STALE_DEPLOYMENT_PREDICATE}
+                       RETURNING id, status, error_message""",
+                    deployment_id,
+                )
     except (asyncpg.PostgresError, ValueError):
         return None
     if not row:
@@ -6790,6 +6825,56 @@ async def _expire_deployment_if_stale(pool, deployment_id: str) -> Optional[dict
     fresh = {"status": row["status"], "progress_percent": 0, "error_message": row["error_message"]}
     deployment_status[deployment_id] = fresh
     return fresh
+
+
+# A device that is not even connected cannot possibly send more progress —
+# waiting out the full 15-minute/3-minute staleness window in that case
+# blocks the user for no reason (Part 2 of the deployment-lease spec: "A
+# dead deployment with no device acknowledgement or progress must unlock
+# quickly"). A short grace period (rather than zero) absorbs a normal
+# reconnect flap — the WebSocket drops and re-establishes within a few
+# seconds routinely — without waiting anywhere near the connected-device
+# timeout.
+_ABANDONED_DISCONNECTED_GRACE = "90 seconds"
+
+
+async def _release_if_abandoned(conn, *, deployment_id: Optional[str] = None,
+                                 device_id: Optional[str] = None) -> Optional[dict]:
+    """Releases a non-terminal deployment immediately when its device is not
+    currently connected AND it has been silent longer than the short
+    disconnected-grace window — regardless of the longer connected-device
+    staleness windows, which exist to tolerate a real device that is still
+    actively (if slowly) working. Scoped to one deployment when
+    `deployment_id` is given, otherwise to every non-terminal deployment on
+    `device_id`. Returns the released row (id, status, error_message) or
+    None if nothing matched."""
+    if device_id is None:
+        return None
+    if ws_manager.is_connected(str(device_id)):
+        return None
+    if deployment_id is not None:
+        return await conn.fetchrow(
+            f"""UPDATE deployments SET status = 'failed',
+                   error_message = 'Device disconnected mid-deployment and did not reconnect',
+                   failure_category = 'device_offline',
+                   updated_at = NOW()
+               WHERE id = $1::uuid
+                 AND status IN ('queued', 'downloading', 'downloaded', 'validating')
+                 AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '{_ABANDONED_DISCONNECTED_GRACE}'
+               RETURNING id, status, error_message""",
+            deployment_id,
+        )
+    await conn.execute(
+        f"""UPDATE deployments SET status = 'failed',
+               error_message = 'Device disconnected mid-deployment and did not reconnect',
+               failure_category = 'device_offline',
+               updated_at = NOW()
+           WHERE device_id = $1::uuid
+             AND status IN ('queued', 'downloading', 'downloaded', 'validating')
+             AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '{_ABANDONED_DISCONNECTED_GRACE}'""",
+        device_id,
+    )
+    return None
 
 
 @app.post("/deployments")
@@ -6814,29 +6899,34 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
             detail="Device is not connected. Open the LokiAI app on the phone so it can receive the deployment."
         )
 
-    # One model per phone (PRD): never run parallel downloads on one device.
-    # Stale rows auto-expire — 15 minutes for an in-progress download,
-    # 90 seconds for a stalled validation (see _STALE_DEPLOYMENT_PREDICATE
-    # for why they differ).
+    # One real active deployment at a time per device — NOT "there is a
+    # nonterminal row" (Part 2 of the deployment-lease spec). Three
+    # reconciliation passes run BEFORE the blocking check, in order from
+    # fastest to slowest, so a dead deployment never costs the user a 409
+    # round-trip before the very next attempt can succeed:
+    #   1. Disconnected + silent past the short grace window -> abandoned
+    #      immediately (the device physically cannot report anything more).
+    #   2. Connected but silent past the longer status-aware window ->
+    #      transport_timeout (large downloads legitimately run long; only a
+    #      genuinely stalled validation/download is expired here).
+    # Staleness is measured from updated_at (last time the phone actually
+    # reported anything for this deployment), not deployed_at (creation
+    # time) — an old deployed_at-based check killed a genuinely
+    # slow-but-still-progressing download the moment it passed the window,
+    # while a deployment that died instantly still got the full grace
+    # period before it stopped blocking new ones.
     async with pool.acquire() as conn:
-        # Cleanup runs BEFORE the blocking check, not after: a deployment that
-        # has gone silent for 15 minutes is dead and must not cost the user an
-        # extra round-trip (409, then retry) before the very next attempt can
-        # succeed. Staleness is measured from updated_at (last time the phone
-        # actually reported anything for this deployment), not deployed_at
-        # (creation time) — the old deployed_at-based check killed a
-        # genuinely slow-but-still-progressing download the moment it passed
-        # 15 minutes old, while a deployment that died instantly still got a
-        # full 15-minute grace period before it stopped blocking new ones.
+        await _release_if_abandoned(conn, device_id=req.device_id)
         await conn.execute(
             f"""UPDATE deployments SET status = 'failed',
                    error_message = 'Timed out: phone stopped reporting progress',
+                   failure_category = 'transport_timeout',
                    updated_at = NOW()
                WHERE device_id = $1::uuid
                  AND {_STALE_DEPLOYMENT_PREDICATE}""",
             req.device_id
         )
-        # The UPDATE immediately above already flipped anything stale to
+        # The UPDATEs immediately above already flipped anything stale to
         # 'failed', so a plain status filter is sufficient and correct here
         # — no need to re-check timing against a row that can no longer be
         # in one of these statuses if it was actually stale.
@@ -6848,11 +6938,19 @@ async def create_deployment(req: DeploymentRequest, request: Request, user_id: s
             req.device_id
         )
         if active:
+            # Part 11 requirement: a blocked 409 must identify the actual
+            # active deployment id and stage, so the dashboard can offer
+            # "cancel this" instead of a dead-end wait.
             raise HTTPException(
                 status_code=409,
-                detail=f"A deployment is already in progress on this device "
-                       f"({active['status']}, {active['progress'] or 0}%). "
-                       f"Wait for it to finish before deploying another model."
+                detail={
+                    "message": f"A deployment is already in progress on this device "
+                               f"({active['status']}, {active['progress'] or 0}%). "
+                               f"Wait for it to finish, or cancel it, before deploying another model.",
+                    "active_deployment_id": str(active["id"]),
+                    "active_stage": active["status"],
+                    "active_progress": active["progress"] or 0,
+                }
             )
 
     if req.model_url:

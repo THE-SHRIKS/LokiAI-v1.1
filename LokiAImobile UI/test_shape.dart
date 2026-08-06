@@ -1,1 +1,0 @@
-import 'dart:io'; import 'package:tflite_flutter/tflite_flutter.dart'; void main() async { final interpreter = await Interpreter.fromFile(File('assets/best.tflite')); print('INPUT: \'); print('OUTPUT: \'); exit(0); }

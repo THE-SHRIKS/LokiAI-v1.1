@@ -31,10 +31,18 @@ class ChatInference {
   ChatRuntimeState get state => _state;
   bool get isReady => _state == ChatRuntimeState.ready;
   String? get failureMessage => _failure;
+  // A machine-readable reason distinguishing WHY activation failed —
+  // quarantined, structurally rejected, context-create failed, or generation
+  // failed — so a caller trying several installed models in sequence (see
+  // main.dart's chat-model fallback) can report the real, specific cause
+  // instead of collapsing every possible failure into one generic
+  // "not ready, redeploy it" message.
+  String? get failureCode => _failureCode;
 
   double? _contextId;
   String? _modelPath;
   String? _failure;
+  String? _failureCode;
   int _epoch = 0;
   int _nextRequest = 0;
   int? _activeRequest;
@@ -117,10 +125,11 @@ class ChatInference {
         'This model crashed LokiAI on two separate attempts to load it, so '
         "it has been disabled. Deploy a different model, or redeploy this "
         'one if you believe the file has changed.',
+        code: 'MODEL_QUARANTINED',
       );
     }
     final rejection = await ModelGuard.validateGguf(path);
-    if (rejection != null) return _fail(rejection.message);
+    if (rejection != null) return _fail(rejection.message, code: rejection.code);
 
     try {
       final cpu = await Fllama.instance()!.getCpuInfo();
@@ -142,16 +151,30 @@ class ChatInference {
         if (id is num) await Fllama.instance()!.releaseContext(id.toDouble());
         return;
       }
-      if (id is! num)
-        return _fail('Model initialization returned no native context.');
+      if (id is! num) {
+        return _fail(
+          'Model initialization returned no native context.',
+          code: 'CHAT_CONTEXT_CREATE_FAILED',
+        );
+      }
       _contextId = id.toDouble();
       _state = ChatRuntimeState.ready;
       _log('load', 'ready');
     } catch (error, stackTrace) {
       await ModelGuard.endLoad(path);
       _record('load', error, stackTrace);
+      // The exact native error is reported, not a generic catch-all — this
+      // used to collapse EVERY possible context-creation failure (a genuine
+      // one-time OOM at that instant, a truly incompatible architecture, a
+      // native allocator failure) into the same "not ready, redeploy it"
+      // text regardless of cause, which is exactly why the message could
+      // appear for a model that had previously worked fine: the user had no
+      // way to tell a transient failure from a real one.
       _fail(
-        'This chat model is not ready on this device yet. Select another downloaded chat model or redeploy it from the dashboard.',
+        'This chat model failed to activate on this device ($error). '
+        'Select another downloaded chat model, try again, or redeploy this '
+        'one from the dashboard if the problem persists.',
+        code: 'CHAT_CONTEXT_CREATE_FAILED',
       );
     }
   }
@@ -317,8 +340,9 @@ class ChatInference {
   String _format(String prompt) =>
       '<|im_start|>system\nYou are Loki, a highly logical and factual AI assistant. Keep responses concise.<|im_end|>\n<|im_start|>user\n$prompt<|im_end|>\n<|im_start|>assistant\n';
 
-  void _fail(String message) {
+  void _fail(String message, {String? code}) {
     _failure = message;
+    _failureCode = code;
     _state = ChatRuntimeState.failed;
     _log('load', 'failed');
   }

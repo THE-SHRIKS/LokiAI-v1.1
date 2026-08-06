@@ -1,11 +1,10 @@
 // LokiAI backend client — every call hits the real FastAPI backend.
 // No mock data anywhere: if the backend is unreachable the UI must say so.
 
-const DEFAULT_BACKEND = import.meta.env.PROD 
-  ? "https://lokiai.onrender.com" 
-  : typeof window !== "undefined" 
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
-    : "http://localhost:8000";
+// This project runs against the real production backend always — there is no
+// local backend in this workflow, so a "point at :8000" dev fallback just
+// produces "Backend unreachable" for anyone opening the local dashboard.
+const DEFAULT_BACKEND = "https://lokiai.onrender.com";
 
 export function backendUrl(): string {
   return localStorage.getItem("lokiai_backend_url") ?? DEFAULT_BACKEND;
@@ -37,9 +36,16 @@ export function clearToken() {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  // Structured detail payload when the backend sent one (e.g. POST
+  // /deployments 409 now includes { active_deployment_id, active_stage,
+  // active_progress } alongside the human-readable message) so callers that
+  // need more than the message string — like offering a "cancel that
+  // deployment" action — don't have to re-parse it.
+  detail?: unknown;
+  constructor(status: number, message: string, detail?: unknown) {
     super(message);
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -146,12 +152,24 @@ async function request<T>(
     // nothing at all. Both shapes are read now, plus a readable fallback for
     // the statuses users actually hit.
     const obj = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
+    // `detail` can also be a structured object (e.g. the deployment
+    // compatibility-gate 422 and the blocked-deployment 409 both attach
+    // machine-readable fields alongside a `message` string) — read `.message`
+    // out of it rather than treating a non-string detail as "nothing useful
+    // to show", which previously threw away the specific reason and fell
+    // back to a bare "Request failed (HTTP 409)."
+    const detailObj =
+      obj && obj.detail && typeof obj.detail === "object"
+        ? (obj.detail as Record<string, unknown>)
+        : null;
     const fromBody =
       obj && typeof obj.detail === "string"
         ? obj.detail
-        : obj && typeof obj.error === "string"
-          ? obj.error
-          : null;
+        : detailObj && typeof detailObj.message === "string"
+          ? detailObj.message
+          : obj && typeof obj.error === "string"
+            ? obj.error
+            : null;
 
     const retryAfter = res.headers.get("retry-after");
     const fallback =
@@ -161,7 +179,7 @@ async function request<T>(
           ? "The server is temporarily unavailable. Please try again shortly."
           : `Request failed (HTTP ${res.status}).`;
 
-    throw new ApiError(res.status, fromBody ?? fallback);
+    throw new ApiError(res.status, fromBody ?? fallback, detailObj ?? obj?.detail);
   }
   return body as T;
 }
