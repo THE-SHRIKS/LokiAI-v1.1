@@ -2532,6 +2532,33 @@ UNSUPPORTED_MODEL_FAMILY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# bind_runtime_adapter() previously bound EVERY .gguf + text-generation file to
+# llama_cpp_gguf_chat_v1 with no check on whether this app's vendored
+# llama.cpp actually implements that model's architecture. It only checks
+# file extension and task, so a model using an architecture llama.cpp has no
+# code for at all was recommended as "comfortable fit", downloaded (600MB+),
+# and only failed after the phone's smoke test tried and failed to build a
+# context for it — a real, deterministic failure the recommender should
+# never have offered in the first place.
+#
+# Checked directly against this app's vendored llama.cpp source
+# (LLM_ARCH_NAMES in llama.cpp) rather than assumed. Confirmed missing:
+#   - LFM2 (Liquid AI's hybrid architecture) - proven in production: every
+#     LFM2 deployment failed CHAT_CONTEXT_CREATE_FAILED.
+#   - Qwen3 - not in this build's LLM_ARCH_NAMES either (only "qwen" and
+#     "qwen2" are), so any Qwen3 GGUF would fail the same way.
+# This is a floor, not a guarantee: a model can advertise a supported family
+# name (e.g. "MiniCPM") while actually being an incompatible fork/newer
+# revision of it, which no filename heuristic can catch — that is exactly
+# what the phone's own runtime smoke test exists to catch, and (as of the
+# WebSocket queue fix) now reports correctly instead of hanging. This filter
+# only removes the subset of failures that are knowable in advance, so users
+# stop burning a download on a model that was never going to load.
+UNSUPPORTED_CHAT_ARCHITECTURE_RE = re.compile(
+    r"(?:\blfm-?2\b|liquid[-_ ]?foundation|\bqwen-?3\b)",
+    re.IGNORECASE,
+)
+
 
 def bind_runtime_adapter(model_id: str, filename: str, task: str,
                          size_mb: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -2545,6 +2572,8 @@ def bind_runtime_adapter(model_id: str, filename: str, task: str,
     if UNSUPPORTED_MODEL_FAMILY_RE.search(haystack):
         return None
     if ext == "gguf" and task == "text-generation" and is_usable_chat_file(filename, size_mb):
+        if UNSUPPORTED_CHAT_ARCHITECTURE_RE.search(haystack):
+            return None
         return _deployable_adapter("llama_cpp_gguf_chat_v1")
     if ext != "tflite":
         return None
