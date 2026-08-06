@@ -4,7 +4,7 @@
 // This project runs against the real production backend always — there is no
 // local backend in this workflow, so a "point at :8000" dev fallback just
 // produces "Backend unreachable" for anyone opening the local dashboard.
-const DEFAULT_BACKEND = "https://lokiai.onrender.com";
+const DEFAULT_BACKEND = "https://lokiai-uznh.onrender.com";
 
 export function backendUrl(): string {
   return localStorage.getItem("lokiai_backend_url") ?? DEFAULT_BACKEND;

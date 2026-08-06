@@ -50,7 +50,7 @@
   "rewrites": [
     {
       "source": "/downloads/lokiai-android.apk",
-      "destination": "https://lokiai.onrender.com/apk/download"
+      "destination": "https://lokiai-uznh.onrender.com/apk/download"
     },
     {
       "source": "/api/(.*)",

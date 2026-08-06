@@ -4,7 +4,7 @@ import { Download } from "lucide-react";
 // GitHub Release asset — the APK is ~139MB, too large to serve from this
 // app's own deploy (and Render's filesystem is ephemeral anyway). This is
 // the page the "Add Device" QR code and phone browsers land on.
-const APK_DOWNLOAD_URL = "https://lokiai.onrender.com/apk/download";
+const APK_DOWNLOAD_URL = "https://lokiai-uznh.onrender.com/apk/download";
 const APK_SIZE_MB = 141.4;
 
 export const Route = createFileRoute("/android-app")({
