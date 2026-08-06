@@ -7,6 +7,15 @@ interface WelcomeVideoModalProps {
   onClose: () => void;
 }
 
+// This app is served under /workspace/* in production (Vercel forwards that
+// prefix WITHOUT stripping it — see vite.config.ts) but at the root locally.
+// A plain "/welcome.mp4" resolves against the marketing site's root in
+// production and 404s. router.tsx uses this exact same env flag for the
+// router's own basepath; the video needs a matching physical copy at
+// public/workspace/welcome.mp4 for the prefixed path to actually exist.
+const VIDEO_SRC =
+  import.meta.env.VITE_WORKSPACE_MOUNTED === "true" ? "/workspace/welcome.mp4" : "/welcome.mp4";
+
 /// Founder welcome video shown once, before the NIM key gate on a brand new
 /// account (and replayable any time from the sidebar). Skippable — this is
 /// an introduction, not a blocker, unlike NimKeyModal.
@@ -54,7 +63,7 @@ export function WelcomeVideoModal({ onClose }: WelcomeVideoModalProps) {
           <div className="relative aspect-video w-full bg-black">
             <video
               ref={videoRef}
-              src="/welcome.mp4"
+              src={VIDEO_SRC}
               autoPlay
               muted
               playsInline
