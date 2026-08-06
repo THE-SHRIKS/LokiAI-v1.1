@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { X, Volume2, VolumeX, Play } from "lucide-react";
+import { X, Volume2, VolumeX, Play, Sparkles } from "lucide-react";
 import lokiaiLogoUrl from "@/assets/lokiai-logo.png";
 
 interface WelcomeVideoModalProps {
@@ -52,6 +52,11 @@ export function WelcomeVideoModal({ onClose }: WelcomeVideoModalProps) {
         <img src={lokiaiLogoUrl} alt="LokiAI" className="h-7 w-24 object-cover object-center" />
 
         <div className="relative w-full overflow-hidden rounded-lg border border-border bg-panel shadow-2xl">
+          <div className="absolute left-3 top-3 z-10 flex items-center gap-1.5 rounded-full border border-primary/30 bg-background/70 px-3 py-1.5 text-xs font-medium text-primary backdrop-blur-sm">
+            <Sparkles className="h-3 w-3" />
+            You're one of LokiAI's first 1,000 users
+          </div>
+
           <button
             onClick={onClose}
             aria-label="Skip"
