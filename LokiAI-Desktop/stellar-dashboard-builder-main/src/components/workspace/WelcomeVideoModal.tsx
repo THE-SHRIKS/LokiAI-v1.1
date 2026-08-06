@@ -69,8 +69,6 @@ export function WelcomeVideoModal({ onClose }: WelcomeVideoModalProps) {
             <video
               ref={videoRef}
               src={VIDEO_SRC}
-              autoPlay
-              muted
               playsInline
               onPlay={() => setStarted(true)}
               onEnded={onClose}
@@ -81,9 +79,12 @@ export function WelcomeVideoModal({ onClose }: WelcomeVideoModalProps) {
             {!started && (
               <button
                 onClick={handlePlayClick}
-                className="absolute inset-0 flex items-center justify-center bg-black/20 transition-colors hover:bg-black/30"
-                aria-label="Play with sound"
+                className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-black/70 transition-colors hover:bg-black/60"
+                aria-label="Play"
               >
+                <p className="max-w-xs text-center text-sm text-foreground/90">
+                  Our commander has something to say to you.
+                </p>
                 <span className="grid h-16 w-16 place-items-center rounded-full bg-background/80 text-foreground shadow-lg transition-transform hover:scale-105">
                   <Play className="h-6 w-6 translate-x-0.5" fill="currentColor" />
                 </span>
