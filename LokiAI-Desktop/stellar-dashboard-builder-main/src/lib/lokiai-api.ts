@@ -96,11 +96,29 @@ export async function logout(): Promise<void> {
   clearToken();
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Render's free tier spins the backend down after idle and takes up to ~50s+
+// to cold-start on the next request — during that window a connection can be
+// refused outright (not just slow), which fetch() surfaces as a bare network
+// error. That is indistinguishable at this layer from the backend actually
+// being down, so a single such failure must not be reported as unreachable.
+// Only a true network-level failure (fetch() throwing) retries here — a real
+// HTTP response, even an error status, never hits this path.
+const COLD_START_RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 16_000, 20_000];
+
 async function doFetch(path: string, headers: Record<string, string>, init: RequestInit): Promise<Response> {
-  try {
-    return await fetch(`${backendUrl()}${path}`, { cache: "no-store", ...init, headers, credentials: "include" });
-  } catch {
-    throw new ApiError(0, `Backend unreachable at ${backendUrl()}`);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetch(`${backendUrl()}${path}`, { cache: "no-store", ...init, headers, credentials: "include" });
+    } catch {
+      if (attempt >= COLD_START_RETRY_DELAYS_MS.length) {
+        throw new ApiError(0, `Backend unreachable at ${backendUrl()}`);
+      }
+      await sleep(COLD_START_RETRY_DELAYS_MS[attempt]);
+    }
   }
 }
 
