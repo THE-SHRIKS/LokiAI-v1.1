@@ -135,6 +135,27 @@ export function CodeBlock({ children, label }: { children: string; label?: strin
   );
 }
 
+// A CTA target is either an internal route (`to`, routed via TanStack
+// Link) or an external target (`href`, a plain anchor — used for
+// mailto: links so contact buttons open the user's real mail client
+// instead of navigating within the app).
+type CTATarget = { label: string } & ({ to: string; href?: never } | { href: string; to?: never });
+
+function CTAButton({ target, className }: { target: CTATarget; className: string }) {
+  if (target.href) {
+    return (
+      <a href={target.href} className={className}>
+        {target.label}
+      </a>
+    );
+  }
+  return (
+    <Link to={target.to!} className={className}>
+      {target.label}
+    </Link>
+  );
+}
+
 export function CTABlock({
   title,
   body,
@@ -144,9 +165,9 @@ export function CTABlock({
 }: {
   title: ReactNode;
   body?: string;
-  primary?: { label: string; to: string };
-  secondary?: { label: string; to: string };
-  tertiary?: { label: string; to: string } | null;
+  primary?: CTATarget;
+  secondary?: CTATarget;
+  tertiary?: CTATarget | null;
 }) {
   return (
     <Section className="bg-plane/40">
@@ -154,25 +175,19 @@ export function CTABlock({
         <h2 className="font-serif text-4xl leading-tight text-foreground sm:text-5xl">{title}</h2>
         {body && <p className="mt-6 text-lg text-muted-foreground">{body}</p>}
         <div className="mt-10 flex flex-wrap gap-3">
-          <Link
-            to={primary.to}
+          <CTAButton
+            target={primary}
             className="inline-flex min-h-[48px] items-center rounded-sm bg-gold px-6 font-mono text-xs uppercase tracking-[0.2em] text-primary-foreground transition-opacity hover:opacity-85"
-          >
-            {primary.label}
-          </Link>
-          <Link
-            to={secondary.to}
+          />
+          <CTAButton
+            target={secondary}
             className="inline-flex min-h-[48px] items-center rounded-sm border border-border px-6 font-mono text-xs uppercase tracking-[0.2em] text-foreground transition-colors hover:border-gold hover:text-gold"
-          >
-            {secondary.label}
-          </Link>
+          />
           {tertiary && (
-            <Link
-              to={tertiary.to}
+            <CTAButton
+              target={tertiary}
               className="inline-flex min-h-[48px] items-center px-2 font-mono text-xs uppercase tracking-[0.2em] text-muted-foreground transition-colors hover:text-foreground"
-            >
-              {tertiary.label}
-            </Link>
+            />
           )}
         </div>
       </div>

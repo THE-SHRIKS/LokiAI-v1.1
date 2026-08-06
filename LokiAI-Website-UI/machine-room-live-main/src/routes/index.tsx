@@ -182,9 +182,9 @@ function Home() {
           <div className="min-w-0">
             <Eyebrow index="00">AI deployment for Edge AI and IoT</Eyebrow>
             <h1 className="mt-4 font-serif text-5xl leading-[1.02] text-foreground sm:text-6xl lg:text-7xl">
-              Give AI the right
+              Edge AI made
               <br />
-              <span className="text-gold">local intelligence</span>.
+              <span className="text-gold">ridiculously simple</span>.
             </h1>
             <p className="mt-6 max-w-xl text-lg leading-relaxed text-muted-foreground sm:text-xl">
               LokiAI discovers, validates, and deploys AI models across Edge AI and IoT environments, then tracks what

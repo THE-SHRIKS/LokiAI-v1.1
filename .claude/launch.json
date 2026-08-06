@@ -9,6 +9,13 @@
       "autoPort": true
     },
     {
+      "name": "lokiai-marketing",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "LokiAI-Website-UI/machine-room-live-main", "run", "dev"],
+      "port": 3000,
+      "autoPort": true
+    },
+    {
       "name": "lokiai-backend",
       "runtimeExecutable": "L:/The Shriks/LokiAI/LokiAI-backend/venv/Scripts/python.exe",
       "runtimeArgs": ["-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "LokiAI-backend"],
