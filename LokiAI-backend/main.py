@@ -2195,6 +2195,101 @@ async def get_device(device_id: str, request: Request, user_id: str = Depends(ge
     return d
 
 
+@app.get("/devices/{device_id}/diagnostics")
+async def get_device_diagnostics(
+    device_id: str, request: Request, user_id: str = Depends(get_current_user),
+    deployment_limit: int = 10, event_limit: int = 30,
+):
+    """Real production evidence for one device — deployment history with
+    timestamps/status/failure detail, recent runtime telemetry, and current
+    connection state. Built so a stuck-deployment report can be diagnosed
+    from actual data instead of guessing at what the phone or backend did.
+    """
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        device = await conn.fetchrow(
+            "SELECT id, phone_model, status, last_seen FROM devices "
+            "WHERE id = $1::uuid AND user_id = $2::uuid",
+            device_id, user_id,
+        )
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        deployments = await conn.fetch(
+            """SELECT d.id, d.status, d.progress, d.error_message,
+                      d.failure_code, d.failure_details, d.adapter_id,
+                      d.adapter_version, d.runtime_version,
+                      d.deployed_at, d.updated_at, d.completed_at,
+                      m.name AS model_name, m.hf_model_id, m.size_mb
+               FROM deployments d
+               LEFT JOIN models m ON m.id = d.model_id
+               WHERE d.device_id = $1::uuid
+               ORDER BY d.deployed_at DESC LIMIT $2""",
+            device_id, deployment_limit,
+        )
+        events = await conn.fetch(
+            """SELECT event_id, deployment_id, model_id, adapter_id,
+                      operation, event_type, success, error_code,
+                      error_detail, occurred_at, received_at
+               FROM runtime_events
+               WHERE device_id = $1::uuid
+               ORDER BY occurred_at DESC LIMIT $2""",
+            device_id, event_limit,
+        )
+
+    now = datetime.now(timezone.utc)
+
+    def _seconds_since(ts) -> Optional[float]:
+        return round((now - ts).total_seconds(), 1) if ts else None
+
+    return {
+        "device": {
+            "id": str(device["id"]),
+            "phone_model": device["phone_model"],
+            "status": device["status"],
+            "last_seen": device["last_seen"].isoformat() if device["last_seen"] else None,
+            "websocket_connected": ws_manager.is_connected(device_id),
+        },
+        "deployments": [
+            {
+                "id": str(d["id"]),
+                "model_name": d["model_name"],
+                "hf_model_id": d["hf_model_id"],
+                "size_mb": d["size_mb"],
+                "status": d["status"],
+                "progress": d["progress"],
+                "adapter_id": d["adapter_id"],
+                "adapter_version": d["adapter_version"],
+                "runtime_version": d["runtime_version"],
+                "error_message": d["error_message"],
+                "failure_code": d["failure_code"],
+                "failure_details": d["failure_details"],
+                "deployed_at": d["deployed_at"].isoformat() if d["deployed_at"] else None,
+                "updated_at": d["updated_at"].isoformat() if d["updated_at"] else None,
+                "completed_at": d["completed_at"].isoformat() if d["completed_at"] else None,
+                "seconds_since_last_update": _seconds_since(d["updated_at"] or d["deployed_at"]),
+            }
+            for d in deployments
+        ],
+        "runtime_events": [
+            {
+                "event_id": e["event_id"],
+                "deployment_id": str(e["deployment_id"]) if e["deployment_id"] else None,
+                "model_id": e["model_id"],
+                "adapter_id": e["adapter_id"],
+                "operation": e["operation"],
+                "event_type": e["event_type"],
+                "success": e["success"],
+                "error_code": e["error_code"],
+                "error_detail": e["error_detail"],
+                "occurred_at": e["occurred_at"].isoformat() if e["occurred_at"] else None,
+                "received_at": e["received_at"].isoformat() if e["received_at"] else None,
+            }
+            for e in events
+        ],
+    }
+
+
 # POST /devices/register was removed here (Batch 4).
 #
 # It upserted on the globally-unique adb_serial and unconditionally set
