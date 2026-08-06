@@ -6618,13 +6618,19 @@ def _is_ssrf_safe_url(url: str) -> bool:
 # Status-aware staleness: a large file transfer (queued/downloading) can
 # legitimately run for many minutes on a slow connection, but validation
 # (downloaded/validating) is a single bounded local operation — one chat
-# generation or one TFLite invoke — that either finishes in seconds or has
-# died (native crash, dropped connection, unhandled hang). Giving that phase
-# the same 15-minute grace period as a genuine download is exactly what let
-# a crashed validation block every other deployment on the device for a
-# quarter of an hour. Used both when a new deployment is requested and when
-# an existing one is simply polled — polling alone must be able to notice a
-# dead deployment, not just the next deploy attempt.
+# generation or one TFLite invoke — that either finishes or has died (native
+# crash, dropped connection, unhandled hang).
+#
+# The window here is deliberately NOT as tight as the phone's own internal
+# validation cap (ModelDownloader._validationTimeout = 60s): a large GGUF
+# chat model's FIRST mmap read on a slow phone, plus WS delivery latency,
+# can legitimately take longer than that 60s cap accounts for, and this
+# value was cut too aggressively (90s) once already — that mislabeled a
+# deployment that was still genuinely validating as "failed", and because
+# the dashboard treats "failed" as terminal and stops polling, a model that
+# went on to actually succeed stayed shown as failed forever. 3 minutes
+# gives real headroom above the phone's own 60s cap while still resolving a
+# genuinely dead deployment 5x faster than the old blanket 15 minutes.
 _STALE_DEPLOYMENT_PREDICATE = """
     status IN ('queued', 'downloading', 'downloaded', 'validating')
     AND (
@@ -6632,7 +6638,7 @@ _STALE_DEPLOYMENT_PREDICATE = """
        AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '15 minutes')
       OR
       (status IN ('downloaded', 'validating')
-       AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '90 seconds')
+       AND COALESCE(updated_at, deployed_at) <= NOW() - INTERVAL '3 minutes')
     )
 """
 
