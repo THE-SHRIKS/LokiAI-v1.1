@@ -526,7 +526,7 @@ app.add_middleware(
 # and LAN pairing deliberately accept their local host/IP; Render only accepts
 # the known backend names unless an operator explicitly adds another host.
 if os.getenv("RENDER"):
-    _default_hosts = "lokiai.onrender.com,lokiai.theshriks.space"
+    _default_hosts = "lokiai-uznh.onrender.com,lokiai.onrender.com,lokiai.theshriks.space"
     _allowed_hosts = [h.strip() for h in os.getenv("ALLOWED_HOSTS", _default_hosts).split(",") if h.strip()]
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
 

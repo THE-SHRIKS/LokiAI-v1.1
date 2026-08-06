@@ -29,7 +29,7 @@ from typing import Optional
 
 import httpx
 
-DEFAULT_BACKEND = "https://lokiai.onrender.com"
+DEFAULT_BACKEND = "https://lokiai-uznh.onrender.com"
 
 
 def _age(iso_timestamp: Optional[str]) -> str:
