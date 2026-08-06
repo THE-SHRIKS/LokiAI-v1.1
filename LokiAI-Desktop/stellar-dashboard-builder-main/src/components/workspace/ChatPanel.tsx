@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
-import { Send, FolderOpen, Asterisk, Rocket, Loader2, CheckCircle2, XCircle } from "lucide-react";
+import { Send, FolderOpen, Asterisk, Rocket, Loader2, CheckCircle2, XCircle, Lock } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Device, ModelRecommendation, DeploymentRecord } from "@/lib/lokiai-api";
 
@@ -7,6 +7,16 @@ export interface DeployState {
   status: "idle" | "queued" | "downloading" | "downloaded" | "validating" | "complete" | "failed";
   progress: number;
   error?: string;
+}
+
+// A 409 ("device already deploying") is reported through the same "failed"
+// status as a real crash, but it isn't one — nothing was attempted, nothing
+// broke. Rendering it as "Failed" made a correct block look like the model
+// itself was defective. Detected by message text since the backend's 409
+// detail is the only signal this component gets for the distinction.
+function isDeviceBusyBlock(error?: string): boolean {
+  if (!error) return false;
+  return /already (in progress|deploying) on this device/i.test(error);
 }
 
 export interface ChatMessage {
@@ -398,6 +408,10 @@ function ModelCard({
           <span className="inline-flex items-center gap-1 text-xs text-olive-glow">
             <CheckCircle2 className="h-3.5 w-3.5" /> Ready
           </span>
+        ) : st === "failed" && isDeviceBusyBlock(state?.error) ? (
+          <span className="inline-flex items-center gap-1 text-xs text-yellow-500">
+            <Lock className="h-3.5 w-3.5" /> Blocked
+          </span>
         ) : st === "failed" ? (
           <span className="inline-flex items-center gap-1 text-xs text-destructive-foreground">
             <XCircle className="h-3.5 w-3.5" /> Failed
@@ -477,7 +491,14 @@ function ModelCard({
         </div>
       )}
       {st === "failed" && state?.error && (
-        <div className="mt-1 text-[11px] text-destructive-foreground">{state.error}</div>
+        <div
+          className={cn(
+            "mt-1 text-[11px]",
+            isDeviceBusyBlock(state.error) ? "text-yellow-500" : "text-destructive-foreground",
+          )}
+        >
+          {state.error}
+        </div>
       )}
     </div>
   );
