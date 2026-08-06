@@ -15,6 +15,7 @@ import {
   Dot,
   LogOut,
   MessageSquarePlus,
+  PlayCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getMe, logout, type Me } from "@/lib/lokiai-api";
@@ -34,9 +35,10 @@ interface SidebarProps {
   activeRecentId?: string;
   onSelectRecent?: (id: string) => void;
   onNewSession?: () => void;
+  onWatchIntro?: () => void;
 }
 
-export function Sidebar({ collapsed, onToggle, recents, activeRecentId, onSelectRecent, onNewSession }: SidebarProps) {
+export function Sidebar({ collapsed, onToggle, recents, activeRecentId, onSelectRecent, onNewSession, onWatchIntro }: SidebarProps) {
   const [tab, setTab] = useState<Tab>("code");
   const [me, setMe] = useState<Me | null>(null);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -91,6 +93,7 @@ export function Sidebar({ collapsed, onToggle, recents, activeRecentId, onSelect
         <SideItem icon={Repeat} label="Models" onClick={() => navigate({ to: "/models" })} />
         <SideItem icon={Send} label="Devices" onClick={() => navigate({ to: "/devices" })} />
         <SideItem icon={MessageSquarePlus} label="Feedback" onClick={() => navigate({ to: "/feedback" })} />
+        <SideItem icon={PlayCircle} label="Watch welcome video" onClick={onWatchIntro} />
       </nav>
 
       <div className="mt-4 px-3 pb-1 text-[11px] uppercase tracking-wider text-muted-foreground/70 flex items-center justify-between">

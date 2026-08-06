@@ -5,6 +5,7 @@ import { Sidebar } from "@/components/workspace/Sidebar";
 import { ChatPanel, type ChatMessage, type DeployState } from "@/components/workspace/ChatPanel";
 import { Workspace } from "@/components/workspace/Workspace";
 import { NimKeyModal } from "@/components/workspace/NimKeyModal";
+import { WelcomeVideoModal } from "@/components/workspace/WelcomeVideoModal";
 import {
   getToken,
   getDevices,
@@ -84,6 +85,23 @@ interface ChatSession {
 
 const SESSIONS_KEY = "lokiai_chat_sessions_v1";
 const MAX_SESSIONS = 50;
+const WELCOME_VIDEO_SEEN_KEY = "lokiai_welcome_video_seen_v1";
+
+function hasSeenWelcomeVideo(userId: string): boolean {
+  try {
+    return localStorage.getItem(`${WELCOME_VIDEO_SEEN_KEY}_${userId}`) === "1";
+  } catch {
+    return true; // localStorage unavailable — never block on the video.
+  }
+}
+
+function markWelcomeVideoSeen(userId: string) {
+  try {
+    localStorage.setItem(`${WELCOME_VIDEO_SEEN_KEY}_${userId}`, "1");
+  } catch {
+    /* best-effort */
+  }
+}
 
 function loadSessions(userId: string): ChatSession[] {
   try {
@@ -143,6 +161,12 @@ function Index() {
   // key (no shared key, no fallback — see LokiAI-backend's assistant_chat).
   // null = still checking, so nothing renders instead of a false flash.
   const [hasNimKey, setHasNimKey] = useState<boolean | null>(null);
+
+  // Founder welcome video: shown once per account, before the NIM key gate
+  // (so it's the very first thing a brand-new sign-up sees), and replayable
+  // any time from the sidebar. null = not decided yet, so it never flashes
+  // on for a returning user while getMe() is still in flight.
+  const [showWelcomeVideo, setShowWelcomeVideo] = useState<boolean | null>(null);
   
   const meRef = useRef<{ id: string } | null>(null);
 
@@ -151,6 +175,7 @@ function Index() {
     getMe()
       .then((m) => {
         setHasNimKey(m.has_nim_key);
+        setShowWelcomeVideo(!hasSeenWelcomeVideo(m.id));
         setMe(m as any);
         meRef.current = m;
         // Merge stored sessions INTO any sessions already created by the
@@ -168,6 +193,7 @@ function Index() {
       })
       .catch(() => {
         setHasNimKey(null);
+        setShowWelcomeVideo(false);
         setSessionsLoaded(true);
       });
   }, []);
@@ -429,7 +455,17 @@ function Index() {
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
-      {hasNimKey === false && <NimKeyModal onSaved={() => setHasNimKey(true)} />}
+      {showWelcomeVideo ? (
+        <WelcomeVideoModal
+          onClose={() => {
+            const userId = me?.id ?? meRef.current?.id;
+            if (userId) markWelcomeVideoSeen(userId);
+            setShowWelcomeVideo(false);
+          }}
+        />
+      ) : (
+        hasNimKey === false && <NimKeyModal onSaved={() => setHasNimKey(true)} />
+      )}
       <div className="flex min-h-0 flex-1">
         <Sidebar
           collapsed={collapsed}
@@ -438,6 +474,7 @@ function Index() {
           activeRecentId={activeSessionId ?? undefined}
           onSelectRecent={setActiveSessionId}
           onNewSession={() => setActiveSessionId(null)}
+          onWatchIntro={() => setShowWelcomeVideo(true)}
         />
 
         {inWorkspace ? (
