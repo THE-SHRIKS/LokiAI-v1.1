@@ -49,6 +49,19 @@ class BackendConnection {
 
   final Random _rng = Random();
 
+  // A deployment status update (e.g. 'complete' after a slow model load)
+  // sent at the exact instant the socket happened to be down was previously
+  // dropped forever — send() had no queue, and the reconnect path only
+  // re-reports whatever is on disk ('downloaded'), never the real outcome.
+  // The backend then had nothing to go on but its own staleness clock,
+  // which eventually marks a deployment that actually succeeded as "failed"
+  // ("Timed out: phone stopped reporting progress") purely because the one
+  // message that would have said otherwise never survived a momentary
+  // disconnect. Buffering here and flushing on every reconnect closes that
+  // gap for any transient drop, regardless of device or model size.
+  static const int _maxPendingSends = 20;
+  final List<Map<String, dynamic>> _pendingSends = [];
+
   /// True once the backend has rejected our credential. The UI watches this to
   /// prompt a re-pair instead of leaving the user staring at a device that
   /// silently never comes online. Retrying is suspended while set.
@@ -209,8 +222,13 @@ class BackendConnection {
 
       // Tell the backend what this device ACTUALLY has, so anything that
       // changed while the socket was down converges instead of the two sides
-      // disagreeing forever.
+      // disagreeing forever. This is a conservative floor read from disk
+      // ('downloaded' at best) — _flushPending() runs right after and sends
+      // anything more current (validating/complete/failed) that was queued
+      // while the socket was unavailable, so a real outcome always overrides
+      // this baseline instead of the other way around.
       await _sendStateReport();
+      _flushPending();
     } on TimeoutException {
       // ignore: avoid_print
       print('VERIFICATION: ws -> connect timed out');
@@ -338,19 +356,46 @@ class BackendConnection {
     });
   }
 
-  /// Sends a JSON payload to the backend. Silently drops when offline —
-  /// deployment status still converges via retries and backend timeouts.
+  /// Sends a JSON payload to the backend. If the socket is down, deployment
+  /// and runtime-event updates are queued and redelivered on the next
+  /// reconnect instead of being lost — those carry a one-time outcome
+  /// (validating/complete/failed) that nothing else will ever re-send.
+  /// Heartbeats and state reports are point-in-time and always regenerated
+  /// fresh, so queuing a stale one would be actively wrong; they're dropped
+  /// as before.
   void send(Map<String, dynamic> payload) {
     final socket = _socket;
     if (socket == null || socket.readyState != WebSocket.open) {
+      final type = payload['type'];
+      final isRequeueable = type != 'heartbeat' && type != 'state_report';
       // ignore: avoid_print
       print(
-        'VERIFICATION: ws -> send skipped (not connected): '
-        '${payload['type'] ?? payload['status'] ?? 'message'}',
+        'VERIFICATION: ws -> send ${isRequeueable ? "queued" : "skipped"} '
+        '(not connected): ${type ?? payload['status'] ?? 'message'}',
       );
+      if (isRequeueable) {
+        _pendingSends.add(payload);
+        while (_pendingSends.length > _maxPendingSends) {
+          _pendingSends.removeAt(0);
+        }
+      }
       return;
     }
     socket.add(jsonEncode(payload));
+  }
+
+  /// Redelivers anything queued by send() while the socket was down. Runs
+  /// after every successful (re)connect, right after _sendStateReport() so a
+  /// real outcome always lands on top of that conservative disk-read floor.
+  void _flushPending() {
+    if (_pendingSends.isEmpty) return;
+    final queued = List<Map<String, dynamic>>.from(_pendingSends);
+    _pendingSends.clear();
+    // ignore: avoid_print
+    print('VERIFICATION: ws -> flushing ${queued.length} queued message(s)');
+    for (final payload in queued) {
+      send(payload);
+    }
   }
 
   void _onMessage(dynamic raw) {
