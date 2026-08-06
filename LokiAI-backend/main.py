@@ -6452,7 +6452,7 @@ async def _assistant_turn(pool, req: "ChatRequest", user_id: str,
     # of models the user already has, not just fresh HF search results.
     async with pool.acquire() as conn:
         own_rows = await conn.fetch(
-            """SELECT id, name, hf_model_id, format, size_mb, task_type, download_url
+            """SELECT id, name, hf_model_id, format, size_mb, task_type, download_url, sha256
                FROM models
                WHERE user_id = $1::uuid AND task_type = ANY($2::text[])
                  AND size_mb IS NOT NULL AND size_mb <= $3
