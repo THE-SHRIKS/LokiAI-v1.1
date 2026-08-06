@@ -243,7 +243,7 @@ export function TopologyVisual() {
         className="[animation:loki-pulse_2s_ease-in-out_infinite]"
       />
       <text x="380" y="59" fill="var(--foreground)" fontFamily="var(--font-mono)" fontSize="11">
-        ANDROID AGENT
+        ANDROID PHONE
       </text>
 
       {/* Device Node 2 (Planned) */}

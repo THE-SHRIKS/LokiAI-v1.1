@@ -217,7 +217,7 @@ function Home() {
                 </span>
                 <span className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.2em] text-live">
                   <span className="h-1.5 w-1.5 rounded-full bg-live [animation:loki-pulse_2s_ease-in-out_infinite]" />
-                  1 agent online
+                  1 device online
                 </span>
               </div>
               <TopologyVisual />
