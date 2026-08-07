@@ -5,6 +5,8 @@ const TITLE = "Docs — LokiAI documentation";
 const DESC =
   "LokiAI documentation: getting started, architecture, device pairing, model compatibility, deployments, security, API reference, troubleshooting and changelog.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/docs";
+
 export const Route = createFileRoute("/docs")({
   head: () => ({
     meta: [
@@ -12,9 +14,11 @@ export const Route = createFileRoute("/docs")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Docs,
 });

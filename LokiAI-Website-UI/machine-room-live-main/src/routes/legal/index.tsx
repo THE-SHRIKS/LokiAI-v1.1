@@ -4,6 +4,8 @@ import { PageHero, Panel, Section } from "@/components/loki/primitives";
 const TITLE = "Legal — LokiAI";
 const DESC = "LokiAI legal information, including its Privacy Policy and Terms of Use.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/legal";
+
 export const Route = createFileRoute("/legal/")({
   head: () => ({
     meta: [
@@ -11,7 +13,9 @@ export const Route = createFileRoute("/legal/")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Legal,
 });

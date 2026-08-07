@@ -13,6 +13,8 @@ const TITLE = "Product — LokiAI intent-to-execution workflow";
 const DESC =
   "How a LokiAI deployment works end to end: describe the outcome, profile the device, verify the artifact, deploy wirelessly and run locally.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/product";
+
 export const Route = createFileRoute("/product")({
   head: () => ({
     meta: [
@@ -20,9 +22,11 @@ export const Route = createFileRoute("/product")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Product,
 });

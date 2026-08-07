@@ -5,6 +5,8 @@ const TITLE = "Terms — LokiAI";
 const DESC =
   "The terms on which LokiAI is provided today, including service status labelling, acceptable use and model licence responsibility.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/legal/terms";
+
 export const Route = createFileRoute("/legal/terms")({
   head: () => ({
     meta: [
@@ -12,9 +14,11 @@ export const Route = createFileRoute("/legal/terms")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Terms,
 });

@@ -6,6 +6,8 @@ const TITLE = "Company — THE SHRIKS, the team behind LokiAI";
 const DESC =
   "Why LokiAI exists, what we believe about local-first AI on real hardware, and how to reach THE SHRIKS for partnerships, press or investment.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/company";
+
 export const Route = createFileRoute("/company")({
   head: () => ({
     meta: [
@@ -13,9 +15,11 @@ export const Route = createFileRoute("/company")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Company,
 });

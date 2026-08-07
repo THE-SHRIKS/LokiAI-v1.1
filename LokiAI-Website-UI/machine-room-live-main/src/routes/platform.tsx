@@ -6,6 +6,8 @@ const TITLE = "Platform — LokiAI control plane and device agents";
 const DESC =
   "The LokiAI platform: control plane, device agents, model verification, hardware profiling, runtime selection, deployment engine, observability and recovery.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/platform";
+
 export const Route = createFileRoute("/platform")({
   head: () => ({
     meta: [
@@ -13,9 +15,11 @@ export const Route = createFileRoute("/platform")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Platform,
 });

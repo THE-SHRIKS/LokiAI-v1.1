@@ -6,6 +6,8 @@ const TITLE = "Security — tenant isolation, device credentials and local infer
 const DESC =
   "The LokiAI security model: tenant isolation, encrypted provider keys, device-scoped credentials, authenticated WebSockets, strict CORS, verified artifacts and rate limits.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/security";
+
 export const Route = createFileRoute("/security")({
   head: () => ({
     meta: [
@@ -13,9 +15,11 @@ export const Route = createFileRoute("/security")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Security,
 });

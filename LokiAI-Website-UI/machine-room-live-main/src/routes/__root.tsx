@@ -75,6 +75,47 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   );
 }
 
+const SITE_URL = "https://lokiai.theshriks.space";
+
+// Structured data: one Organization (THE SHRIKS, the venture) and one
+// SoftwareApplication (LokiAI, the product) linked by @id so search engines
+// and AI retrieval systems can resolve "who makes this" and "what is this"
+// as a single, unambiguous entity instead of inferring it from prose.
+// alternateName is a genuine known-as variant (people do type "Loki AI" as
+// two words) — deliberately not gaming this with the "low-key" phonetic
+// joke, which lives in prose (llms.txt, meta description) instead, where a
+// human or LLM reading it can tell it's a pronunciation note, not a claimed
+// second brand name.
+const ORGANIZATION_JSON_LD = {
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "@id": `${SITE_URL}/#organization`,
+  name: "THE SHRIKS",
+  url: SITE_URL,
+  logo: `${SITE_URL}/logo.png`,
+  sameAs: [
+    "https://x.com/theshriks1",
+    "https://www.instagram.com/times.theshriks/",
+    "https://www.reddit.com/user/ShrishLoki/",
+    "https://www.linkedin.com/in/laukik-rajput-95bb48300/",
+  ],
+};
+
+const SOFTWARE_JSON_LD = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "@id": `${SITE_URL}/#software`,
+  name: "LokiAI",
+  alternateName: "Loki AI",
+  url: SITE_URL,
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "Android",
+  description:
+    "LokiAI discovers, verifies, and deploys AI models to real devices, then tracks what runs, where it runs, and why it fits. Starts with an Android agent that pairs over the network and runs models fully offline, on-device.",
+  publisher: { "@id": `${SITE_URL}/#organization` },
+  creator: { "@id": `${SITE_URL}/#organization` },
+};
+
 export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
   head: () => ({
     meta: [
@@ -84,17 +125,26 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       {
         name: "description",
         content:
-          "LokiAI discovers, verifies and deploys AI models to real devices — starting with the Android agent.",
+          "LokiAI (pronounced \"low-key AI\") discovers, verifies and deploys AI models to real devices, fully offline — starting with the Android agent. Built by THE SHRIKS.",
       },
       { name: "author", content: "THE SHRIKS" },
       { property: "og:site_name", content: "LokiAI" },
       { property: "og:type", content: "website" },
+      // No blanket og:url here, same reasoning as canonical above — each
+      // route supplies its own og:url pointing at its own real path.
+      { property: "og:image", content: `${SITE_URL}/logo.png` },
       { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:site", content: "@theshriks1" },
+      { name: "twitter:image", content: `${SITE_URL}/logo.png` },
       { name: "theme-color", content: "#0d0c0a" },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
       { rel: "icon", href: "/favicon.png", type: "image/png" },
+      // No blanket canonical here — that would tell search engines every
+      // route is the homepage. Each route sets its own canonical in its own
+      // head() (see contact.tsx etc. for the pattern), pointing at its own
+      // real path.
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
       {
@@ -114,6 +164,18 @@ function RootShell({ children }: { children: ReactNode }) {
     <html lang="en">
       <head>
         <HeadContent />
+        {/* JSON-LD: rendered directly rather than through head()'s meta/links
+            API, which has no first-class slot for a raw <script> tag. This
+            guarantees it's present in the server-rendered HTML regardless
+            of that API's shape. */}
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(ORGANIZATION_JSON_LD) }}
+        />
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(SOFTWARE_JSON_LD) }}
+        />
       </head>
       <body>
         {children}

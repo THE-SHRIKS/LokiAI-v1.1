@@ -32,6 +32,15 @@ const COLUMNS = [
   },
 ];
 
+// Same four accounts as the Organization schema's sameAs in __root.tsx —
+// keep these two lists in sync if a handle ever changes.
+const SOCIALS = [
+  { label: "X", href: "https://x.com/theshriks1" },
+  { label: "Instagram", href: "https://www.instagram.com/times.theshriks/" },
+  { label: "Reddit", href: "https://www.reddit.com/user/ShrishLoki/" },
+  { label: "LinkedIn", href: "https://www.linkedin.com/in/laukik-rajput-95bb48300/" },
+];
+
 export function Footer() {
   return (
     <footer className="border-t border-border bg-transparent">
@@ -44,6 +53,19 @@ export function Footer() {
             <p className="mt-4 max-w-xs text-sm text-muted-foreground">
               An AI-native deployment and operations layer for Edge AI and IoT environments. Built by THE SHRIKS.
             </p>
+            <nav aria-label="Social" className="mt-6 flex flex-wrap gap-x-4 gap-y-2">
+              {SOCIALS.map((s) => (
+                <a
+                  key={s.label}
+                  href={s.href}
+                  target="_blank"
+                  rel="me noreferrer"
+                  className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground transition-colors hover:text-gold"
+                >
+                  {s.label}
+                </a>
+              ))}
+            </nav>
           </div>
           {COLUMNS.map((column) => (
             <nav key={column.title} aria-label={column.title}>

@@ -6,6 +6,8 @@ const TITLE = "Applications — on-device AI by use case and industry | LokiAI";
 const DESC =
   "Where LokiAI deployments are used: offline assistants, local analysis, audio classification, anomaly detection, IoT intelligence and Edge AI workflows.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/applications";
+
 export const Route = createFileRoute("/applications")({
   head: () => ({
     meta: [
@@ -13,9 +15,11 @@ export const Route = createFileRoute("/applications")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Applications,
 });

@@ -6,6 +6,8 @@ const TITLE = "Developers — architecture, APIs and the agent protocol | LokiAI
 const DESC =
   "LokiAI for engineers: control-plane architecture, agent protocol, runtime adapters, supported model formats, deployment events and the WebSocket lifecycle.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/developers";
+
 export const Route = createFileRoute("/developers")({
   head: () => ({
     meta: [
@@ -13,9 +15,11 @@ export const Route = createFileRoute("/developers")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Developers,
 });

@@ -22,6 +22,8 @@ const TITLE = "LokiAI - Edge AI made ridiculously simple!";
 const DESC =
   "LokiAI discovers, validates and deploys AI models across Edge AI and IoT environments without requiring users to understand model formats or runtimes.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/";
+
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
@@ -29,9 +31,11 @@ export const Route = createFileRoute("/")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Home,
 });

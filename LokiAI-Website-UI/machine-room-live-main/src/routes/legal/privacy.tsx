@@ -5,6 +5,8 @@ const TITLE = "Privacy — LokiAI";
 const DESC =
   "How LokiAI handles account data, device telemetry, provider credentials and inference inputs, which stay on the device.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/legal/privacy";
+
 export const Route = createFileRoute("/legal/privacy")({
   head: () => ({
     meta: [
@@ -12,9 +14,11 @@ export const Route = createFileRoute("/legal/privacy")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Privacy,
 });

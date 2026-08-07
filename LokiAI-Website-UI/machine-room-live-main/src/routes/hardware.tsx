@@ -13,6 +13,8 @@ const TITLE = "Hardware — supported and planned device classes | LokiAI";
 const DESC =
   "Honest status for every LokiAI device class: Android is available today, with broader IoT and Edge AI support planned.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/hardware";
+
 export const Route = createFileRoute("/hardware")({
   head: () => ({
     meta: [
@@ -20,9 +22,11 @@ export const Route = createFileRoute("/hardware")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Hardware,
 });

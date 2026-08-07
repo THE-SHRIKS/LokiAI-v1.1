@@ -1,0 +1,9 @@
+User-agent: *
+Allow: /
+Disallow: /workspace
+Disallow: /login
+
+Sitemap: https://lokiai.theshriks.space/sitemap.xml
+
+# llms.txt (not a search-engine signal — see https://llmstxt.org):
+# https://lokiai.theshriks.space/llms.txt

@@ -6,6 +6,8 @@ const TITLE = "Models — discovery, verification and formats | LokiAI";
 const DESC =
   "How LokiAI resolves a Hugging Face repository to one verified GGUF or TFLite artifact, checks it against the device profile and selects a local runtime.";
 
+const PAGE_URL = "https://lokiai.theshriks.space/models";
+
 export const Route = createFileRoute("/models")({
   head: () => ({
     meta: [
@@ -13,9 +15,11 @@ export const Route = createFileRoute("/models")({
       { name: "description", content: DESC },
       { property: "og:title", content: TITLE },
       { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
       { name: "twitter:title", content: TITLE },
       { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: Models,
 });

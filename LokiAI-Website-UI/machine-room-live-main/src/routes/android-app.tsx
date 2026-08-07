@@ -3,12 +3,23 @@ import { createFileRoute } from "@tanstack/react-router";
 // Served through the public LokiAI domain; Vercel proxies the file source.
 const APK_DOWNLOAD_URL = "/downloads/lokiai-android.apk";
 
+const TITLE = "Install LokiAI — Android app | LokiAI by THE SHRIKS";
+const DESC =
+  "Download the LokiAI Android app and pair it with your workspace to deploy and run AI models fully offline, on-device.";
+const PAGE_URL = "https://lokiai.theshriks.space/android-app";
+
 export const Route = createFileRoute("/android-app")({
   head: () => ({
     meta: [
-      { title: "Install LokiAI" },
-      { name: "description", content: "Download the LokiAI Android app." },
+      { title: TITLE },
+      { name: "description", content: DESC },
+      { property: "og:title", content: TITLE },
+      { property: "og:description", content: DESC },
+      { property: "og:url", content: PAGE_URL },
+      { name: "twitter:title", content: TITLE },
+      { name: "twitter:description", content: DESC },
     ],
+    links: [{ rel: "canonical", href: PAGE_URL }],
   }),
   component: AndroidApp,
 });
