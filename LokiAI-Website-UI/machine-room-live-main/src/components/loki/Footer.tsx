@@ -3,21 +3,18 @@ import { Logo } from "./Logo";
 
 const COLUMNS = [
   {
-    title: "Platform",
+    title: "Product",
     links: [
       { label: "Product", to: "/product" as const },
-      { label: "Platform", to: "/platform" as const },
-      { label: "Edge AI", to: "/hardware" as const },
-      { label: "Models", to: "/models" as const },
+      { label: "Hardware", to: "/hardware" as const },
+      { label: "Security", to: "/security" as const },
     ],
   },
   {
     title: "Build",
     links: [
-      { label: "Applications", to: "/applications" as const },
       { label: "Developers", to: "/developers" as const },
       { label: "Docs", to: "/docs" as const },
-      { label: "Security", to: "/security" as const },
     ],
   },
   {
@@ -43,7 +40,7 @@ const SOCIALS = [
 
 export function Footer() {
   return (
-    <footer className="border-t border-border bg-transparent">
+    <footer className="bg-transparent">
       <div className="mx-auto max-w-[1400px] px-5 py-16 sm:px-8">
         <div className="grid gap-12 md:grid-cols-[1.4fr_repeat(3,1fr)]">
           <div>
@@ -51,7 +48,7 @@ export function Footer() {
               <Logo className="h-12 w-auto" />
             </div>
             <p className="mt-4 max-w-xs text-sm text-muted-foreground">
-              An AI-native deployment and operations layer for Edge AI and IoT environments. Built by THE SHRIKS.
+              A desktop app and local runtime that lets coding agents work on real hardware with your approval. Open source. Built by THE SHRIKS.
             </p>
             <nav aria-label="Social" className="mt-6 flex flex-wrap gap-x-4 gap-y-2">
               {SOCIALS.map((s) => (

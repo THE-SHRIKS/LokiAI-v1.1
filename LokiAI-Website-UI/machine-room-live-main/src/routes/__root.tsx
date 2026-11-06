@@ -6,6 +6,7 @@ import {
   useRouter,
   HeadContent,
   Scripts,
+  useRouterState,
 } from "@tanstack/react-router";
 import { useEffect, type ReactNode } from "react";
 import Lenis from "lenis";
@@ -109,9 +110,9 @@ const SOFTWARE_JSON_LD = {
   alternateName: "Loki AI",
   url: SITE_URL,
   applicationCategory: "DeveloperApplication",
-  operatingSystem: "Android",
+  operatingSystem: "Windows",
   description:
-    "LokiAI discovers, verifies, and deploys AI models to real devices, then tracks what runs, where it runs, and why it fits. Starts with an Android agent that pairs over the network and runs models fully offline, on-device.",
+    "LokiAI v1.2 is an open-source desktop app and local runtime that lets coding agents inspect, build, flash and test micro-devices through scoped tools, with user approval and a full activity trail.",
   publisher: { "@id": `${SITE_URL}/#organization` },
   creator: { "@id": `${SITE_URL}/#organization` },
 };
@@ -121,22 +122,27 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "LokiAI - Edge AI made ridiculously simple!" },
+      { title: "LokiAI v1.2: coding agents propose, LokiAI executes, you approve" },
       {
         name: "description",
         content:
-          "LokiAI (pronounced \"low-key AI\") discovers, verifies and deploys AI models to real devices, fully offline — starting with the Android agent. Built by THE SHRIKS.",
+          "LokiAI v1.2 is an open-source desktop app and local runtime that lets coding agents inspect, build, flash and test micro-devices through scoped tools, with your approval and a full activity trail. Built by THE SHRIKS.",
       },
       { name: "author", content: "THE SHRIKS" },
       { property: "og:site_name", content: "LokiAI" },
       { property: "og:type", content: "website" },
       // No blanket og:url here, same reasoning as canonical above — each
       // route supplies its own og:url pointing at its own real path.
-      { property: "og:image", content: `${SITE_URL}/logo.png` },
+      { property: "og:locale", content: "en_US" },
+      { property: "og:image", content: `${SITE_URL}/og-image.png` },
+      { property: "og:image:width", content: "1200" },
+      { property: "og:image:height", content: "630" },
+      { property: "og:image:alt", content: "LokiAI v1.2: coding agents propose, you approve." },
+      { name: "robots", content: "index, follow, max-image-preview:large, max-snippet:-1" },
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:site", content: "@theshriks1" },
-      { name: "twitter:image", content: `${SITE_URL}/logo.png` },
-      { name: "theme-color", content: "#0d0c0a" },
+      { name: "twitter:image", content: `${SITE_URL}/og-image.png` },
+      { name: "theme-color", content: "#010101" },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
@@ -149,7 +155,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
       {
         rel: "stylesheet",
-        href: "https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap",
+        href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap",
       },
     ],
   }),
@@ -159,7 +165,40 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
   errorComponent: ErrorComponent,
 });
 
+const CRUMB_NAMES: Record<string, string> = {
+  product: "Product",
+  hardware: "Hardware",
+  security: "Security",
+  developers: "Developers",
+  docs: "Docs",
+  company: "Company",
+  contact: "Contact",
+  legal: "Legal",
+  privacy: "Privacy",
+  terms: "Terms",
+};
+
+function breadcrumbJsonLd(pathname: string) {
+  const segs = pathname.split("/").filter(Boolean);
+  if (!segs.length) return null;
+  return {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "LokiAI", item: `${SITE_URL}/` },
+      ...segs.map((seg, i) => ({
+        "@type": "ListItem",
+        position: i + 2,
+        name: CRUMB_NAMES[seg] ?? seg,
+        item: `${SITE_URL}/${segs.slice(0, i + 1).join("/")}`,
+      })),
+    ],
+  };
+}
+
 function RootShell({ children }: { children: ReactNode }) {
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const crumbs = breadcrumbJsonLd(pathname);
   return (
     <html lang="en">
       <head>
@@ -176,6 +215,12 @@ function RootShell({ children }: { children: ReactNode }) {
           type="application/ld+json"
           dangerouslySetInnerHTML={{ __html: JSON.stringify(SOFTWARE_JSON_LD) }}
         />
+        {crumbs && (
+          <script
+            type="application/ld+json"
+            dangerouslySetInnerHTML={{ __html: JSON.stringify(crumbs) }}
+          />
+        )}
       </head>
       <body>
         {children}
@@ -204,12 +249,8 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      {/* Dynamic Background */}
-      <div className="fixed inset-0 z-[-1] bg-background pointer-events-none">
-        <div className="absolute inset-0 bg-loki-aurora opacity-30 mix-blend-screen" />
-        <div className="absolute inset-0 loki-grid opacity-[0.15]" />
-      </div>
-      
+      <div className="fixed inset-0 z-[-1] bg-background pointer-events-none" />
+
       <div className="relative flex min-h-dvh flex-col text-foreground">
         <Nav />
         <main id="main" className="flex-1">

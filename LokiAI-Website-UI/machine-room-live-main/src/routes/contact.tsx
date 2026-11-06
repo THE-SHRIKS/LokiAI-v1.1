@@ -30,12 +30,12 @@ const CONTACT_EMAIL = "transmission@theshriks.space";
 const ROUTES = [
   [
     "Product & support",
-    "Questions about deployments, device pairing or model compatibility.",
+    "Questions about LokiAI, device support or the open-source repository.",
     "LokiAI — Product & support",
   ],
   [
     "Hardware partnerships",
-    "You ship devices and want a LokiAI agent for your platform.",
+    "You ship devices and want a LokiAI connector for your platform.",
     "LokiAI — Hardware partnership",
   ],
   [
@@ -80,7 +80,7 @@ function Contact() {
           ))}
         </ul>
         <p className="mt-10 max-w-2xl text-sm text-muted-foreground">
-          Include the device class, OS version and model you are trying to deploy. That is usually
+          Include the device, the board and the problem you are trying to solve. That is usually
           enough for us to answer in one reply. Prefer to write directly?{" "}
           <a href={mailtoFor("LokiAI enquiry")} className="text-gold underline underline-offset-4">
             {CONTACT_EMAIL}
@@ -90,7 +90,7 @@ function Contact() {
       </Section>
       <CTABlock
         title="Before you write, the docs may already answer it"
-        body="Pairing, compatibility and troubleshooting cover most first questions."
+        body="The repository documents the design, the security model and the current status."
         primary={{ label: "Email us", href: mailtoFor("LokiAI enquiry") }}
         secondary={{ label: "Read the docs", to: "/docs" }}
         tertiary={{ label: "Security overview", to: "/security" }}

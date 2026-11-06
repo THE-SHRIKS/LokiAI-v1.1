@@ -1,6 +1,8 @@
 @import "tailwindcss" source(none);
 @source "../src";
 @import "tw-animate-css";
+@import "@fontsource/dotgothic16";
+@import "@fontsource/tiny5";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -283,4 +285,57 @@
     radial-gradient(circle at 20% 80%, oklch(0.5 0.1 120 / 40%) 0%, transparent 50%);
   background-size: 200% 200%, 200% 200%, 200% 200%;
   animation: loki-aurora 20s ease-in-out infinite alternate;
+}
+
+
+/* ============================================================
+ * Pixel identity: black fields and green fields, joined by pixel seams.
+ * Headings use a bitmap display face; small numerals use a pixel face.
+ * ============================================================ */
+@theme inline {
+  --font-serif: "DotGothic16", "Courier New", monospace;
+  --font-pixel: "Tiny5", "Courier New", monospace;
+}
+
+@layer base {
+  h1,
+  h2 {
+    text-transform: uppercase;
+    letter-spacing: 0;
+    font-weight: 400;
+  }
+  h3,
+  h4 {
+    letter-spacing: 0;
+    font-weight: 400;
+  }
+}
+
+/* A green field. Anything inside re-themes: black text on green, black controls. */
+.field {
+  --background: oklch(0.68 0.13 130);
+  --foreground: oklch(0.1 0 0);
+  --card: oklch(0.62 0.13 130);
+  --card-foreground: oklch(0.1 0 0);
+  --muted-foreground: oklch(0.24 0.05 130);
+  --border: oklch(0.1 0 0 / 38%);
+  --primary: oklch(0.1 0 0);
+  --primary-foreground: oklch(0.9 0.05 100);
+  --gold: oklch(0.1 0 0);
+  --gold-dim: oklch(0.22 0.05 130);
+  --live: oklch(0.1 0 0);
+  --plane: oklch(0.6 0.13 130);
+  --plane-40: oklch(0.6 0.13 130 / 40%);
+  --grid-line: oklch(0.1 0 0 / 18%);
+  background-color: var(--background);
+  color: var(--foreground);
+}
+
+.field ::selection {
+  background: oklch(0.1 0 0);
+  color: oklch(0.9 0.05 100);
+}
+
+.px {
+  font-family: var(--font-pixel);
 }

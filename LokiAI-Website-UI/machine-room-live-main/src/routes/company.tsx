@@ -30,36 +30,36 @@ function Company() {
       <PageHero
         eyebrow="Company"
         title="THE SHRIKS"
-        lede="We build the layer between a model repository and a device that has to run it. LokiAI started because that step is still done by hand, badly, almost everywhere."
-        meta={["Founded by THE SHRIKS", "Local-first by default", "Hardware partnerships welcome"]}
+        lede="We build the layer between a coding agent and the hardware it works on. LokiAI exists because agents can edit firmware, but nothing safe sits between them and a real device."
+        meta={["Founded by THE SHRIKS", "Open source", "Local-first by default"]}
       />
 
       <Section>
         <SectionHeader
           index="01"
           eyebrow="Mission"
-          title="Make capable devices useful without specialist AI teams"
+          title="Let agents work on hardware without handing them the keys"
         />
         <div className="mt-10 grid gap-6 md:grid-cols-2 lg:grid-cols-3">
           <Panel key="The problem" className="h-full">
             <h3 className="font-serif text-2xl text-gold">The problem</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Choosing a model, a quantisation, a runtime and a deployment path takes specialist
-              knowledge most teams do not have in house.
+              A coding agent can change firmware, but raw shell or serial access is too broad, and
+              ordinary monitoring tools do not connect evidence to code changes.
             </p>
           </Panel>
           <Panel key="Our approach" className="h-full">
             <h3 className="font-serif text-2xl text-gold">Our approach</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Profile the real device, verify the exact artifact, deploy it wirelessly and keep the
-              evidence.
+              Agents propose. LokiAI authenticates, executes, observes and records. People keep the
+              final say on anything consequential.
             </p>
           </Panel>
           <Panel key="Why now" className="h-full">
             <h3 className="font-serif text-2xl text-gold">Why now</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Quantised models finally run usefully on commodity phones and boards, and the hardware
-              is already deployed in the field.
+              Agents are now writing real firmware. The step between a suggestion and a flashed
+              board is where the risk sits.
             </p>
           </Panel>
         </div>
@@ -70,10 +70,10 @@ function Company() {
         <div className="mt-10 max-w-3xl">
           <BulletList
             items={[
-              "State availability honestly: available, beta or planned, with no blurring between them.",
-              "Keep inference local unless there is a stated reason not to.",
-              "Record what was deployed, so an operator can answer questions months later.",
-              "Add hardware by adding agents, never by special-casing the control plane.",
+              "State status honestly: say what works, what is in progress and what is only planned.",
+              "Keep device authority in the runtime, never in the interface or in an agent.",
+              "Record every consequential action, so an operator can answer questions months later.",
+              "Add hardware by adding connectors, never by special-casing the shared layers.",
             ]}
           />
         </div>
@@ -85,13 +85,13 @@ function Company() {
           <Panel key="General & product" className="h-full">
             <h3 className="font-serif text-2xl text-gold">General & product</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Questions about the platform, device support or a deployment you are planning.
+              Questions about LokiAI, device support or a project you are planning.
             </p>
           </Panel>
           <Panel key="Partnerships" className="h-full">
             <h3 className="font-serif text-2xl text-gold">Partnerships</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              Hardware vendors and integrators who want a LokiAI agent for their platform.
+              Hardware vendors and integrators who want a LokiAI connector for their platform.
             </p>
           </Panel>
           <Panel key="Press & investors" className="h-full">
@@ -103,8 +103,8 @@ function Company() {
           <Panel key="Careers" className="h-full">
             <h3 className="font-serif text-2xl text-gold">Careers</h3>
             <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-              We are small. If you work on local AI, IoT or device fleets, introduce
-              yourself.
+              We are small. If you work on firmware, embedded systems or device fleets,
+              introduce yourself.
             </p>
           </Panel>
         </div>
